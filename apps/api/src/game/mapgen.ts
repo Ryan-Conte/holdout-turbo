@@ -1,6 +1,6 @@
-import { AuthoredMap, EnemyKind, MAP_H, MAP_W, PoiSnap, TILE, Tile } from '@holdout/shared';
+import { AuthoredMap, COPPER_CHANCE, EnemyKind, IRON_CHANCE, MAP_H, MAP_W, PoiSnap, TILE, Tile, TraderTier } from '@holdout/shared';
 
-export type ChestTier = 'normal' | 'military';
+export type ChestTier = 'normal' | 'military' | 'rare';
 
 export interface GeneratedMap {
   seed: number;
@@ -11,7 +11,7 @@ export interface GeneratedMap {
   lootSpots: { x: number; y: number }[];
   spawns: { x: number; y: number }[];
   pois: PoiSnap[];
-  traders: { x: number; y: number }[];
+  traders: { x: number; y: number; tier?: TraderTier }[];
   extracts: { x: number; y: number }[];
   enemySpawns: { x: number; y: number; kind: EnemyKind }[];
 }
@@ -180,9 +180,11 @@ export function generateMap(seed = (Math.random() * 2 ** 31) | 0): GeneratedMap 
     for (let i = 0; i < 3; i++)
       chestSpots.push({ x: px(airX + ri(0, 20)), y: px(airY + ri(15, 16)), tier: 'military' });
 
-    pois.push({ name: 'Redfield Airport', kind: 'airport', x: px(airX + 11), y: px(airY + 9), r: 17 * TILE });
+    // the airport is the high-loot zone: rare chests, harder enemies, black-market dealer
+    pois.push({ name: 'Redfield Airport', kind: 'airport', x: px(airX + 11), y: px(airY + 9), r: 17 * TILE, hot: true });
     for (let i = 0; i < 6; i++)
       enemySpawns.push({ x: px(airX + ri(-2, 24)), y: px(airY + ri(-2, 20)), kind: 'military' });
+    traders.push({ x: px(airX + 8), y: px(airY + 15), tier: 2 }); // trades in the open — risky business
   }
 
   // road: town → outpost → airport
@@ -217,7 +219,7 @@ export function generateMap(seed = (Math.random() * 2 ** 31) | 0): GeneratedMap 
   const nearBuilding = (x: number, y: number, pad: number) =>
     buildingRects.some((b) => x >= b.x - pad && x < b.x + b.w + pad && y >= b.y - pad && y < b.y + b.h + pad);
 
-  // rock clusters
+  // rock clusters — a rock has a rare chance to spawn ore-veined instead
   for (let c = 0; c < 9; c++) {
     for (let tries = 0; tries < 60; tries++) {
       const cx = ri(4, W - 5);
@@ -226,7 +228,10 @@ export function generateMap(seed = (Math.random() * 2 ** 31) | 0): GeneratedMap 
       for (let i = 0, n = ri(3, 6); i < n; i++) {
         const x = cx + ri(-2, 2);
         const y = cy + ri(-2, 2);
-        if (inB(x, y) && t[idx(x, y)] === Tile.Grass && !nearBuilding(x, y, 1)) t[idx(x, y)] = Tile.Rock;
+        if (inB(x, y) && t[idx(x, y)] === Tile.Grass && !nearBuilding(x, y, 1)) {
+          const roll = rnd();
+          t[idx(x, y)] = roll < IRON_CHANCE ? Tile.IronOre : roll < IRON_CHANCE + COPPER_CHANCE ? Tile.CopperOre : Tile.Rock;
+        }
       }
       break;
     }
@@ -351,10 +356,15 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
   const W = Math.max(20, Math.min(200, map.w | 0));
   const H = Math.max(20, Math.min(200, map.h | 0));
   const tiles = new Uint8Array(W * H).fill(Tile.Grass);
-  const maxTile = Tile.DoorMat;
+  // editor may paint terrain + resource nodes; structures/stations stay player-built
+  const AUTHORABLE = new Set<number>([
+    Tile.Grass, Tile.Water, Tile.Tree, Tile.Floor, Tile.Wall, Tile.Road,
+    Tile.Sand, Tile.Rock, Tile.Asphalt, Tile.Bed, Tile.DoorMat,
+    Tile.CopperOre, Tile.IronOre,
+  ]);
   for (let i = 0; i < W * H && i < map.tiles.length; i++) {
     const v = map.tiles[i] | 0;
-    tiles[i] = v >= 0 && v <= maxTile ? v : Tile.Grass;
+    tiles[i] = AUTHORABLE.has(v) ? v : Tile.Grass;
   }
 
   const out: GeneratedMap = {
@@ -389,12 +399,14 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
       case 'spawn': out.spawns.push({ x: cx, y: cy }); break;
       case 'extract': out.extracts.push({ x: cx, y: cy }); break;
       case 'trader':
-        out.traders.push({ x: cx, y: cy });
+        out.traders.push({ x: cx, y: cy, tier: 1 });
         out.pois.push({ name: o.name || 'Outpost', kind: 'outpost', x: cx, y: cy, r: (o.r ?? 8) * TILE, safe: true });
         break;
+      case 'trader_black': out.traders.push({ x: cx, y: cy, tier: 2 }); break; // no safe zone — deal at your own risk
       case 'poi_town': out.pois.push({ name: o.name || 'Town', kind: 'town', x: cx, y: cy, r: (o.r ?? 14) * TILE }); break;
-      case 'poi_airport': out.pois.push({ name: o.name || 'Airport', kind: 'airport', x: cx, y: cy, r: (o.r ?? 16) * TILE }); break;
+      case 'poi_airport': out.pois.push({ name: o.name || 'Airport', kind: 'airport', x: cx, y: cy, r: (o.r ?? 16) * TILE, hot: true }); break;
       case 'poi_outpost': out.pois.push({ name: o.name || 'Outpost', kind: 'outpost', x: cx, y: cy, r: (o.r ?? 8) * TILE, safe: true }); break;
+      case 'poi_hotzone': out.pois.push({ name: o.name || 'Hot Zone', kind: 'hotzone', x: cx, y: cy, r: (o.r ?? 12) * TILE, hot: true }); break;
     }
   }
   if (out.spawns.length === 0) out.spawns.push({ x: px(W >> 1), y: px(H >> 1) });

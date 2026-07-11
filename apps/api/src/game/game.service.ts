@@ -22,11 +22,13 @@ import {
   BLOCKS_MOVE,
   ContainerContents,
   ContainerSnap,
+  COPPER_CHANCE,
   DAY_LENGTH_MS,
   EMPTY_SKILLS,
   ENEMY_DEFS,
   EV,
   EXTRACT_TIME_MS,
+  IRON_CHANCE,
   HOME_REST_HP_PER_S,
   NIGHT_AGGRO_MULT,
   NIGHT_SPEED_MULT,
@@ -51,6 +53,7 @@ import {
   MeleeStats,
   NODE_HITS,
   NODE_RESPAWN_MS,
+  ORE_YIELD,
   PLAYER_MAX_HP,
   PLAYER_RADIUS,
   PLAYER_SPEED,
@@ -67,7 +70,8 @@ import {
   StationOpen,
   TICK_MS,
   TILE,
-  TRADER_STOCK,
+  TRADER_TIER_STOCK,
+  TraderTier,
   Tile,
   WeaponStats,
   WorldInit,
@@ -115,6 +119,8 @@ interface ServerPlayer {
   openContainer: string | null;
   returnPos: { x: number; y: number } | null;
   ignoreInteractUntil: number; // swallow held-E repeats right after an instance switch
+  loggedOutAt: number | null; // combat-log: body lingers in the world, killable, for a bit
+  lastStationMask: number; // change-detect for near-station flags so the UI is never stale
 }
 
 interface Enemy {
@@ -138,29 +144,9 @@ interface Enemy {
   detourUntil: number;
   detourAngle: number;
   enraged: boolean; // damaged animals keep chasing well past their neutral aggro radius
-}
-
-/** Survivor NPCs — scripted "players": they roam, chop wood, and some shoot on sight. */
-interface Npc {
-  id: string;
-  name: string;
-  x: number;
-  y: number;
-  angle: number;
-  hp: number;
-  hostile: boolean; // raiders attack on sight; harvesters only when provoked
-  weapon: ItemId;
-  targetSid: string | null;
-  targetI: number; // tree tile index being chopped (-1 = none)
-  nextSwingAt: number;
-  lastSwingAt: number;
-  nextShotAt: number;
-  nextThinkAt: number;
-  wanderAngle: number;
-  wandering: boolean;
-  moving: boolean;
-  detourUntil: number;
-  detourAngle: number;
+  lastSeenAt: number; // sight memory — when the target was last in line of sight
+  lastSeenX: number; // …and where; hidden targets are hunted at this spot only
+  lastSeenY: number;
 }
 
 interface Container {
@@ -200,7 +186,7 @@ interface Instance {
   h: number;
   tiles: Uint8Array;
   pois: PoiSnap[];
-  traders: { x: number; y: number }[];
+  traders: { x: number; y: number; tier?: TraderTier }[];
   extracts: { x: number; y: number }[];
   exit: { x: number; y: number } | null;
   spawns: { x: number; y: number }[];
@@ -208,8 +194,7 @@ interface Instance {
   containers: Map<string, Container>;
   ground: Map<string, GroundItem>;
   enemies: Map<string, Enemy>;
-  npcs: Map<string, Npc>;
-  npcRespawns: { at: number; hostile: boolean }[];
+  unders: Map<number, number>; // floor tile beneath player-built stations (render + restore)
   projectiles: Projectile[];
   nodeHits: Map<number, number>;
   nodeRespawns: { i: number; tile: number; at: number }[];
@@ -217,12 +202,13 @@ interface Instance {
   lastGroundSpawn: number;
   players: number; // live count, for hideout GC
   hideout?: HideoutData; // persistence backing for hideout instances
-  structures: Map<number, { type: BuildType; hp: number; expiresAt: number }>; // world-placed, tile-indexed
+  structures: Map<number, { type: BuildType; hp: number; expiresAt: number; under?: number }>; // world-placed, tile-indexed
 }
 
 const ENEMY_RADIUS = 12;
 const ENEMY_RESPAWN_MS = 90_000;
 const WORLD = 'world';
+const LOS_MEMORY_MS = 3000; // how long an enemy hunts a target it can no longer see
 
 @Injectable()
 export class GameService implements OnModuleInit, OnModuleDestroy {
@@ -302,8 +288,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       containers: new Map(),
       ground: new Map(),
       enemies: new Map(),
-      npcs: new Map(),
-      npcRespawns: [],
+      unders: new Map(),
       projectiles: [],
       nodeHits: new Map(),
       nodeRespawns: [],
@@ -317,21 +302,19 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const tx = Math.floor(spot.x / TILE);
       const ty = Math.floor(spot.y / TILE);
       const onTarmac = gen.tiles[ty * gen.w + tx] === Tile.Asphalt;
+      // chests inside a high-loot zone roll the RARE table
+      const inHot = gen.pois.some((poi) => poi.hot && Math.hypot(poi.x - spot.x, poi.y - spot.y) < poi.r);
+      const tier: ChestTier = inHot ? 'rare' : spot.tier;
       inst.containers.set(cid, {
         id: cid, x: spot.x, y: spot.y,
         kind: onTarmac ? 'crate' : 'chest',
-        tier: spot.tier,
-        slots: rollChest(this.rnd, spot.tier),
+        tier,
+        slots: rollChest(this.rnd, tier),
         restockAt: null,
       });
     }
     for (const spot of gen.lootSpots) this.spawnGroundAt(inst, spot.x, spot.y);
     for (const s of gen.enemySpawns) this.spawnEnemy(inst, s.x, s.y, s.kind);
-    if (kind === 'world') {
-      // survivor NPCs — the zone should feel inhabited even with few real players
-      for (let i = 0; i < 3; i++) this.spawnNpc(inst, false);
-      for (let i = 0; i < 2; i++) this.spawnNpc(inst, true);
-    }
     return inst;
   }
 
@@ -373,8 +356,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       containers: new Map(),
       ground: new Map(),
       enemies: new Map(),
-      npcs: new Map(),
-      npcRespawns: [],
+      unders: new Map(),
       projectiles: [],
       nodeHits: new Map(),
       nodeRespawns: [],
@@ -394,11 +376,16 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       slots: hideout.storage,
       restockAt: null,
     });
-    // player-built tiles + chests
+    // player-built tiles + chests (objects apply in build order: floors first,
+    // stations later — a station over a floor records it as its under-tile)
     for (const o of hideout.objects) {
       if (o.tx < 1 || o.ty < 1 || o.tx >= W - 1 || o.ty >= H - 1) continue;
       const b = BUILDABLES[o.type];
-      if (b?.tile) tiles[o.ty * W + o.tx] = b.tile;
+      if (b?.tile) {
+        const i = o.ty * W + o.tx;
+        if (FLOOR_TILES[tiles[i]]) inst.unders.set(i, tiles[i]);
+        tiles[i] = b.tile;
+      }
     }
     this.syncHideoutContainers(inst);
     this.instances.set(id, inst);
@@ -450,6 +437,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       extracts: inst.extracts,
       exit: inst.exit,
       ownHideout: inst.kind === 'hideout' && inst.ownerId === this.players.get(sid)?.userId,
+      unders: Object.fromEntries(inst.unders),
       you: sid,
     };
   }
@@ -490,6 +478,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         for (const e of i.enemies.values()) if (e.targetSid === oldSid) e.targetSid = sid;
       existing.sid = sid;
       existing.input = { up: false, down: false, left: false, right: false, angle: existing.angle, shoot: false };
+      existing.loggedOutAt = null; // reconnected before the combat-log body expired
       this.players.set(sid, existing);
       const inst = this.inst(existing);
       void this.io?.sockets.sockets.get(sid)?.join(inst.id);
@@ -563,6 +552,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       openContainer: null,
       returnPos: null,
       ignoreInteractUntil: Date.now() + 900, // a key held through the login screen opens nothing
+      loggedOutAt: null,
+      lastStationMask: -1,
     };
     this.players.set(sid, p);
     home.players++;
@@ -576,15 +567,33 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   async removePlayer(sid: string) {
     const p = this.players.get(sid);
     if (!p) return;
-    this.players.delete(sid);
+    const inst = this.instances.get(p.instanceId);
+    // combat-log guard: a live body in the open world lingers 60s so you can't
+    // alt-F4 to save your loot — anyone can still kill it and take the drops.
+    const inDanger = !!inst && inst.kind === 'world' && !p.dead && !this.isSafeAt(inst, p.x, p.y);
+    if (inDanger && p.loggedOutAt === null) {
+      p.loggedOutAt = Date.now();
+      p.input = { up: false, down: false, left: false, right: false, angle: p.angle, shoot: false };
+      p.action = null;
+      this.log.log(`${p.name} disconnected in the open — body lingers 60s (${this.players.size} online)`);
+      await this.saveProfileOf(p);
+      return; // stays in this.players; the tick finalizes it later
+    }
+    this.finalizePlayerExit(p);
+    await this.saveProfileOf(p);
+  }
+
+  /** Fully remove a player from the sim (safe exit, or after the combat-log timer). */
+  private finalizePlayerExit(p: ServerPlayer) {
+    if (!this.players.has(p.sid)) return;
+    this.players.delete(p.sid);
     const inst = this.instances.get(p.instanceId);
     if (inst) {
       inst.players = Math.max(0, inst.players - 1);
       if (inst.kind === 'hideout' && inst.players === 0) this.instances.delete(inst.id);
-      for (const e of inst.enemies.values()) if (e.targetSid === sid) e.targetSid = null;
+      for (const e of inst.enemies.values()) if (e.targetSid === p.sid) e.targetSid = null;
     }
     this.log.log(`${p.name} left (${this.players.size} online)`);
-    await this.saveProfileOf(p);
   }
 
   /** You wake up with nothing but your fists. */
@@ -601,7 +610,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   setInput(sid: string, input: InputPayload) {
     const p = this.players.get(sid);
-    if (!p || p.dead) return;
+    if (!p || p.dead || p.loggedOutAt !== null) return;
     const angle = Number(input.angle);
     p.input = {
       up: !!input.up,
@@ -654,6 +663,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       [Tile.Firepit]: 'firepit',
       [Tile.Furnace]: 'furnace',
       [Tile.Workbench]: 'workbench',
+      [Tile.Anvil]: 'anvil',
     };
     let station: BuildType | null = null;
     let stationD = INTERACT_RANGE;
@@ -1046,8 +1056,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const item = p.inv.slots[slot];
     if (!item) return;
     const kind = ITEMS[item.id].kind;
-    // weapons, tools and consumables can be held in hand (click to use / attack)
-    if (kind !== 'weapon' && kind !== 'tool' && kind !== 'consumable') return;
+    // weapons, tools, consumables and build kits can be held in hand (click to use/attack/place)
+    if (kind !== 'weapon' && kind !== 'tool' && kind !== 'consumable' && kind !== 'placeable') return;
     p.equipped = p.equipped === slot ? null : slot;
     this.pushInventory(p);
   }
@@ -1064,12 +1074,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   /** Station / material / weight validation, with feedback toasts. */
   private craftChecks(p: ServerPlayer, recipe: (typeof RECIPES)[number]): boolean {
-    if (recipe.station === 'workbench' && !this.nearTile(p, Tile.Workbench)) {
-      this.toast(p.sid, 'You need to be at a workbench (B to build one)');
-      return false;
-    }
-    if (recipe.station === 'furnace' && !this.nearTile(p, Tile.Furnace)) {
-      this.toast(p.sid, 'You need to be at a furnace (B to build one)');
+    const STATION_TILE: Record<string, Tile> = { workbench: Tile.Workbench, furnace: Tile.Furnace, anvil: Tile.Anvil };
+    if (recipe.station && !this.nearTile(p, STATION_TILE[recipe.station])) {
+      this.toast(p.sid, `You need to be at a ${recipe.station}`);
       return false;
     }
     for (const cost of recipe.cost) {
@@ -1163,21 +1170,17 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.removeItem(p.inv, held.id, 1);
 
     if (buildable.tile) {
-      // building on top of a floor replaces it — retire the floor object underneath
-      if (inHideout && inst.hideout && FLOOR_TILES[targetTile]) {
-        const fi = inst.hideout.objects.findIndex((o) => o.tx === tx && o.ty === ty);
-        if (fi >= 0) {
-          inst.hideout.objects.splice(fi, 1);
-          this.syncHideoutContainers(inst);
-        }
-      }
+      // building on a floor keeps the floor UNDER the piece — it shows through
+      // visually and comes back when the piece is demolished or destroyed
+      const under = FLOOR_TILES[targetTile] ? targetTile : undefined;
+      if (under !== undefined) inst.unders.set(i, under);
       inst.tiles[i] = buildable.tile;
-      this.io?.to(inst.id).emit(EV.tile, { i, tile: buildable.tile });
+      this.io?.to(inst.id).emit(EV.tile, { i, tile: buildable.tile, under });
       if (inHideout && inst.hideout) {
         inst.hideout.objects.push({ type, tx, ty });
         this.persistHideout(inst);
       } else {
-        inst.structures.set(i, { type, hp: buildable.hp, expiresAt: Date.now() + WORLD_STRUCTURE_TTL_MS });
+        inst.structures.set(i, { type, hp: buildable.hp, expiresAt: Date.now() + WORLD_STRUCTURE_TTL_MS, under });
       }
     } else if (inHideout && inst.hideout) {
       inst.hideout.objects.push({ type, tx, ty, slots: new Array<InvSlot>(HIDEOUT_STORAGE_SLOTS).fill(null) });
@@ -1205,7 +1208,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       this.toast(sid, 'Too far away');
       return;
     }
-    const oi = inst.hideout.objects.findIndex((o) => o.tx === tx && o.ty === ty);
+    // take the TOP piece at this tile (a station may be standing on a floor)
+    let oi = -1;
+    for (let k = inst.hideout.objects.length - 1; k >= 0; k--) {
+      if (inst.hideout.objects[k].tx === tx && inst.hideout.objects[k].ty === ty) { oi = k; break; }
+    }
     if (oi < 0) {
       this.toast(sid, 'Nothing you built there');
       return;
@@ -1224,8 +1231,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const buildable = BUILDABLES[obj.type];
     if (buildable.tile) {
       const i = ty * inst.w + tx;
-      inst.tiles[i] = Tile.Grass;
-      this.io?.to(inst.id).emit(EV.tile, { i, tile: Tile.Grass });
+      const restore = inst.unders.get(i) ?? Tile.Grass; // the floor beneath survives
+      inst.unders.delete(i);
+      inst.tiles[i] = restore;
+      this.io?.to(inst.id).emit(EV.tile, { i, tile: restore });
     }
     this.syncHideoutContainers(inst);
     this.persistHideout(inst);
@@ -1241,8 +1250,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.hitFx(inst, (i % inst.w) * TILE + 16, Math.floor(i / inst.w) * TILE + 16, dmg, 'node', 'stone');
     if (s.hp <= 0) {
       inst.structures.delete(i);
-      inst.tiles[i] = Tile.Grass;
-      this.io?.to(inst.id).emit(EV.tile, { i, tile: Tile.Grass });
+      const restore = s.under ?? Tile.Grass;
+      inst.unders.delete(i);
+      inst.tiles[i] = restore;
+      this.io?.to(inst.id).emit(EV.tile, { i, tile: restore });
     }
     return true;
   }
@@ -1263,23 +1274,40 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   // ── quests ────────────────────────────────────────────────────────────────
 
-  private questStatus(p: ServerPlayer): QuestStatus[] {
-    return this.quests.map((def) => {
-      const prog = p.quests[def.id] ?? { kills: 0, claimed: false };
-      const progress = def.kind === 'kill' ? Math.min(prog.kills, def.count) : Math.min(this.countItem(p.inv, def.target as ItemId), def.count);
-      return { def, progress, done: progress >= def.count, claimed: !!prog.claimed };
-    });
+  /** Quest tree: a quest is unlocked once its prerequisite is claimed. */
+  private questUnlocked(p: ServerPlayer, def: QuestDef): boolean {
+    if (def.requires === null) return true;
+    return !!p.quests[def.requires]?.claimed;
+  }
+
+  /** Quests this trader offers: unlocked (or already claimed) quests of its tier. */
+  private questStatus(p: ServerPlayer, tier: TraderTier): QuestStatus[] {
+    return this.quests
+      .filter((def) => def.tier === tier && this.questUnlocked(p, def))
+      .map((def) => {
+        const prog = p.quests[def.id] ?? { kills: 0, claimed: false };
+        const progress = def.kind === 'kill' ? Math.min(prog.kills, def.count) : Math.min(this.countItem(p.inv, def.target as ItemId), def.count);
+        return { def, progress, done: progress >= def.count, claimed: !!prog.claimed };
+      });
   }
 
   private sendTrade(p: ServerPlayer) {
-    this.emitTo(p.sid, EV.trade, { stock: TRADER_STOCK, money: p.money, quests: this.questStatus(p) });
+    const tier = this.traderAt(p)?.tier ?? 1;
+    this.emitTo(p.sid, EV.trade, {
+      stock: TRADER_TIER_STOCK[tier],
+      money: p.money,
+      quests: this.questStatus(p, tier),
+      tier,
+    });
   }
 
   questClaim(sid: string, questId: number) {
     const p = this.players.get(sid);
-    if (!p || p.dead || !this.nearTrader(p)) return;
+    if (!p || p.dead) return;
+    const trader = this.traderAt(p);
+    if (!trader) return;
     const def = this.quests.find((q) => q.id === questId);
-    if (!def) return;
+    if (!def || def.tier !== (trader.tier ?? 1) || !this.questUnlocked(p, def)) return;
     const prog = p.quests[def.id] ?? { kills: 0, claimed: false };
     if (prog.claimed) return;
     if (def.kind === 'fetch') {
@@ -1328,14 +1356,24 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   // ── trading ───────────────────────────────────────────────────────────────
 
-  private nearTrader(p: ServerPlayer): boolean {
-    return this.inst(p).traders.some((t) => Math.hypot(t.x - p.x, t.y - p.y) < INTERACT_RANGE * 1.5);
+  /** The trader in interaction range (if any) — its tier decides stock and quests. */
+  private traderAt(p: ServerPlayer): { x: number; y: number; tier?: TraderTier } | null {
+    let best: { x: number; y: number; tier?: TraderTier } | null = null;
+    let bd = INTERACT_RANGE * 1.5;
+    for (const t of this.inst(p).traders) {
+      const d = Math.hypot(t.x - p.x, t.y - p.y);
+      if (d < bd) { best = t; bd = d; }
+    }
+    return best;
   }
 
   tradeBuy(sid: string, id: string, qty: number) {
     const p = this.players.get(sid);
-    if (!p || p.dead || !this.nearTrader(p)) return;
-    const entry = TRADER_STOCK.find((e) => e.id === id && e.buy > 0);
+    if (!p || p.dead) return;
+    const trader = this.traderAt(p);
+    if (!trader) return;
+    const stock = TRADER_TIER_STOCK[trader.tier ?? 1];
+    const entry = stock.find((e) => e.id === id && e.buy > 0);
     if (!entry) return;
     const n = Math.max(1, Math.min(99, Math.floor(qty) || 1));
     const affordable = Math.min(n, Math.floor(p.money / entry.buy));
@@ -1352,18 +1390,21 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     p.money -= bought * entry.buy;
     this.toast(sid, `Bought ${ITEMS[entry.id].name} x${bought} (-${bought * entry.buy}cr)`);
     this.pushInventory(p);
-    this.emitTo(sid, EV.trade, { stock: TRADER_STOCK, money: p.money });
+    this.sendTrade(p);
   }
 
   tradeSell(sid: string, slot: number, qty: number) {
     const p = this.players.get(sid);
-    if (!p || p.dead || !this.nearTrader(p)) return;
+    if (!p || p.dead) return;
+    const trader = this.traderAt(p);
+    if (!trader) return;
     if (slot < 0 || slot >= p.inv.slots.length) return;
     const item = p.inv.slots[slot];
     if (!item) return;
-    const entry = TRADER_STOCK.find((e) => e.id === item.id && e.sell > 0);
+    const stock = TRADER_TIER_STOCK[trader.tier ?? 1];
+    const entry = stock.find((e) => e.id === item.id && e.sell > 0);
     if (!entry) {
-      this.toast(sid, 'The trader is not interested in that');
+      this.toast(sid, 'This trader is not interested in that');
       return;
     }
     const n = Math.max(1, Math.min(Math.floor(qty) || item.qty, item.qty));
@@ -1375,7 +1416,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     p.money += n * entry.sell;
     this.toast(sid, `Sold ${ITEMS[item.id].name} x${n} (+${n * entry.sell}cr)`);
     this.pushInventory(p);
-    this.emitTo(sid, EV.trade, { stock: TRADER_STOCK, money: p.money });
+    this.sendTrade(p);
   }
 
   // ── hideout ───────────────────────────────────────────────────────────────
@@ -1390,8 +1431,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       this.toast(sid, 'Reach an extraction beacon to get home');
       return;
     }
-    if (inst.kind !== 'world' || !this.isSafeAt(inst, p.x, p.y)) {
-      this.toast(sid, 'You can only visit a camp from a safe zone');
+    // visit friends from the comfort of your own base, or from a safe zone
+    const fromHome = inst.kind === 'hideout' && inst.ownerId === p.userId;
+    if (!fromHome && (inst.kind !== 'world' || !this.isSafeAt(inst, p.x, p.y))) {
+      this.toast(sid, 'Visit camps from your base or a safe zone');
       return;
     }
     const ok = await this.db.areFriends(owner, p.userId);
@@ -1399,23 +1442,38 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       this.toast(sid, 'You are not on that hideout’s access list');
       return;
     }
-    p.returnPos = { x: p.x, y: p.y };
+    p.returnPos = fromHome ? null : { x: p.x, y: p.y };
     const h = await this.hideoutInstance(owner);
     const spawn = h.spawns[0];
     this.switchInstance(p, h, spawn.x, spawn.y);
-    this.toast(sid, owner === p.userId ? 'Welcome home' : 'Entered a friend’s hideout');
+    this.toast(sid, 'Entered a friend’s camp — have a look around');
   }
 
-  leaveHideout(sid: string) {
+  async leaveHideout(sid: string) {
     const p = this.players.get(sid);
     if (!p || p.dead) return;
-    if (this.inst(p).kind !== 'hideout') return;
+    const inst = this.inst(p);
+    if (inst.kind !== 'hideout') return;
+    if (inst.ownerId !== p.userId) {
+      // leaving a friend's camp: back to the safe zone you came from, or home
+      if (p.returnPos) {
+        const world = this.instances.get(WORLD)!;
+        const ret = p.returnPos;
+        p.returnPos = null;
+        this.switchInstance(p, world, ret.x, ret.y);
+      } else {
+        const home = await this.hideoutInstance(p.userId);
+        this.switchInstance(p, home, home.spawns[0].x, home.spawns[0].y);
+        this.toast(sid, 'Back home');
+      }
+      return;
+    }
+    // leaving your own base = deploying into the zone
     const world = this.instances.get(WORLD)!;
-    // came in from a safe zone → go back there; fresh from home → random deployment
     const ret = p.returnPos ?? world.spawns[Math.floor(this.rnd() * world.spawns.length)];
     p.returnPos = null;
     this.switchInstance(p, world, ret.x, ret.y);
-    this.toast(sid, 'Deployed into the zone — H from a safe zone gets you home');
+    this.toast(sid, 'Deployed into the zone — find a beacon to extract');
   }
 
   // ── inventory primitives ──────────────────────────────────────────────────
@@ -1513,6 +1571,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       detourUntil: 0,
       detourAngle: 0,
       enraged: false,
+      lastSeenAt: 0,
+      lastSeenX: x,
+      lastSeenY: y,
     });
   }
 
@@ -1524,8 +1585,26 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.lastTick = now;
 
     for (const p of this.players.values()) {
+      // combat-log body: no owner online — expire it (or reap it once it dies)
+      if (p.loggedOutAt !== null) {
+        if (p.dead || now - p.loggedOutAt > 60_000) { this.finalizePlayerExit(p); continue; }
+        p.moving = false;
+        continue; // frozen: still a target, but takes no input, survival, or actions
+      }
       if (p.dead) continue;
       const inst = this.inst(p);
+      // near-station flags must follow you around — push the moment they change
+      // (fixes "standing at the workbench but it says I need one")
+      const stationMask =
+        (this.nearTile(p, Tile.Workbench) ? 1 : 0) |
+        (this.nearTile(p, Tile.Firepit) ? 2 : 0) |
+        (this.nearTile(p, Tile.Furnace) ? 4 : 0) |
+        (this.nearTile(p, Tile.Anvil) ? 8 : 0) |
+        (this.nearTile(p, Tile.Water) ? 16 : 0);
+      if (stationMask !== p.lastStationMask) {
+        p.lastStationMask = stationMask;
+        this.pushInventory(p);
+      }
       // survival decay (paused inside hideouts — it's a rest space)
       if (inst.kind !== 'hideout') {
         p.hunger = Math.max(0, p.hunger - HUNGER_DECAY_PER_S * dt);
@@ -1608,7 +1687,6 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     for (const inst of this.instances.values()) {
       if (inst.kind === 'world') {
         this.updateEnemies(inst, dt, now, night);
-        this.updateNpcs(inst, dt, now);
         // chest restock
         for (const c of inst.containers.values()) {
           if (c.kind !== 'bag' && c.kind !== 'storage' && c.restockAt && now >= c.restockAt) {
@@ -1616,7 +1694,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             c.restockAt = null;
           }
         }
-        // node regrowth
+        // node regrowth — rocks re-roll their ore vein so nobody camps a node:
+        // plain rock has the normal ore chances; a depleted ore vein only has a
+        // small chance to come back as the same ore, otherwise it's just rock
         for (let i = inst.nodeRespawns.length - 1; i >= 0; i--) {
           const nr = inst.nodeRespawns[i];
           if (now < nr.at) continue;
@@ -1629,8 +1709,15 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             nr.at = now + 10_000;
             continue;
           }
-          inst.tiles[nr.i] = nr.tile;
-          this.io?.to(inst.id).emit(EV.tile, { i: nr.i, tile: nr.tile });
+          let tile = nr.tile;
+          if (tile === Tile.Rock) {
+            const roll = this.rnd();
+            tile = roll < IRON_CHANCE ? Tile.IronOre : roll < IRON_CHANCE + COPPER_CHANCE ? Tile.CopperOre : Tile.Rock;
+          } else if (tile === Tile.CopperOre || tile === Tile.IronOre) {
+            if (this.rnd() >= 0.25) tile = Tile.Rock;
+          }
+          inst.tiles[nr.i] = tile;
+          this.io?.to(inst.id).emit(EV.tile, { i: nr.i, tile });
           inst.nodeRespawns.splice(i, 1);
         }
         // enemy respawns
@@ -1640,12 +1727,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
           this.spawnEnemy(inst, er.x, er.y, er.kind);
           inst.enemyRespawns.splice(i, 1);
         }
-        // world structures wear out
+        // world structures wear out (restoring any floor beneath)
         for (const [i, s] of inst.structures) {
           if (now < s.expiresAt) continue;
           inst.structures.delete(i);
-          inst.tiles[i] = Tile.Grass;
-          this.io?.to(inst.id).emit(EV.tile, { i, tile: Tile.Grass });
+          const restore = s.under ?? Tile.Grass;
+          inst.unders.delete(i);
+          inst.tiles[i] = restore;
+          this.io?.to(inst.id).emit(EV.tile, { i, tile: restore });
         }
         // ground loot top-up
         if (inst.ground.size < 45 && now - inst.lastGroundSpawn > 5000 && inst.lootSpots.length > 0) {
@@ -1704,6 +1793,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   private tryAttack(p: ServerPlayer, inst: Instance, now: number) {
     const slot = p.equipped !== null ? p.inv.slots[p.equipped] : null;
     const def = slot ? ITEMS[slot.id] : null;
+    if (def?.kind === 'placeable') return; // held kits place via c:build, never swing
     if (def?.weapon) this.tryShoot(p, inst, def.weapon, slot!.id, now);
     else if (def?.kind === 'consumable') this.tryConsume(p, p.equipped!, now);
     else this.tryMelee(p, inst, def?.melee ?? FISTS, now);
@@ -1774,11 +1864,18 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         weapon: weaponId,
       });
     }
-    // gunshot noise draws the dead (bows are quiet; suppressors quieter still)
+    // gunshot noise draws the dead (bows are quiet; suppressors quieter still) —
+    // they investigate where the shot came from, they don't magically see you
     const noise = Math.min(w.noise ?? 380, p.equipment.mod === 'attach_suppressor' ? SUPPRESSED_AGGRO_RANGE : Infinity);
+    const shotAt = Date.now();
     for (const e of inst.enemies.values()) {
       if (e.targetSid) continue;
-      if (Math.hypot(e.x - p.x, e.y - p.y) < noise) e.targetSid = p.sid;
+      if (Math.hypot(e.x - p.x, e.y - p.y) < noise) {
+        e.targetSid = p.sid;
+        e.lastSeenAt = shotAt;
+        e.lastSeenX = p.x;
+        e.lastSeenY = p.y;
+      }
     }
     this.pushInventory(p);
   }
@@ -1845,28 +1942,23 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     };
 
     if (!attackerSafe) {
-      let victim: ServerPlayer | Enemy | Npc | null = null;
-      let victimKind: 'player' | 'enemy' | 'npc' = 'player';
+      let victim: ServerPlayer | Enemy | null = null;
+      let victimIsEnemy = false;
       let bestD = reach;
       for (const other of this.players.values()) {
         if (other.sid === p.sid || other.dead || other.instanceId !== inst.id) continue;
         if (this.isSafeAt(inst, other.x, other.y)) continue;
         const d = inArc(other.x, other.y);
-        if (d < bestD) { victim = other; victimKind = 'player'; bestD = d; }
+        if (d < bestD) { victim = other; victimIsEnemy = false; bestD = d; }
       }
       for (const e of inst.enemies.values()) {
         const d = inArc(e.x, e.y);
-        if (d < bestD) { victim = e; victimKind = 'enemy'; bestD = d; }
-      }
-      for (const n of inst.npcs.values()) {
-        const d = inArc(n.x, n.y);
-        if (d < bestD) { victim = n; victimKind = 'npc'; bestD = d; }
+        if (d < bestD) { victim = e; victimIsEnemy = true; bestD = d; }
       }
       if (victim) {
         const dmg = Math.round(m.damage * Math.min(1.3, 1 + 0.01 * (skillLevel(p.skills.melee) - 1)));
         this.addXp(p, 'melee', dmg);
-        if (victimKind === 'enemy') this.damageEnemy(inst, victim as Enemy, dmg, p);
-        else if (victimKind === 'npc') this.damageNpc(inst, victim as Npc, dmg, p, null);
+        if (victimIsEnemy) this.damageEnemy(inst, victim as Enemy, dmg, p);
         else this.damagePlayer(victim as ServerPlayer, dmg, p.name, null, p);
         return;
       }
@@ -1896,6 +1988,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         this.toast(p.sid, 'Inventory full');
         return;
       }
+      // ore-veined rocks give stone AND ore
+      const ore = ORE_YIELD[tile];
+      if (ore && this.addItem(p.inv, ore, 1) === 0) {
+        this.addXp(p, 'mining', 4);
+      }
       this.hitFx(inst, tx * TILE + TILE / 2, ty * TILE + TILE / 2, yieldQty - leftover, 'node', isTree ? 'wood' : 'stone');
 
       const left = (inst.nodeHits.get(i) ?? totalHits) - 1;
@@ -1924,11 +2021,23 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const aggro = def.aggroRange * (night && hunter ? NIGHT_AGGRO_MULT : 1);
       const speed = def.speed * (night && e.kind === 'zombie' ? NIGHT_SPEED_MULT : 1);
       let target = e.targetSid ? this.players.get(e.targetSid) : undefined;
+      // sight memory: refresh while the target is visible; hidden targets are
+      // only hunted at their last-seen spot, and forgotten after a few seconds
+      let seen = false;
+      if (target && !target.dead && target.instanceId === inst.id) {
+        seen = this.losClear(inst, e.x, e.y, target.x, target.y);
+        if (seen) {
+          e.lastSeenAt = now;
+          e.lastSeenX = target.x;
+          e.lastSeenY = target.y;
+        }
+      }
       if (
         !target ||
         target.dead ||
         target.instanceId !== inst.id ||
         this.isSafeAt(inst, target.x, target.y) ||
+        now - e.lastSeenAt > LOS_MEMORY_MS || // you hid — it lost you
         Math.hypot(target.x - e.x, target.y - e.y) > Math.max(aggro * 1.6, e.enraged ? 480 : 0)
       ) {
         target = undefined;
@@ -1940,13 +2049,22 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
           // walls (and forest) break line of sight — you can hide
           if (d < bestD && this.losClear(inst, e.x, e.y, p.x, p.y)) { target = p; bestD = d; }
         }
-        if (target) e.targetSid = target.sid;
+        if (target) {
+          e.targetSid = target.sid;
+          seen = true;
+          e.lastSeenAt = now;
+          e.lastSeenX = target.x;
+          e.lastSeenY = target.y;
+        }
       }
 
       e.moving = false;
       if (target) {
-        const dx = target.x - e.x;
-        const dy = target.y - e.y;
+        // chase the target where it was LAST SEEN — no tracking through walls
+        const aimX = seen ? target.x : e.lastSeenX;
+        const aimY = seen ? target.y : e.lastSeenY;
+        const dx = aimX - e.x;
+        const dy = aimY - e.y;
         const dist = Math.hypot(dx, dy) || 1;
         e.angle = Math.atan2(dy, dx);
 
@@ -1978,8 +2096,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
         if (def.behavior === 'melee') {
           if (dist > def.attackRange - 4) {
-            chase(speed);
-          } else if (now >= e.nextAttackAt) {
+            // reached the last-seen spot and still nothing? stand and sniff around
+            if (!seen && dist < 18) { e.moving = false; }
+            else chase(speed);
+          } else if (seen && now >= e.nextAttackAt) {
             e.nextAttackAt = now + def.attackMs;
             this.damagePlayer(target, def.damage, `a ${def.name}`, null, null);
             this.hitFx(inst, target.x, target.y, def.damage, 'player');
@@ -1987,11 +2107,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         } else {
           if (dist > def.attackRange) {
             chase(def.speed);
-          } else if (dist < 120) {
+          } else if (seen && dist < 120) {
             this.moveEntity(inst, e, (-dx / dist) * def.speed * 0.7 * dt, (-dy / dist) * def.speed * 0.7 * dt, ENEMY_RADIUS, BLOCKS_ENEMY);
             e.moving = true;
           }
-          if (e.burstLeft <= 0 && now >= e.nextAttackAt && dist <= def.attackRange + 40) {
+          if (seen && e.burstLeft <= 0 && now >= e.nextAttackAt && dist <= def.attackRange + 40) {
             e.burstLeft = 3;
             e.nextAttackAt = now + def.attackMs + this.rnd() * 700;
           }
@@ -2051,6 +2171,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (attacker) {
       e.targetSid = attacker.sid;
       e.enraged = true; // neutral animals fight back (or bolt further) once hurt
+      e.lastSeenAt = Date.now(); // pain tells it exactly where you are
+      e.lastSeenX = attacker.x;
+      e.lastSeenY = attacker.y;
       if (ranged) this.addXp(attacker, 'shooting', dmg);
     }
     if (e.hp > 0) return;
@@ -2058,9 +2181,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (attacker) {
       attacker.kills++;
       this.toast(attacker.sid, `☠ ${ENEMY_DEFS[e.kind].name} down`);
-      // kill-quest progress
+      // kill-quest progress (locked quests don't tick — take them first)
       for (const def of this.quests) {
-        if (def.kind !== 'kill' || def.target !== e.kind) continue;
+        if (def.kind !== 'kill' || def.target !== e.kind || !this.questUnlocked(attacker, def)) continue;
         const prog = attacker.quests[def.id] ?? { kills: 0, claimed: false };
         if (!prog.claimed && prog.kills < def.count) {
           prog.kills++;
@@ -2076,213 +2199,6 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       inst.containers.set(id, { id, x: e.x, y: e.y, kind: 'bag', tier: 'normal', slots: drops, restockAt: null });
     }
     inst.enemyRespawns.push({ x: e.homeX, y: e.homeY, kind: e.kind, at: Date.now() + ENEMY_RESPAWN_MS + this.rnd() * 30_000 });
-  }
-
-  // ── survivor NPCs ─────────────────────────────────────────────────────────
-
-  private static readonly NPC_NAMES = ['Marek', 'Ivo', 'Sasha', 'Yuri', 'Petra', 'Dain', 'Olek', 'Vera'];
-  private static readonly NPC_SPEED = 150;
-
-  private spawnNpc(inst: Instance, hostile: boolean) {
-    const spawn = inst.spawns[Math.floor(this.rnd() * inst.spawns.length)];
-    if (!spawn) return;
-    const id = `npc${this.nextId++}`;
-    inst.npcs.set(id, {
-      id,
-      name: GameService.NPC_NAMES[Math.floor(this.rnd() * GameService.NPC_NAMES.length)],
-      x: spawn.x,
-      y: spawn.y,
-      angle: this.rnd() * Math.PI * 2,
-      hp: 100,
-      hostile,
-      weapon: hostile ? 'pistol' : 'axe',
-      targetSid: null,
-      targetI: -1,
-      nextSwingAt: 0,
-      lastSwingAt: 0,
-      nextShotAt: 0,
-      nextThinkAt: 0,
-      wanderAngle: this.rnd() * Math.PI * 2,
-      wandering: false,
-      moving: false,
-      detourUntil: 0,
-      detourAngle: 0,
-    });
-  }
-
-  private updateNpcs(inst: Instance, dt: number, now: number) {
-    for (const n of inst.npcs.values()) {
-      n.moving = false;
-      const steer = (speed: number, dirX: number, dirY: number) => {
-        if (now < n.detourUntil) {
-          this.moveEntity(inst, n, Math.cos(n.detourAngle) * speed * dt, Math.sin(n.detourAngle) * speed * dt, PLAYER_RADIUS, BLOCKS_ENEMY);
-          n.moving = true;
-          return;
-        }
-        const bx = n.x;
-        const by = n.y;
-        this.moveEntity(inst, n, dirX * speed * dt, dirY * speed * dt, PLAYER_RADIUS, BLOCKS_ENEMY);
-        n.moving = true;
-        if (Math.hypot(n.x - bx, n.y - by) < speed * dt * 0.35) {
-          n.detourAngle = Math.atan2(dirY, dirX) + (this.rnd() < 0.5 ? 1 : -1) * (Math.PI / 2 + this.rnd() * 0.6);
-          n.detourUntil = now + 450 + this.rnd() * 350;
-        }
-      };
-
-      // target upkeep: drop dead / distant / safe / wall-hidden marks
-      let target = n.targetSid ? this.players.get(n.targetSid) : undefined;
-      if (
-        !target ||
-        target.dead ||
-        target.instanceId !== inst.id ||
-        this.isSafeAt(inst, target.x, target.y) ||
-        Math.hypot(target.x - n.x, target.y - n.y) > 460
-      ) {
-        target = undefined;
-        n.targetSid = null;
-      }
-      // raiders acquire targets on sight (never through walls)
-      if (!target && n.hostile) {
-        let bestD = 300;
-        for (const p of this.players.values()) {
-          if (p.dead || p.instanceId !== inst.id || this.isSafeAt(inst, p.x, p.y)) continue;
-          const d = Math.hypot(p.x - n.x, p.y - n.y);
-          if (d < bestD && this.losClear(inst, n.x, n.y, p.x, p.y)) { target = p; bestD = d; }
-        }
-        if (target) n.targetSid = target.sid;
-      }
-
-      if (target) {
-        const dx = target.x - n.x;
-        const dy = target.y - n.y;
-        const dist = Math.hypot(dx, dy) || 1;
-        n.angle = Math.atan2(dy, dx);
-        const seen = this.losClear(inst, n.x, n.y, target.x, target.y);
-        if (n.weapon === 'pistol') {
-          if (dist > 200 || !seen) steer(GameService.NPC_SPEED, dx / dist, dy / dist);
-          if (seen && dist <= 280 && now >= n.nextShotAt) {
-            n.nextShotAt = now + 900 + this.rnd() * 500;
-            const a = n.angle + (this.rnd() - 0.5) * 0.14;
-            inst.projectiles.push({
-              id: this.nextId++,
-              x: n.x + Math.cos(n.angle) * (PLAYER_RADIUS + 6),
-              y: n.y + Math.sin(n.angle) * (PLAYER_RADIUS + 6),
-              vx: Math.cos(a) * 700,
-              vy: Math.sin(a) * 700,
-              angle: a,
-              traveled: 0,
-              range: 460,
-              damage: 11,
-              owner: n.id,
-              ownerKind: null,
-              weapon: 'pistol',
-            });
-          }
-        } else {
-          // provoked harvester: axe to the face
-          if (dist > 34) steer(GameService.NPC_SPEED * 1.05, dx / dist, dy / dist);
-          else if (now >= n.nextSwingAt) {
-            n.nextSwingAt = now + 700;
-            n.lastSwingAt = now;
-            this.damagePlayer(target, 13, n.name, 'axe', null);
-            this.hitFx(inst, target.x, target.y, 13, 'player');
-          }
-        }
-        continue;
-      }
-
-      // peaceful loop: find a tree, chop it, wander on
-      if (n.targetI >= 0 && inst.tiles[n.targetI] !== Tile.Tree) n.targetI = -1;
-      if (n.targetI >= 0) {
-        const tx = n.targetI % inst.w;
-        const ty = Math.floor(n.targetI / inst.w);
-        const cx = (tx + 0.5) * TILE;
-        const cy = (ty + 0.5) * TILE + TILE; // stand just south of the trunk
-        const dx = cx - n.x;
-        const dy = cy - n.y;
-        const dist = Math.hypot(dx, dy);
-        if (dist > 20) {
-          n.angle = Math.atan2(dy, dx);
-          steer(GameService.NPC_SPEED * 0.8, dx / dist, dy / dist);
-        } else {
-          n.angle = Math.atan2((ty + 0.5) * TILE - n.y, (tx + 0.5) * TILE - n.x);
-          if (now >= n.nextSwingAt) {
-            n.nextSwingAt = now + 900;
-            n.lastSwingAt = now;
-            this.npcChop(inst, n.targetI, now);
-          }
-        }
-        continue;
-      }
-      if (now >= n.nextThinkAt) {
-        n.nextThinkAt = now + 2500 + this.rnd() * 4000;
-        if (!n.hostile && this.rnd() < 0.65) {
-          // look for a tree within ~9 tiles
-          const ntx = Math.floor(n.x / TILE);
-          const nty = Math.floor(n.y / TILE);
-          let best = -1;
-          let bd = Infinity;
-          for (let ty = Math.max(1, nty - 9); ty <= Math.min(inst.h - 2, nty + 9); ty++)
-            for (let tx = Math.max(1, ntx - 9); tx <= Math.min(inst.w - 2, ntx + 9); tx++) {
-              if (inst.tiles[ty * inst.w + tx] !== Tile.Tree) continue;
-              const d = (tx - ntx) ** 2 + (ty - nty) ** 2;
-              if (d < bd) { bd = d; best = ty * inst.w + tx; }
-            }
-          if (best >= 0) { n.targetI = best; continue; }
-        }
-        n.wandering = this.rnd() < 0.7;
-        n.wanderAngle = this.rnd() * Math.PI * 2;
-      }
-      if (n.wandering) {
-        n.angle = n.wanderAngle;
-        steer(GameService.NPC_SPEED * 0.45, Math.cos(n.wanderAngle), Math.sin(n.wanderAngle));
-      }
-    }
-
-    // fallen survivors are replaced eventually
-    for (let i = inst.npcRespawns.length - 1; i >= 0; i--) {
-      if (now < inst.npcRespawns[i].at) continue;
-      this.spawnNpc(inst, inst.npcRespawns[i].hostile);
-      inst.npcRespawns.splice(i, 1);
-    }
-  }
-
-  /** NPC tree chopping: same depletion pipeline as players, no inventory. */
-  private npcChop(inst: Instance, i: number, now: number) {
-    this.hitFx(inst, (i % inst.w) * TILE + TILE / 2, Math.floor(i / inst.w) * TILE + TILE / 2, 1, 'node', 'wood');
-    const left = (inst.nodeHits.get(i) ?? NODE_HITS[Tile.Tree]!) - 1;
-    if (left <= 0) {
-      inst.nodeHits.delete(i);
-      inst.tiles[i] = Tile.Stump;
-      this.io?.to(inst.id).emit(EV.tile, { i, tile: Tile.Stump });
-      inst.nodeRespawns.push({ i, tile: Tile.Tree, at: now + NODE_RESPAWN_MS });
-    } else {
-      inst.nodeHits.set(i, left);
-    }
-  }
-
-  private damageNpc(inst: Instance, n: Npc, dmg: number, attacker: ServerPlayer | null, weapon: ItemId | null, ranged = false) {
-    n.hp -= dmg;
-    this.hitFx(inst, n.x, n.y, dmg, 'player');
-    if (attacker) {
-      n.targetSid = attacker.sid; // even the peaceful ones fight back
-      n.targetI = -1;
-      if (ranged) this.addXp(attacker, 'shooting', dmg);
-    }
-    if (n.hp > 0) return;
-    inst.npcs.delete(n.id);
-    const drops: InvSlot[] = n.hostile
-      ? [{ id: 'pistol', qty: 1 }, { id: 'ammo_9mm', qty: 6 + Math.floor(this.rnd() * 8) }]
-      : [{ id: 'wood', qty: 5 + Math.floor(this.rnd() * 8) }, { id: 'cloth', qty: 1 + Math.floor(this.rnd() * 3) }];
-    const bagId = `b${this.nextId++}`;
-    inst.containers.set(bagId, { id: bagId, x: n.x, y: n.y, kind: 'bag', tier: 'normal', slots: drops, restockAt: null });
-    if (attacker) {
-      attacker.kills++;
-      this.toast(attacker.sid, `☠ ${n.name} down`);
-      this.pushInventory(attacker);
-    }
-    this.io?.emit(EV.killfeed, { killer: attacker?.name ?? '?', victim: n.name, weapon });
-    inst.npcRespawns.push({ at: Date.now() + 150_000 + this.rnd() * 60_000, hostile: n.hostile });
   }
 
   /** Straight-line sight check — walls, trees and rock block vision. */
@@ -2332,22 +2248,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             alive = false;
             if (!this.isSafeAt(inst, target.x, target.y)) {
               const shooter = pr.ownerKind === null ? this.players.get(pr.owner) : undefined;
-              const killerName = pr.ownerKind
-                ? `a ${ENEMY_DEFS[pr.ownerKind].name}`
-                : shooter?.name ?? inst.npcs.get(pr.owner)?.name ?? '?';
+              const killerName = pr.ownerKind ? `a ${ENEMY_DEFS[pr.ownerKind].name}` : shooter?.name ?? '?';
               this.hitFx(inst, pr.x, pr.y, pr.damage, 'player');
               this.damagePlayer(target, pr.damage, killerName, pr.weapon, shooter ?? null);
             }
-            break;
-          }
-        }
-        if (!alive) break;
-        for (const n of inst.npcs.values()) {
-          if (n.id === pr.owner) continue;
-          if (Math.hypot(n.x - pr.x, n.y - pr.y) <= PLAYER_RADIUS + 3) {
-            alive = false;
-            const shooter = pr.ownerKind === null ? this.players.get(pr.owner) : undefined;
-            this.damageNpc(inst, n, pr.damage, shooter ?? null, pr.weapon, true);
             break;
           }
         }
@@ -2441,23 +2345,6 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         swing: now - p.lastSwingAt < 400 ? p.lastSwingAt : 0,
       });
     }
-    for (const n of inst.npcs.values()) {
-      allPlayers.push({
-        id: n.id,
-        name: n.name,
-        x: Math.round(n.x * 10) / 10,
-        y: Math.round(n.y * 10) / 10,
-        angle: Math.round(n.angle * 100) / 100,
-        hp: n.hp,
-        maxHp: PLAYER_MAX_HP,
-        weapon: n.weapon,
-        helmet: null,
-        vest: null,
-        dead: false,
-        moving: n.moving,
-        swing: now - n.lastSwingAt < 400 ? n.lastSwingAt : 0,
-      });
-    }
     const allEnemies: StateSnap['enemies'] = [...inst.enemies.values()].map((e) => ({
       id: e.id,
       kind: e.kind,
@@ -2519,6 +2406,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       nearWorkbench: this.nearTile(p, Tile.Workbench),
       nearFirepit: this.nearTile(p, Tile.Firepit),
       nearFurnace: this.nearTile(p, Tile.Furnace),
+      nearAnvil: this.nearTile(p, Tile.Anvil),
       nearWater: this.nearTile(p, Tile.Water),
       hunger: Math.round(p.hunger),
       thirst: Math.round(p.thirst),

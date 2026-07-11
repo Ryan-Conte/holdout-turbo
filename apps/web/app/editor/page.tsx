@@ -16,12 +16,14 @@ interface QuestRow {
   rewardMoney: number;
   rewardItem: string | null;
   rewardQty: number;
+  requiresId: number | null;
+  tier: number;
   active: boolean;
 }
 
 const EMPTY_QUEST: QuestRow = {
   id: 0, name: '', desc: '', kind: 'kill', target: 'zombie', count: 5,
-  rewardMoney: 50, rewardItem: null, rewardQty: 1, active: true,
+  rewardMoney: 50, rewardItem: null, rewardQty: 1, requiresId: null, tier: 1, active: true,
 };
 
 function QuestsEditor() {
@@ -98,6 +100,16 @@ function QuestsEditor() {
             <input type="number" value={form.rewardQty} onChange={(e) => set({ rewardQty: Number(e.target.value) })} />
           </>
         )}
+        <label className="ed-label">TRADER TIER</label>
+        <select value={form.tier} onChange={(e) => set({ tier: Number(e.target.value) })}>
+          <option value={1}>1 — Outpost quartermaster</option>
+          <option value={2}>2 — Black-market dealer (hot zones)</option>
+        </select>
+        <label className="ed-label">REQUIRES QUEST (unlock chain)</label>
+        <select value={form.requiresId ?? ''} onChange={(e) => set({ requiresId: e.target.value ? Number(e.target.value) : null })}>
+          <option value="">— none (always available) —</option>
+          {quests.filter((q) => q.id !== form.id).map((q) => <option key={q.id} value={q.id}>#{q.id} {q.name}</option>)}
+        </select>
         <label className="ed-label">
           <input type="checkbox" checked={form.active} onChange={(e) => set({ active: e.target.checked })} /> ACTIVE
         </label>
@@ -112,8 +124,9 @@ function QuestsEditor() {
             <div className="q-body">
               <b>#{q.id} {q.name}</b> {!q.active && <span className="q-off">INACTIVE</span>}
               <div className="q-meta">
-                {q.kind === 'kill' ? `kill ${q.count} ${q.target}` : `fetch ${q.count} ${q.target}`} → {q.rewardMoney}cr
+                T{q.tier} · {q.kind === 'kill' ? `kill ${q.count} ${q.target}` : `fetch ${q.count} ${q.target}`} → {q.rewardMoney}cr
                 {q.rewardItem ? ` + ${q.rewardQty}× ${q.rewardItem}` : ''}
+                {q.requiresId ? ` · needs #${q.requiresId}` : ''}
               </div>
             </div>
             <button onClick={() => setForm(q)}>EDIT</button>
@@ -121,6 +134,79 @@ function QuestsEditor() {
           </div>
         ))}
         {quests.length === 0 && <div className="ed-help">No quests yet — create one on the left. Players see them at any trader.</div>}
+      </div>
+    </div>
+  );
+}
+
+interface ServerRow { id: number; name: string; region: string; url: string; active: boolean; sort: number }
+
+/** Server-browser management: register game servers with regions. */
+function ServersEditor() {
+  const [servers, setServers] = useState<ServerRow[]>([]);
+  const [form, setForm] = useState({ name: '', region: 'local', url: 'http://localhost:3001' });
+  const [status, setStatus] = useState('');
+
+  const load = useCallback(async () => {
+    const res = await fetch('/api/admin/servers');
+    if (res.ok) setServers((await res.json()).servers ?? []);
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  const add = async () => {
+    setStatus('Saving…');
+    const res = await fetch('/api/admin/servers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(form),
+    });
+    const data = await res.json();
+    setStatus(res.ok ? 'Server registered' : `Error: ${data.error}`);
+    if (res.ok) {
+      setForm({ name: '', region: 'local', url: '' });
+      void load();
+    }
+  };
+
+  const toggle = async (s: ServerRow) => {
+    await fetch('/api/admin/servers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: s.id, active: !s.active }) });
+    void load();
+  };
+
+  const remove = async (id: number) => {
+    await fetch('/api/admin/servers', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+    void load();
+  };
+
+  return (
+    <div className="quests-editor">
+      <div className="q-form">
+        <h2>REGISTER SERVER</h2>
+        <label className="ed-label">NAME</label>
+        <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="EU West 1" />
+        <label className="ed-label">REGION</label>
+        <input value={form.region} onChange={(e) => setForm({ ...form, region: e.target.value })} placeholder="eu-west" />
+        <label className="ed-label">SOCKET URL</label>
+        <input value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} placeholder="https://eu1.holdout.gg" />
+        <button className="btn-primary" onClick={add}>REGISTER</button>
+        <div className="ed-status">{status}</div>
+        <div className="ed-help">
+          Players pick a server on the login screen. Every server must share the same
+          JWT_SECRET and database. &quot;Local&quot; is auto-seeded for dev.
+        </div>
+      </div>
+      <div className="q-list">
+        <h2>SERVERS ({servers.length})</h2>
+        {servers.map((s) => (
+          <div className="q-row" key={s.id}>
+            <div className="q-body">
+              <b>#{s.id} {s.name}</b> {!s.active && <span className="q-off">HIDDEN</span>}
+              <div className="q-meta">{s.region} · {s.url}</div>
+            </div>
+            <button onClick={() => toggle(s)}>{s.active ? 'HIDE' : 'SHOW'}</button>
+            <button onClick={() => remove(s.id)}>DELETE</button>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -139,6 +225,8 @@ const TILE_TOOLS: { tile: Tile; label: string; color: string }[] = [
   { tile: Tile.Wall, label: 'Wall', color: '#4c3a28' },
   { tile: Tile.Tree, label: 'Tree', color: '#2a4d2a' },
   { tile: Tile.Rock, label: 'Rock', color: '#77777d' },
+  { tile: Tile.CopperOre, label: 'Copper vein', color: '#c87a3a' },
+  { tile: Tile.IronOre, label: 'Iron vein', color: '#9aa4b0' },
 ];
 
 const OBJECT_TOOLS: { type: MapObjectType; label: string; color: string; letter: string }[] = [
@@ -154,13 +242,15 @@ const OBJECT_TOOLS: { type: MapObjectType; label: string; color: string; letter:
   { type: 'wolf', label: 'Wolf', color: '#6e7076', letter: 'W' },
   { type: 'extract', label: 'Extraction beacon', color: '#5ff08a', letter: 'E' },
   { type: 'trader', label: 'Trader outpost', color: '#78d878', letter: 'T' },
+  { type: 'trader_black', label: 'Black-market dealer', color: '#b078e0', letter: 'B' },
   { type: 'poi_town', label: 'POI: town', color: '#c25047', letter: 'P' },
-  { type: 'poi_airport', label: 'POI: airport', color: '#d8a24a', letter: 'A' },
+  { type: 'poi_airport', label: 'POI: airport (hot)', color: '#d8a24a', letter: 'A' },
+  { type: 'poi_hotzone', label: 'POI: high-loot zone', color: '#f05a3a', letter: 'H' },
 ];
 
 export default function EditorPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [tab, setTab] = useState<'map' | 'quests'>('map');
+  const [tab, setTab] = useState<'map' | 'quests' | 'servers'>('map');
   const [denied, setDenied] = useState(false);
   const [w, setW] = useState(100);
   const [h, setH] = useState(100);
@@ -342,6 +432,7 @@ export default function EditorPage() {
         <div className="ed-tabs">
           <button className={tab === 'map' ? 'active' : ''} onClick={() => setTab('map')}>MAP</button>
           <button className={tab === 'quests' ? 'active' : ''} onClick={() => setTab('quests')}>QUESTS</button>
+          <button className={tab === 'servers' ? 'active' : ''} onClick={() => setTab('servers')}>SERVERS</button>
         </div>
         {tab === 'map' && (<>
         <label className="ed-label">MAP NAME</label>
@@ -410,11 +501,15 @@ export default function EditorPage() {
         </div>
         </>)}
         {tab === 'quests' && (
-          <div className="ed-help">Create jobs the trader NPC hands out — kill or fetch quests with credit/item rewards. Changes go live within a minute, no restart needed.</div>
+          <div className="ed-help">Create jobs traders hand out — kill or fetch quests with credit/item rewards, chained via REQUIRES into a quest tree. Tier 2 quests only appear at black-market dealers. Changes go live within a minute, no restart needed.</div>
+        )}
+        {tab === 'servers' && (
+          <div className="ed-help">Register game servers for the login-screen server browser. Hide instead of delete to take one down for maintenance.</div>
         )}
       </div>
       {tab === 'quests' && <QuestsEditor />}
-      <div className="editor-canvas-wrap" style={tab === 'quests' ? { display: 'none' } : undefined}>
+      {tab === 'servers' && <ServersEditor />}
+      <div className="editor-canvas-wrap" style={tab !== 'map' ? { display: 'none' } : undefined}>
         <canvas
           ref={canvasRef}
           width={w * scale}

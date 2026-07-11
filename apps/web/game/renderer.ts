@@ -1,4 +1,5 @@
 import {
+  BLOCKS_BULLET,
   ContainerSnap,
   EnemySnap,
   GroundItemSnap,
@@ -66,6 +67,8 @@ export interface WorldView {
   ghost: { tile: number; tx: number; ty: number; valid: boolean } | null; // build placement preview
   highlight: { x: number; y: number } | null; // nearest interactable — pulsing ring
   demolish: { tx: number; ty: number; valid: boolean } | null; // demolish-mode tile marker
+  fog: boolean; // dim tiles the player has no line of sight to (world only)
+  cursor: { x: number; y: number } | null; // world-space aim point — drawn crosshair
 }
 
 interface Particle {
@@ -122,6 +125,9 @@ const MINI_COLORS: Record<number, string> = {
   [Tile.Door]: "#7a5a34",
   [Tile.Fence]: "#7a5a34",
   [Tile.Torch]: "#d8722a",
+  [Tile.CopperOre]: "#c87a3a",
+  [Tile.IronOre]: "#9aa4b0",
+  [Tile.Anvil]: "#5c5c64",
 };
 
 export class Renderer {
@@ -131,6 +137,10 @@ export class Renderer {
 
   private particles: Particle[] = [];
   private flashes: Flash[] = [];
+  // LOS fog cache: recomputed when the player crosses a tile or the map changes
+  private fogKey = "";
+  private fogVersion = 0;
+  private fogBlocked: Set<number> = new Set();
   private falling: FallingTree[] = [];
   private corpses: Corpse[] = [];
   private shakes = new Map<number, number>(); // tile idx -> shake start (time s)
@@ -139,6 +149,8 @@ export class Renderer {
   private lastTime = 0;
   private kickUntil = 0;
   private kickAngle = 0;
+
+  private unders: Map<number, number>;
 
   constructor(
     private tiles: number[],
@@ -149,7 +161,9 @@ export class Renderer {
     private traders: { x: number; y: number }[],
     private exit: { x: number; y: number } | null,
     private extracts: { x: number; y: number }[] = [],
+    unders: Record<number, number> = {},
   ) {
+    this.unders = new Map(Object.entries(unders).map(([k, v]) => [Number(k), v]));
     this.mapCanvas = document.createElement("canvas");
     this.mapCanvas.width = w * TILE;
     this.mapCanvas.height = h * TILE;
@@ -167,6 +181,22 @@ export class Renderer {
   /** Public read of the live tile map (used by the client for build validity). */
   tileAtPublic(x: number, y: number): number {
     return this.tileAt(x, y);
+  }
+
+  /** Client-side sightline check — mirrors the server's wall-vision rules. */
+  private losTo(x1: number, y1: number, x2: number, y2: number): boolean {
+    const dist = Math.hypot(x2 - x1, y2 - y1);
+    if (dist < 1) return true;
+    const steps = Math.ceil(dist / 12);
+    const sx = (x2 - x1) / steps;
+    const sy = (y2 - y1) / steps;
+    for (let s = 1; s < steps; s++) {
+      const tx = Math.floor((x1 + sx * s) / TILE);
+      const ty = Math.floor((y1 + sy * s) / TILE);
+      if (tx < 0 || ty < 0 || tx >= this.w || ty >= this.h) return false;
+      if (BLOCKS_BULLET[this.tiles[ty * this.w + tx]]) return false;
+    }
+    return true;
   }
 
   // ── sprite helpers ──────────────────────────────────────────────────────
@@ -246,11 +276,11 @@ export class Renderer {
     for (let ty = 0; ty < this.h; ty++)
       for (let tx = 0; tx < this.w; tx++) this.drawBaseTile(ctx, tx, ty);
 
-    // safe zone markers baked into the ground
+    // safe-zone and hot-zone markers baked into the ground
     for (const poi of this.pois) {
-      if (!poi.safe) continue;
+      if (!poi.safe && !poi.hot) continue;
       ctx.save();
-      ctx.strokeStyle = "rgba(150, 200, 130, 0.35)";
+      ctx.strokeStyle = poi.hot ? "rgba(240, 90, 58, 0.4)" : "rgba(150, 200, 130, 0.35)";
       ctx.lineWidth = 3;
       ctx.setLineDash([10, 8]);
       ctx.beginPath();
@@ -267,6 +297,14 @@ export class Renderer {
       }
   }
 
+  /** Base under a placed piece: the floor it was built on, else grass. */
+  private blitUnderlay(ctx: CanvasRenderingContext2D, tx: number, ty: number, dx: number, dy: number) {
+    const under = this.unders.get(ty * this.w + tx);
+    if (under === Tile.WoodFloor) this.blitTile(ctx, 19, dx, dy);
+    else if (under === Tile.StoneFloor) this.blitTile(ctx, 20, dx, dy);
+    else this.blitTile(ctx, hash2(tx, ty) < 0.5 ? 0 : 1, dx, dy);
+  }
+
   private drawBaseTile(ctx: CanvasRenderingContext2D, tx: number, ty: number) {
     const t = this.tileAt(tx, ty);
     const dx = tx * TILE;
@@ -275,6 +313,8 @@ export class Renderer {
       case Tile.Grass:
       case Tile.Tree:
       case Tile.Rock:
+      case Tile.CopperOre:
+      case Tile.IronOre:
         this.blitTile(ctx, hash2(tx, ty) < 0.5 ? 0 : 1, dx, dy);
         break;
       case Tile.Water:
@@ -301,17 +341,17 @@ export class Renderer {
         break;
       }
       case Tile.Workbench: {
-        this.blitTile(ctx, hash2(tx, ty) < 0.5 ? 0 : 1, dx, dy);
+        this.blitUnderlay(ctx, tx, ty, dx, dy);
         this.blitTile(ctx, 14, dx, dy);
         break;
       }
       case Tile.Firepit: {
-        this.blitTile(ctx, hash2(tx, ty) < 0.5 ? 0 : 1, dx, dy);
+        this.blitUnderlay(ctx, tx, ty, dx, dy);
         this.blitTile(ctx, 15, dx, dy);
         break;
       }
       case Tile.Furnace: {
-        this.blitTile(ctx, hash2(tx, ty) < 0.5 ? 0 : 1, dx, dy);
+        this.blitUnderlay(ctx, tx, ty, dx, dy);
         this.blitTile(ctx, 16, dx, dy);
         break;
       }
@@ -351,13 +391,21 @@ export class Renderer {
       case Tile.Torch:
         this.blitTile(ctx, 24, dx, dy);
         break;
+      case Tile.Anvil: {
+        this.blitUnderlay(ctx, tx, ty, dx, dy);
+        this.blitTile(ctx, 27, dx, dy);
+        break;
+      }
     }
   }
 
-  /** Server changed a tile (harvest / regrowth). */
-  applyTile(i: number, tile: number) {
+  /** Server changed a tile (harvest / regrowth / build). `under` = floor beneath a station. */
+  applyTile(i: number, tile: number, under?: number) {
     const old = this.tiles[i];
     this.tiles[i] = tile;
+    if (under !== undefined) this.unders.set(i, under);
+    else this.unders.delete(i);
+    this.fogVersion++; // sightlines may have changed
     const tx = i % this.w;
     const ty = Math.floor(i / this.w);
     if (old === Tile.Tree && tile === Tile.Grass) {
@@ -568,10 +616,11 @@ export class Renderer {
             y: by,
             fn: () => this.drawTreeSprite(ctx, cx, by, 0, 1, shakeX),
           });
-        } else if (t === Tile.Rock) {
+        } else if (t === Tile.Rock || t === Tile.CopperOre || t === Tile.IronOre) {
           const i = ty * this.w + tx;
           const dx = tx * TILE;
           const dy = ty * TILE;
+          const col = t === Tile.Rock ? 12 : t === Tile.CopperOre ? 25 : 26;
           const shakeAt = this.shakes.get(i);
           let shakeX = 0;
           if (shakeAt !== undefined) {
@@ -584,7 +633,7 @@ export class Renderer {
             fn: () =>
               ctx.drawImage(
                 this.sheets.tiles,
-                12 * SPR,
+                col * SPR,
                 0,
                 SPR,
                 SPR,
@@ -665,6 +714,33 @@ export class Renderer {
     }
     ctx.globalAlpha = 1;
 
+    // LOS fog: dim what you cannot see past walls/forest — matches server vision rules
+    if (view.fog && you) {
+      const key = `${Math.floor(you.dx / TILE)},${Math.floor(you.dy / TILE)},${this.fogVersion}`;
+      if (key !== this.fogKey) {
+        this.fogKey = key;
+        this.fogBlocked.clear();
+        const px = you.dx;
+        const py = you.dy;
+        for (let ty = tMinY; ty <= tMaxY; ty++)
+          for (let tx = tMinX; tx <= tMaxX; tx++) {
+            const cx = tx * TILE + TILE / 2;
+            const cy = ty * TILE + TILE / 2;
+            if (Math.hypot(cx - px, cy - py) < 140) continue; // you always sense your surroundings
+            if (!this.losTo(px, py, cx, cy)) this.fogBlocked.add(ty * this.w + tx);
+          }
+      }
+      ctx.save();
+      ctx.fillStyle = "rgba(6, 8, 12, 0.42)";
+      for (const i of this.fogBlocked) {
+        const tx = i % this.w;
+        const ty = Math.floor(i / this.w);
+        if (tx < tMinX || tx > tMaxX || ty < tMinY || ty > tMaxY) continue;
+        ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+      }
+      ctx.restore();
+    }
+
     // pulsing ring under the nearest interactable (what E will act on)
     if (view.highlight) {
       const pulse = 0.5 + 0.5 * Math.sin(view.time * 5);
@@ -736,6 +812,26 @@ export class Renderer {
           ctx.fillStyle = g;
           ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
         }
+      ctx.restore();
+    }
+
+    // crosshair at the aim point — the gun barrel sits on this line
+    if (view.cursor && you && !you.dead) {
+      const c = view.cursor;
+      ctx.save();
+      ctx.strokeStyle = "rgba(240, 216, 120, 0.85)";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, 6, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      for (const [dx1, dy1, dx2, dy2] of [[0, -9, 0, -5], [0, 9, 0, 5], [-9, 0, -5, 0], [9, 0, 5, 0]]) {
+        ctx.moveTo(c.x + dx1, c.y + dy1);
+        ctx.lineTo(c.x + dx2, c.y + dy2);
+      }
+      ctx.stroke();
+      ctx.fillStyle = "rgba(240, 216, 120, 0.9)";
+      ctx.fillRect(c.x - 0.75, c.y - 0.75, 1.5, 1.5);
       ctx.restore();
     }
 
@@ -815,15 +911,25 @@ export class Renderer {
       const y = (poi.y / TILE) * s;
       ctx.strokeStyle = poi.safe
         ? "rgba(140, 210, 130, 0.9)"
-        : poi.kind === "airport"
-          ? "rgba(216, 162, 74, 0.8)"
-          : "rgba(194, 80, 71, 0.8)";
+        : poi.hot
+          ? "rgba(240, 90, 58, 0.95)"
+          : poi.kind === "airport"
+            ? "rgba(216, 162, 74, 0.8)"
+            : "rgba(194, 80, 71, 0.8)";
       ctx.lineWidth = 1;
       ctx.strokeRect(x - 3, y - 3, 6, 6);
+      if (poi.hot) {
+        // high-loot zones ring the minimap so the risk/reward reads at a glance
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.arc(x, y, (poi.r / TILE) * s, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
       ctx.font = "8px monospace";
       ctx.textAlign = "center";
-      ctx.fillStyle = "rgba(230, 228, 210, 0.95)";
-      ctx.fillText(poi.name, x, y - 6);
+      ctx.fillStyle = poi.hot ? "rgba(255, 170, 150, 0.95)" : "rgba(230, 228, 210, 0.95)";
+      ctx.fillText(poi.hot ? `☠ ${poi.name}` : poi.name, x, y - 6);
     }
     for (const tr of this.traders) {
       ctx.fillStyle = "#d8c26a";
@@ -940,23 +1046,33 @@ export class Renderer {
     weapon: ItemId,
     angle: number,
     swingPhase: number | null,
+    recoil = 0,
   ) {
     const def = ITEMS[weapon];
+    const isGun = !!def.weapon;
     ctx.save();
     ctx.translate(x, y + 2);
     let a = angle;
-    let reach = 8;
-    if (swingPhase !== null) {
+    let reach = isGun ? 10 - recoil * 4 : 8; // guns kick back into the shoulder
+    if (swingPhase !== null && !isGun) {
       if (weapon === "spear") reach += Math.sin(swingPhase * Math.PI) * 14;
       else a += -0.9 + easeOut(swingPhase) * 1.6;
     }
     ctx.rotate(a);
-    ctx.translate(reach, 0);
-    ctx.rotate(Math.PI / 4); // icons are drawn diagonal-ish; nudge toward pointing right
+    // guns are drawn barrel-right in the sheet: keep them ON the aim line so the
+    // muzzle matches the crosshair; flip vertically when aiming left so they
+    // never render upside-down. Tools keep the diagonal-icon nudge.
+    if (isGun) {
+      if (Math.cos(angle) < 0) ctx.scale(1, -1);
+      ctx.translate(reach, 0);
+    } else {
+      ctx.translate(reach, 0);
+      ctx.rotate(Math.PI / 4);
+    }
     this.blitItem(ctx, weapon, -12, -12, 24);
     ctx.restore();
 
-    if (swingPhase !== null && weapon !== "spear") {
+    if (swingPhase !== null && !isGun && weapon !== "spear") {
       ctx.save();
       ctx.translate(x, y + 2);
       ctx.strokeStyle = `rgba(255,255,255,${0.45 * (1 - swingPhase)})`;
@@ -1041,9 +1157,10 @@ export class Renderer {
       ctx.fillRect(p.dx - 8, p.dy - 4 - bob, 16, 7);
     }
 
-    if (p.weapon && !swimming)
-      this.drawHeldItem(ctx, p.dx, p.dy, p.weapon, p.angle, swingPhase);
-    else if (swingPhase !== null && !swimming) {
+    if (p.weapon && !swimming) {
+      const recoil = isYou && view.time < this.kickUntil ? (this.kickUntil - view.time) / 0.09 : 0;
+      this.drawHeldItem(ctx, p.dx, p.dy, p.weapon, p.angle, swingPhase, recoil);
+    } else if (swingPhase !== null && !swimming) {
       // bare-fist jab, alternating hands
       const side = Math.floor(p.swing / 400) & 1 ? 1 : -1;
       const ext = Math.sin(swingPhase * Math.PI) * 12;
@@ -1237,6 +1354,7 @@ function tileSpriteCol(tile: number): number {
     case Tile.Door: return 22;
     case Tile.Fence: return 23;
     case Tile.Torch: return 24;
+    case Tile.Anvil: return 27;
     default: return -1; // chest has no tile sprite; ghost falls back to the green box
   }
 }

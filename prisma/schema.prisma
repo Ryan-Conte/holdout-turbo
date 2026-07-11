@@ -76,6 +76,7 @@ model Profile {
   money     Int      @default(25)
   kills     Int      @default(0)
   deaths    Int      @default(0)
+  admin     Boolean  @default(false) // grants /editor + admin APIs (env ADMIN_EMAILS bootstraps this)
   hideout   Json? // { storage: InvSlot[], objects: [{type, tx, ty, slots?}] }
   updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
 
@@ -112,8 +113,22 @@ model Quest {
   rewardMoney  Int      @default(0)
   rewardItem   String?
   rewardQty    Int      @default(1)
+  requiresId   Int? // quest tree: must claim this quest first
+  tier         Int      @default(1) // 1 = outpost trader, 2 = hotzone black-market
   active       Boolean  @default(true)
   updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
 
   @@map("quests")
+}
+
+model GameServer {
+  id        Int      @id @default(autoincrement())
+  name      String
+  region    String   @default("local")
+  url       String // socket endpoint, e.g. http://localhost:3001
+  active    Boolean  @default(true)
+  sort      Int      @default(0)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("game_servers")
 }

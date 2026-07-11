@@ -10,7 +10,11 @@
     "dev": "turbo run dev",
     "build": "turbo run build",
     "lint": "turbo run lint",
-    "typecheck": "turbo run typecheck"
+    "typecheck": "turbo run typecheck",
+    "deploy:api": "npm --workspace=apps/api run build && npm --workspace=apps/api run deploy",
+    "deploy:web": "npm --workspace=apps/web run build && npm --workspace=apps/web run deploy",
+    "deploy:api:ci": "npm --workspace=apps/api run build --if-present && echo \"Replace this with your CI/CD deploy command (scp/rsync/docker push, etc.)\"",
+    "deploy:web:ci": "npm --workspace=apps/web run build --if-present && echo \"Replace this with your CI/CD deploy command (scp/rsync/docker push, etc.)\""
   },
   "devDependencies": {
     "pngjs": "^7.0.0",

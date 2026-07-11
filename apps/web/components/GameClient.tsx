@@ -35,11 +35,20 @@ import {
   xpForLevel,
 } from '@holdout/shared';
 import { DamageFloat, RenderEnemy, RenderPlayer, Renderer } from '@/game/renderer';
+import { Tip, itemTip } from '@/components/Tooltip';
 import { ITEM_INDEX, ITEM_SHEET_ORDER, loadSheets } from '@/game/sprites';
 import { initSfx, isMuted, sfx, startAmbient, toggleMute } from '@/game/sfx';
 import { authClient } from '@/lib/auth-client';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+/** the server picked in the login-screen server browser (falls back to env) */
+function gameServerUrl(): string {
+  try {
+    return localStorage.getItem('holdout_server_url') || API_URL;
+  } catch {
+    return API_URL;
+  }
+}
 const MINIMAP_SIZE = 168;
 
 interface Toast { id: number; msg: string }
@@ -89,13 +98,13 @@ export function ItemIcon({ id, size = 28 }: { id: ItemId; size?: number }) {
 const CRAFT_TABS: { cat: RecipeCat; label: string }[] = [
   { cat: 'survival', label: 'SURVIVAL' },
   { cat: 'medical', label: 'MEDICAL' },
-  { cat: 'ammo', label: 'AMMO' },
   { cat: 'gear', label: 'GEAR' },
-  { cat: 'mods', label: 'MODS' },
   { cat: 'build', label: 'BUILD' },
+  { cat: 'smelt', label: 'SMELT' },
+  { cat: 'forge', label: 'FORGE' },
 ];
 
-const STATION_LABEL: Record<string, string> = { workbench: 'workbench', furnace: 'furnace' };
+const STATION_LABEL: Record<string, string> = { workbench: 'workbench', furnace: 'furnace', anvil: 'anvil' };
 
 export default function GameClient() {
   const router = useRouter();
@@ -126,7 +135,7 @@ export default function GameClient() {
   const dragConsumed = useRef(false);
   const lastStepAt = useRef(0);
   const lastGroanAt = useRef(0);
-  const placingRef = useRef<{ slot: number; item: ItemId } | null>(null);
+  const heldKitRef = useRef<{ slot: number; item: ItemId } | null>(null); // equipped placeable = placement mode
   const chatOpenRef = useRef(false);
   const menuRef = useRef({ gear: false, craft: false, skills: false, social: false });
   const lootContRef = useRef<string | null>(null); // container the loot queue belongs to
@@ -151,6 +160,9 @@ export default function GameClient() {
   const [craftSel, setCraftSel] = useState<string | null>(null);
   const [container, setContainer] = useState<ContainerContents | null>(null);
   const [trade, setTrade] = useState<TradeOpen | null>(null);
+  const [tradeTab, setTradeTab] = useState<'buy' | 'sell' | 'jobs'>('buy');
+  const [buySel, setBuySel] = useState<ItemId | null>(null);
+  const [sellSel, setSellSel] = useState<number | null>(null); // backpack slot index
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [feed, setFeed] = useState<(KillFeedEntry & { id: number })[]>([]);
   const [dead, setDead] = useState<string | null>(null);
@@ -171,7 +183,6 @@ export default function GameClient() {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatText, setChatText] = useState('');
   const [chatLog, setChatLog] = useState<(ChatMsg & { at: number })[]>([]);
-  const [placing, setPlacing] = useState<{ slot: number; item: ItemId } | null>(null);
   const [action, setAction] = useState<{ label: string; until: number; ms: number; kind?: string; container?: string; slot?: number } | null>(null);
   const [lootQueue, setLootQueue] = useState<number[]>([]); // container slots queued for taking
   const [cookQueue, setCookQueue] = useState<number[]>([]); // inventory slots queued for cooking
@@ -179,6 +190,7 @@ export default function GameClient() {
   const [station, setStation] = useState<'firepit' | null>(null); // open campfire UI
   const [clock, setClock] = useState('');
   const [demolishMode, setDemolishMode] = useState(false); // camp demolish mode (X)
+  const [escMenu, setEscMenu] = useState(false); // pause/system menu (ESC)
   const [objectives, setObjectives] = useState<Record<string, boolean>>(() => {
     try { return JSON.parse(localStorage.getItem('holdout_objectives') ?? '{}'); } catch { return {}; }
   });
@@ -205,15 +217,15 @@ export default function GameClient() {
   }, []);
 
   useEffect(() => { containerRef.current = container; }, [container]);
-  useEffect(() => { latestInvRef.current = inv; }, [inv]);
-  useEffect(() => { placingRef.current = placing; }, [placing]);
-  useEffect(() => { demolishRef.current = demolishMode; }, [demolishMode]);
-  // leave placement mode once the held kit runs out
   useEffect(() => {
-    if (!placing) return;
-    const s = inv?.inv.slots[placing.slot];
-    if (!s || s.id !== placing.item || !ITEMS[s.id].place) setPlacing(null);
-  }, [inv, placing]);
+    latestInvRef.current = inv;
+    // holding a build kit in hand = placement mode (ghost + click-to-place)
+    const s = inv?.equipped !== null && inv?.equipped !== undefined ? inv.inv.slots[inv.equipped] : null;
+    heldKitRef.current = s && ITEMS[s.id].place ? { slot: inv!.equipped!, item: s.id } : null;
+  }, [inv]);
+  useEffect(() => { demolishRef.current = demolishMode; }, [demolishMode]);
+  const escMenuRef = useRef(false);
+  useEffect(() => { escMenuRef.current = escMenu; }, [escMenu]);
   // Loot queue: fire the next queued containerTake once the current timed action clears.
   // The server runs one action at a time, so queued clicks drain sequentially.
   useEffect(() => {
@@ -275,19 +287,25 @@ export default function GameClient() {
     }
   }, []);
 
-  // Cook queue: keep cooking queued raw-food slots until each stack is done.
+  // Cook queue: every entry is ONE cook of that slot (click = +1). Entries are
+  // popped as they fire so a stuck server action can never wedge the queue.
   useEffect(() => {
     if (action) { cookAwaitRef.current = null; return; }
     if (cookQueue.length === 0) return;
+    const aw = cookAwaitRef.current;
+    if (aw && Date.now() - aw.at < 900) {
+      // fired but the action hasn't arrived (or was rejected) — re-check shortly
+      const t = setTimeout(() => setCookQueue((q) => [...q]), 950);
+      return () => clearTimeout(t);
+    }
     const slots = inv?.inv.slots;
     if (!slots || !inv?.nearFirepit) { setCookQueue([]); return; }
-    const valid = cookQueue.filter((i) => { const s = slots[i]; return s && ITEMS[s.id].raw; });
-    if (valid.length !== cookQueue.length) { setCookQueue(valid); return; }
-    const next = valid[0];
-    const aw = cookAwaitRef.current;
-    if (aw && aw.slot === next && Date.now() - aw.at < 800) return;
-    cookAwaitRef.current = { slot: next, at: Date.now() };
-    socketRef.current?.emit(EV.invUse, { slot: next });
+    const i = cookQueue[0];
+    setCookQueue((q) => q.slice(1));
+    const s = slots[i];
+    if (!s || !ITEMS[s.id].raw) return; // stack moved or finished — skip this entry
+    cookAwaitRef.current = { slot: i, at: Date.now() };
+    socketRef.current?.emit(EV.invUse, { slot: i });
   }, [action, inv, cookQueue]);
   // Craft queue: each craft is a timed server action; fire the next once the bar clears.
   useEffect(() => {
@@ -322,16 +340,18 @@ export default function GameClient() {
     setTrade(null);
     setStation(null);
     if (which !== 'gear') { setContainer(null); socketRef.current?.emit(EV.containerClose); }
-    if (which !== null) { setPlacing(null); setDemolishMode(false); }
+    if (which !== null) setDemolishMode(false);
+    setEscMenu(false);
   }, []);
 
-  // begin holding a placeable item to place it (ghost preview follows the cursor)
-  const startPlacing = useCallback((slot: number, item: ItemId) => {
+  // no build mode: holding a kit IS placement — equip it, ghost follows, click places
+  const holdKit = useCallback((slot: number) => {
     only(null);
     setCtxMenu(null);
     setDemolishMode(false);
-    setPlacing({ slot, item });
-    pushToast('Click the ground to place · ESC to cancel');
+    const u = latestInvRef.current;
+    if (u?.equipped !== slot) socketRef.current?.emit(EV.invEquip, { slot });
+    pushToast('Holding the kit — click the ground to place');
   }, [only, pushToast]);
 
   const toggleDemolish = useCallback(() => {
@@ -340,21 +360,20 @@ export default function GameClient() {
       return;
     }
     only(null);
-    setPlacing(null);
     setDemolishMode((d) => !d);
   }, [only, pushToast]);
 
-  // selecting a hotbar slot: placeables enter placement mode; weapons/tools/food
-  // get held in hand (click to use/attack); armor/mods/backpacks apply immediately
+  // selecting a hotbar slot: weapons/tools/food/kits get held in hand
+  // (click to use/attack/place); armor/mods/backpacks apply immediately
   const useSlot = useCallback((i: number) => {
     const s = latestInvRef.current?.inv.slots[i];
     if (!s) return;
     const def = ITEMS[s.id];
-    if (def.place) startPlacing(i, s.id);
-    else if (def.kind === 'weapon' || def.kind === 'tool' || def.kind === 'consumable')
+    const kind = def.kind;
+    if (kind === 'weapon' || kind === 'tool' || kind === 'consumable' || kind === 'placeable')
       socketRef.current?.emit(EV.invEquip, { slot: i });
     else socketRef.current?.emit(EV.invUse, { slot: i });
-  }, [startPlacing]);
+  }, []);
 
   // scroll wheel cycles the equipped weapon/tool across hotbar slots 1-5
   const cycleHotbar = useCallback((dir: number) => {
@@ -364,7 +383,7 @@ export default function GameClient() {
     for (let i = 0; i < 5 && i < u.inv.slots.length; i++) {
       const s = u.inv.slots[i];
       const k = s && ITEMS[s.id].kind;
-      if (k === 'weapon' || k === 'tool' || k === 'consumable') cand.push(i);
+      if (k === 'weapon' || k === 'tool' || k === 'consumable' || k === 'placeable') cand.push(i);
     }
     if (cand.length === 0) return;
     const at = u.equipped === null ? -1 : cand.indexOf(u.equipped);
@@ -408,7 +427,7 @@ export default function GameClient() {
       const sheets = await loadSheets();
       if (cancelled) return;
 
-      socket = io(API_URL, { auth: { token }, transports: ['websocket'] });
+      socket = io(gameServerUrl(), { auth: { token }, transports: ['websocket'] });
       socketRef.current = socket;
 
       socket.on('connect_error', () => setFailed('Cannot reach the game server. Is the API running on :3001?'));
@@ -416,13 +435,12 @@ export default function GameClient() {
       socket.on(EV.init, (init: WorldInit) => {
         youRef.current = init.you;
         initRef.current = init;
-        rendererRef.current = new Renderer(init.tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? []);
+        rendererRef.current = new Renderer(init.tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {});
         displayPos.current.clear();
         seenProjectiles.current.clear();
         snapRef.current = null;
         setInHideout(init.kind === 'hideout');
         setOwnHideout(init.ownHideout);
-        setPlacing(null);
         setDemolishMode(false);
         setStation(null);
         setContainer(null);
@@ -533,10 +551,13 @@ export default function GameClient() {
           only(null);
           setStation('firepit');
         } else if (s.type === 'furnace') {
-          setCraftTab('ammo');
+          setCraftTab('smelt');
           only('craft');
         } else if (s.type === 'workbench') {
-          setCraftTab('mods');
+          setCraftTab('survival');
+          only('craft');
+        } else if (s.type === 'anvil') {
+          setCraftTab('forge');
           only('craft');
         }
       });
@@ -557,7 +578,7 @@ export default function GameClient() {
           else sfx.hit(Math.max(0.2, 1 - d / 380));
         }
       });
-      socket.on(EV.tile, (u: TileUpdate) => rendererRef.current?.applyTile(u.i, u.tile));
+      socket.on(EV.tile, (u: TileUpdate) => rendererRef.current?.applyTile(u.i, u.tile, u.under));
       socket.on(EV.action, (a: ActionSnap) => {
         setAction(a.ms > 0 ? { label: a.label, until: Date.now() + a.ms, ms: a.ms, kind: a.kind, container: a.container, slot: a.slot } : null);
       });
@@ -586,8 +607,8 @@ export default function GameClient() {
   }, [router, pushToast, only, completeObjective]);
 
   useEffect(() => {
-    panelsOpenRef.current = showGear || showCraft || showSocial || showSkills || !!container || !!trade || chatOpen || !!ctxMenu || !!station;
-  }, [showGear, showCraft, showSocial, showSkills, container, trade, chatOpen, ctxMenu, station]);
+    panelsOpenRef.current = showGear || showCraft || showSocial || showSkills || !!container || !!trade || chatOpen || !!ctxMenu || !!station || escMenu;
+  }, [showGear, showCraft, showSocial, showSkills, container, trade, chatOpen, ctxMenu, station, escMenu]);
 
   // ── actions ─────────────────────────────────────────────────────────────
   const emit = useCallback((ev: string, payload?: unknown) => socketRef.current?.emit(ev, payload), []);
@@ -632,21 +653,26 @@ export default function GameClient() {
       else if (e.code === 'KeyP') { only(menuRef.current.social ? null : 'social'); void refreshFriends(); }
       else if (e.code === 'KeyQ') quickHeal();
       else if (e.code === 'KeyB') {
-        // hold the first placeable kit you own and place it
+        // grab the first build kit you own into your hand
         const u = latestInvRef.current;
         const s = u?.inv.slots.findIndex((x) => x && ITEMS[x.id].place) ?? -1;
-        if (u && s >= 0) startPlacing(s, u.inv.slots[s]!.id);
-        else pushToast('Craft a firepit/workbench/furnace kit first (C → BUILD)');
+        if (u && s >= 0) holdKit(s);
+        else pushToast('Craft a build kit first (C → BUILD)');
       }
       else if (e.code === 'KeyX') toggleDemolish();
       else if (e.code === 'KeyM') setMuted(toggleMute());
       else if (e.code === 'Enter' || e.code === 'KeyT') { e.preventDefault(); setChatOpen(true); }
       else if (/^Digit[1-5]$/.test(e.code)) useSlot(Number(e.code.slice(5)) - 1);
       else if (e.code === 'Escape') {
-        only(null);
-        setCtxMenu(null);
-        setPlacing(null);
-        setDemolishMode(false);
+        if (escMenuRef.current) {
+          setEscMenu(false);
+        } else if (panelsOpenRef.current || demolishRef.current) {
+          only(null);
+          setCtxMenu(null);
+          setDemolishMode(false);
+        } else {
+          setEscMenu(true); // nothing open — bring up the system menu
+        }
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -662,8 +688,8 @@ export default function GameClient() {
       if (!(e.target instanceof Element && e.target.closest('.ctx-menu'))) setCtxMenu(null);
       if (e.button !== 0) return;
       if (e.target instanceof Element && e.target.closest('.panel, .gear-screen, .death-overlay, .hotbar, .ctx-menu, button, input, .chat-bar')) return;
-      // placement: click the ground to place the held kit
-      const pl = placingRef.current;
+      // holding a build kit: click the ground to place it (no separate build mode)
+      const pl = heldKitRef.current;
       if (pl && snapRef.current) {
         const you = snapRef.current.players.find((p) => p.id === youRef.current);
         if (you) {
@@ -704,7 +730,7 @@ export default function GameClient() {
     };
     const onWheel = (e: WheelEvent) => {
       // let panels (crafting grid, stash) scroll normally; only steer the hotbar in-world
-      if (panelsOpenRef.current || placingRef.current || demolishRef.current) return;
+      if (panelsOpenRef.current || demolishRef.current) return;
       cycleHotbar(e.deltaY > 0 ? 1 : -1);
     };
     window.addEventListener('keydown', onKeyDown);
@@ -723,7 +749,7 @@ export default function GameClient() {
       window.removeEventListener('wheel', onWheel);
       window.removeEventListener('blur', onBlur);
     };
-  }, [emit, quickHeal, toggleDemolish, refreshFriends, pushToast, only, startPlacing, useSlot, cycleHotbar]);
+  }, [emit, quickHeal, toggleDemolish, refreshFriends, pushToast, only, holdKit, useSlot, cycleHotbar]);
 
   // input + footsteps at 20Hz
   useEffect(() => {
@@ -740,7 +766,7 @@ export default function GameClient() {
       socket.emit(EV.input, {
         ...dirs,
         angle,
-        shoot: mouse.current.down && !locked && !placingRef.current && !demolishRef.current,
+        shoot: mouse.current.down && !locked && !heldKitRef.current && !demolishRef.current,
       });
       const now = performance.now();
       if (moving && now - lastStepAt.current > 340) {
@@ -808,7 +834,7 @@ export default function GameClient() {
 
       // build placement ghost — snap the cursor to a tile, mark valid/invalid
       let ghost: { tile: number; tx: number; ty: number; valid: boolean } | null = null;
-      const pl = placingRef.current;
+      const pl = heldKitRef.current;
       if (pl && meNow) {
         const wx = meNow.dx + (mouse.current.x - canvas.width / 2) / renderer.zoom;
         const wy = meNow.dy + (mouse.current.y - canvas.height / 2) / renderer.zoom;
@@ -838,6 +864,14 @@ export default function GameClient() {
         demolish = { tx, ty, valid: inRange && (DEMOLISHABLE.has(renderer.tileAtPublic(tx, ty)) || builtChest) };
       }
 
+      // world-space aim point for the drawn crosshair
+      const cursor = meNow && !panelsOpenRef.current
+        ? {
+            x: meNow.dx + (mouse.current.x - canvas.width / 2) / renderer.zoom,
+            y: meNow.dy + (mouse.current.y - canvas.height / 2) / renderer.zoom,
+          }
+        : null;
+
       renderer.draw(ctx, canvas.width, canvas.height, {
         players,
         enemies,
@@ -854,6 +888,8 @@ export default function GameClient() {
         ghost,
         highlight: promptPosRef.current,
         demolish,
+        fog: init.kind === 'world', // walls hide what the server hides — show it
+        cursor,
       });
 
       // day/night clock for the HUD
@@ -924,8 +960,9 @@ export default function GameClient() {
               const t = renderer.tileAtPublic(tx2, ty2);
               const label =
                 t === Tile.Firepit ? 'Cook at the campfire'
-                : t === Tile.Furnace ? 'Use furnace (ammo)'
-                : t === Tile.Workbench ? 'Use workbench (mods)'
+                : t === Tile.Furnace ? 'Use furnace (smelt ore)'
+                : t === Tile.Workbench ? 'Use workbench (craft)'
+                : t === Tile.Anvil ? 'Use anvil (forge weapons)'
                 : null;
               if (!label) continue;
               const cx = (tx2 + 0.5) * TILE;
@@ -1031,7 +1068,7 @@ export default function GameClient() {
     const cont = containerRef.current;
     switch (action) {
       case 'use': emit(EV.invUse, { slot: m.index }); break;
-      case 'place': startPlacing(m.index, m.item); break;
+      case 'place': holdKit(m.index); break;
       case 'unequip': emit(EV.unequipArmor, { piece: m.zone }); break;
       case 'drop1': emit(EV.invDrop, { slot: m.index, qty: 1 }); break;
       case 'dropall': emit(EV.invDrop, { slot: m.index, qty: m.qty }); break;
@@ -1044,6 +1081,8 @@ export default function GameClient() {
 
   const equippedItem = inv && inv.equipped !== null ? inv.inv.slots[inv.equipped] : null;
   const eqWeapon = equippedItem ? ITEMS[equippedItem.id].weapon : null;
+  const heldKit = equippedItem && ITEMS[equippedItem.id].place ? { slot: inv!.equipped!, item: equippedItem.id, qty: equippedItem.qty } : null;
+  const anyPanel = showGear || showCraft || showSkills || showSocial || !!container || !!trade || chatOpen || !!station || !!dead || escMenu;
   const ammoReserve = eqWeapon ? countOf(eqWeapon.ammo) : null;
   const weight = inv ? invWeight(inv.inv) : 0;
   const cap = inv ? invCapacity(inv.inv) : BACKPACKS[0];
@@ -1087,48 +1126,49 @@ export default function GameClient() {
   }
 
   const invSlot = (s: { id: ItemId; qty: number } | null, i: number) => (
-    <div
-      key={i}
-      className={`slot${inv?.equipped === i ? ' equipped' : ''}${drag?.zone === 'inv' && drag.index === i ? ' dragging' : ''}`}
-      onMouseDown={(e) => {
-        if (!s) return;
-        // shift-click: quick-deposit into whatever container is open
-        if (e.shiftKey && containerRef.current) {
-          e.preventDefault();
-          emit(EV.containerPut, { id: containerRef.current.id, slot: i });
-          return;
-        }
-        beginDrag('inv', i, s.id, s.qty, e);
-      }}
-      onMouseUp={() => dropOn('inv', i)}
-      onContextMenu={(e) => s && openCtx('inv', i, s.id, s.qty, e)}
-      onDoubleClick={() => s && useSlot(i)}
-      title={s ? `${ITEMS[s.id].name} — ${ITEMS[s.id].desc}` : ''}
-    >
-      {i < 5 && <span className="keycap">{i + 1}</span>}
-      {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}</>)}
-    </div>
+    <Tip key={i} tip={s ? itemTip(s.id, s.qty) : null}>
+      <div
+        className={`slot${inv?.equipped === i ? ' equipped' : ''}${drag?.zone === 'inv' && drag.index === i ? ' dragging' : ''}`}
+        onMouseDown={(e) => {
+          if (!s) return;
+          // shift-click: quick-deposit into whatever container is open
+          if (e.shiftKey && containerRef.current) {
+            e.preventDefault();
+            emit(EV.containerPut, { id: containerRef.current.id, slot: i });
+            return;
+          }
+          beginDrag('inv', i, s.id, s.qty, e);
+        }}
+        onMouseUp={() => dropOn('inv', i)}
+        onContextMenu={(e) => s && openCtx('inv', i, s.id, s.qty, e)}
+        onDoubleClick={() => s && useSlot(i)}
+      >
+        {i < 5 && <span className="keycap">{i + 1}</span>}
+        {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}</>)}
+      </div>
+    </Tip>
   );
 
   const equipSlot = (zone: 'helmet' | 'vest' | 'mod', label: string) => {
     const id = inv?.equipment[zone] ?? null;
     return (
-      <div
-        className="equip-slot"
-        onMouseDown={(e) => id && beginDrag(zone, 0, id, 1, e)}
-        onMouseUp={() => dropOn(zone, 0)}
-        onContextMenu={(e) => id && openCtx(zone, 0, id, 1, e)}
-        title={id ? ITEMS[id].name : label}
-      >
-        <span className="corner">{label}</span>
-        {id && <ItemIcon id={id} size={32} />}
-      </div>
+      <Tip tip={id ? itemTip(id) : null}>
+        <div
+          className="equip-slot"
+          onMouseDown={(e) => id && beginDrag(zone, 0, id, 1, e)}
+          onMouseUp={() => dropOn(zone, 0)}
+          onContextMenu={(e) => id && openCtx(zone, 0, id, 1, e)}
+        >
+          <span className="corner">{label}</span>
+          {id && <ItemIcon id={id} size={32} />}
+        </div>
+      </Tip>
     );
   };
 
   return (
     <div className="game-root">
-      <canvas ref={canvasRef} className="world" style={placing || demolishMode ? { cursor: 'crosshair' } : undefined} />
+      <canvas ref={canvasRef} className="world" style={{ cursor: anyPanel ? 'default' : 'none' }} />
       {!connected && <div className="connect-overlay">CONNECTING TO THE ZONE…</div>}
       {hurtAt > 0 && <div className="hurt-flash" key={hurtAt} />}
 
@@ -1141,13 +1181,13 @@ export default function GameClient() {
       {location && <div className="location-banner" key={location}>{location.toUpperCase()}</div>}
       {inSafe && !inHideout && <div className="safe-chip">SAFE ZONE — ENTER chat · extract to get home</div>}
       {inHideout && <div className="safe-chip">{ownHideout ? 'HOME BASE — B build · X demolish · walk the mat to deploy' : 'ALLY CAMP — E on the mat to leave'}</div>}
-      {placing && (
+      {heldKit && !anyPanel && (
         <div className="build-bar">
-          <span>PLACING <b>{ITEMS[placing.item].name}</b>{(inv?.inv.slots[placing.slot]?.qty ?? 0) > 1 ? ` ×${inv!.inv.slots[placing.slot]!.qty}` : ''}</span>
+          <span>HOLDING <b>{ITEMS[heldKit.item].name}</b>{heldKit.qty > 1 ? ` ×${heldKit.qty}` : ''}</span>
           <span className="build-hint">
-            click the ground to place{inHideout ? '' : ' — wears out & is destructible in the world'} · ESC cancel
+            click the ground to place{inHideout ? '' : ' — wears out & is destructible in the world'} · scroll to swap hands
           </span>
-          <button onClick={() => setPlacing(null)}>CANCEL</button>
+          <button onClick={() => emit(EV.invEquip, { slot: heldKit.slot })}>PUT AWAY</button>
         </div>
       )}
       {demolishMode && (
@@ -1203,7 +1243,9 @@ export default function GameClient() {
                   : `${ITEMS[equippedItem.id].name} · ${inv.mag}/${eqWeapon.magSize} · ${ammoReserve} reserve ${inv.mag === 0 ? '· R to reload' : ''}`
                 : ITEMS[equippedItem.id].kind === 'consumable'
                   ? `${ITEMS[equippedItem.id].name} · ${(useVerb(ITEMS[equippedItem.id]) ?? 'USE')} — left-click`
-                  : ITEMS[equippedItem.id].name
+                  : ITEMS[equippedItem.id].place
+                    ? `${ITEMS[equippedItem.id].name} · click the ground to place`
+                    : ITEMS[equippedItem.id].name
               : 'FISTS — punch trees & rocks, craft a spear (C)'}
           </div>
         </div>
@@ -1213,16 +1255,18 @@ export default function GameClient() {
       {inv && (
         <div className="hotbar">
           {inv.inv.slots.slice(0, 5).map((s, i) => (
-            <div key={i} className={`slot${inv.equipped === i ? ' equipped' : ''}`} onClick={() => useSlot(i)} title={s ? ITEMS[s.id].name : ''}>
-              <span className="keycap">{i + 1}</span>
-              {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}</>)}
-            </div>
+            <Tip key={i} tip={s ? itemTip(s.id, s.qty) : null}>
+              <div className={`slot${inv.equipped === i ? ' equipped' : ''}`} onClick={() => useSlot(i)}>
+                <span className="keycap">{i + 1}</span>
+                {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}</>)}
+              </div>
+            </Tip>
           ))}
         </div>
       )}
 
       {/* contextual interaction hints (fish / drink / cook) */}
-      {inv && !panelsOpenRef.current && !placing && (() => {
+      {inv && !panelsOpenRef.current && !heldKit && (() => {
         const hasRod = equippedItem?.id === 'fishing_rod';
         const rawHeld = inv.inv.slots.filter((s) => s && ITEMS[s.id].raw) as { id: ItemId; qty: number }[];
         const hints: string[] = [];
@@ -1263,9 +1307,9 @@ export default function GameClient() {
           // building controls only show at home — out in the zone the hotbar stays lean
           ...(ownHideout
             ? ([
-                ['🔨', 'B', 'Place a build kit', () => {
+                ['🔨', 'B', 'Hold a build kit', () => {
                   const s = inv?.inv.slots.findIndex((x) => x && ITEMS[x.id].place) ?? -1;
-                  if (inv && s >= 0) startPlacing(s, inv.inv.slots[s]!.id);
+                  if (inv && s >= 0) holdKit(s);
                   else pushToast('Craft a build kit first (C → BUILD)');
                 }],
                 ['⛏', 'X', 'Demolish (your camp)', toggleDemolish],
@@ -1362,14 +1406,13 @@ export default function GameClient() {
                   const looting = !!action && action.kind === 'loot' && action.container === container.id && action.slot === i;
                   const queuePos = !looting && lootContRef.current === container.id ? lootQueue.indexOf(i) : -1;
                   return (
+                    <Tip key={i} tip={s ? itemTip(s.id, s.qty) : null}>
                     <div
-                      key={i}
                       className={`slot${drag?.zone === 'cont' && drag.index === i ? ' dragging' : ''}${looting ? ' looting' : ''}${queuePos >= 0 ? ' queued' : ''}`}
                       onMouseDown={(e) => s && beginDrag('cont', i, s.id, s.qty, e)}
                       onMouseUp={() => dropOn('cont', i)}
                       onClick={() => s && enqueueLoot(i)}
                       onContextMenu={(e) => s && openCtx('cont', i, s.id, s.qty, e)}
-                      title={s ? ITEMS[s.id].name : ''}
                     >
                       {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}</>)}
                       {looting && (
@@ -1382,6 +1425,7 @@ export default function GameClient() {
                       )}
                       {queuePos >= 0 && <span className="queue-badge">{queuePos + 1}</span>}
                     </div>
+                    </Tip>
                   );
                 })}
               </div>
@@ -1433,11 +1477,15 @@ export default function GameClient() {
         </div>
       )}
 
-      {/* Crafting: category tabs → icon grid → detail with craft queue */}
+      {/* Crafting: category tabs → icon grid → detail with craft queue.
+          Station recipes are HIDDEN unless you stand at that station. */}
       {showCraft && inv && (() => {
-        const hasStation = (st?: string) => !st || (st === 'workbench' ? inv.nearWorkbench : st === 'furnace' ? inv.nearFurnace : true);
+        const hasStation = (st?: string) =>
+          !st || (st === 'workbench' ? inv.nearWorkbench : st === 'furnace' ? inv.nearFurnace : st === 'anvil' ? inv.nearAnvil : true);
         const canMake = (r: typeof RECIPES[number]) => r.cost.every((c) => countOf(c.id) >= c.qty) && hasStation(r.station);
-        const list = RECIPES.filter((r) => r.cat === craftTab);
+        const list = RECIPES.filter((r) => r.cat === craftTab && hasStation(r.station));
+        const hidden = RECIPES.filter((r) => r.cat === craftTab && !hasStation(r.station));
+        const hiddenStations = [...new Set(hidden.map((r) => STATION_LABEL[r.station!]))].join(' / ');
         const r = list.find((x) => x.id === craftSel) ?? list[0];
         const queuedOf = (id: string) => craftQueue.filter((q) => q === id).length;
         const enqueue = (id: string, n = 1) => setCraftQueue((q) => [...q, ...new Array<string>(n).fill(id)]);
@@ -1455,25 +1503,35 @@ export default function GameClient() {
               ))}
             </div>
             <div className="craft-body">
+              <div className="craft-col">
               <div className="craft-grid">
                 {list.map((rc) => {
                   const ok = canMake(rc);
                   const nq = queuedOf(rc.id);
                   return (
-                    <button
-                      key={rc.id}
-                      className={`craft-cell${(r && r.id === rc.id) ? ' active' : ''}${ok ? ' craftable' : ' locked'}`}
-                      title={`${ITEMS[rc.out.id].name}${rc.station ? ` — needs a ${STATION_LABEL[rc.station]}` : ''}`}
-                      onClick={() => setCraftSel(rc.id)}
-                      onDoubleClick={() => ok && enqueue(rc.id)}
-                    >
-                      <ItemIcon id={rc.out.id} size={28} />
-                      {rc.out.qty > 1 && <span className="cc-qty">×{rc.out.qty}</span>}
-                      {rc.station && <span className="cc-station">⚒</span>}
-                      {nq > 0 && <span className="queue-badge">{nq}</span>}
-                    </button>
+                    <Tip key={rc.id} tip={itemTip(rc.out.id, rc.out.qty)}>
+                      <button
+                        className={`craft-cell${(r && r.id === rc.id) ? ' active' : ''}${ok ? ' craftable' : ' locked'}`}
+                        onClick={() => setCraftSel(rc.id)}
+                        onDoubleClick={() => ok && enqueue(rc.id)}
+                      >
+                        <ItemIcon id={rc.out.id} size={28} />
+                        {rc.out.qty > 1 && <span className="cc-qty">×{rc.out.qty}</span>}
+                        {rc.station && <span className="cc-station">⚒</span>}
+                        {nq > 0 && <span className="queue-badge">{nq}</span>}
+                      </button>
+                    </Tip>
                   );
                 })}
+                {list.length === 0 && (
+                  <div className="craft-empty">
+                    Nothing craftable by hand here.
+                  </div>
+                )}
+              </div>
+              {hidden.length > 0 && (
+                <div className="craft-hidden">🔒 {hidden.length} more recipe{hidden.length > 1 ? 's' : ''} at the {hiddenStations}</div>
+              )}
               </div>
               <div className="craft-detail">
                 {r && (() => {
@@ -1513,15 +1571,16 @@ export default function GameClient() {
         );
       })()}
 
-      {/* Campfire: queue raw food, watch it cook */}
+      {/* Campfire: click a row to queue ONE cook; badge shows how many are queued */}
       {station === 'firepit' && inv && (() => {
         const rawSlots = inv.inv.slots
           .map((s, i) => ({ s, i }))
           .filter((x): x is { s: { id: ItemId; qty: number }; i: number } => !!x.s && !!ITEMS[x.s.id].raw);
         const cookingSlot = action?.kind === 'cook' ? action.slot : undefined;
+        const queuedOf = (i: number) => cookQueue.filter((q) => q === i).length;
         return (
           <div className="panel cook-panel">
-            <h3>CAMPFIRE<span className="sub">ESC to close</span></h3>
+            <h3>CAMPFIRE<span className="sub">click = cook 1 · ESC to close</span></h3>
             {rawSlots.length === 0 ? (
               <div className="item-desc">Nothing raw to cook — hunt animals or catch fish, then come back.</div>
             ) : (
@@ -1529,12 +1588,12 @@ export default function GameClient() {
                 {rawSlots.map(({ s, i }) => {
                   const def = ITEMS[s.id];
                   const cooking = cookingSlot === i;
-                  const queuePos = cookQueue.indexOf(i);
+                  const nq = queuedOf(i);
                   return (
                     <button
                       key={i}
-                      className={`cook-row${cooking ? ' cooking' : ''}${queuePos >= 0 ? ' queued' : ''}`}
-                      onClick={() => setCookQueue((q) => (q.includes(i) ? q : [...q, i]))}
+                      className={`cook-row${cooking ? ' cooking' : ''}${nq > 0 ? ' queued' : ''}`}
+                      onClick={() => setCookQueue((q) => (queuedOf(i) + (cooking ? 1 : 0) < s.qty ? [...q, i] : q))}
                     >
                       <ItemIcon id={s.id} size={28} />
                       <span className="cook-name">{def.name} ×{s.qty}</span>
@@ -1545,8 +1604,8 @@ export default function GameClient() {
                           <span key={action.until} style={{ animationDuration: `${action.ms}ms` }} />
                         </span>
                       )}
-                      {!cooking && queuePos >= 0 && <span className="queue-badge">{queuePos + 1}</span>}
-                      {!cooking && queuePos < 0 && <span className="cook-hint">COOK</span>}
+                      {nq > 0 && <span className="queue-badge">{nq}</span>}
+                      {!cooking && nq === 0 && <span className="cook-hint">COOK +1</span>}
                     </button>
                   );
                 })}
@@ -1554,8 +1613,19 @@ export default function GameClient() {
             )}
             <div className="item-actions">
               {rawSlots.length > 0 && (
-                <button onClick={() => setCookQueue(rawSlots.map(({ i }) => i))}>
-                  {cookQueue.length > 0 ? `COOKING… (${cookQueue.length})` : 'COOK EVERYTHING'}
+                <button
+                  onClick={() =>
+                    setCookQueue((q) => {
+                      const next = [...q];
+                      for (const { s, i } of rawSlots) {
+                        const already = next.filter((x) => x === i).length + (cookingSlot === i ? 1 : 0);
+                        for (let n = already; n < s.qty; n++) next.push(i);
+                      }
+                      return next;
+                    })
+                  }
+                >
+                  {cookQueue.length > 0 ? `COOKING… (${cookQueue.length} queued)` : 'QUEUE EVERYTHING'}
                 </button>
               )}
               <button onClick={() => { setCookQueue([]); setStation(null); }}>CLOSE</button>
@@ -1597,66 +1667,125 @@ export default function GameClient() {
         </div>
       )}
 
-      {/* Trade + jobs */}
-      {trade && inv && (
-        <div className="panel trade-panel">
-          <h3>TRADER<span className="sub">{trade.money} credits</span></h3>
-          {trade.quests.length > 0 && (
-            <div className="jobs">
-              <div className="trade-head">JOBS</div>
-              {trade.quests.map((q) => (
-                <div className="job-row" key={q.def.id}>
-                  <div className="job-body">
-                    <b>{q.def.name}</b>
-                    <div className="job-desc">
-                      {q.def.desc || (q.def.kind === 'kill' ? `Kill ${q.def.count} ${q.def.target}s` : `Bring ${q.def.count} ${ITEMS[q.def.target as ItemId]?.name ?? q.def.target}`)}
-                      {' · '}{q.progress}/{q.def.count}
-                      {' · '}reward {q.def.rewardMoney}cr{q.def.rewardItem ? ` + ${ITEMS[q.def.rewardItem].name}` : ''}
-                    </div>
-                  </div>
-                  {q.claimed ? <span className="job-done">DONE</span> : (
-                    <button disabled={!q.done} onClick={() => emit(EV.questClaim, { id: q.def.id })}>CLAIM</button>
+      {/* Trader: BUY / SELL / JOBS tabs — icon grids + detail, same language as crafting */}
+      {trade && inv && (() => {
+        const buyList = trade.stock.filter((e) => e.buy > 0);
+        const sellable = inv.inv.slots
+          .map((s, i) => ({ s, i, entry: s ? trade.stock.find((e) => e.id === s.id && e.sell > 0) : undefined }))
+          .filter((x): x is { s: { id: ItemId; qty: number }; i: number; entry: { id: ItemId; buy: number; sell: number } } => !!x.s && !!x.entry);
+        const openJobs = trade.quests.filter((q) => !q.claimed).length;
+        const buyEntry = buyList.find((e) => e.id === buySel) ?? buyList[0];
+        const sellRow = sellable.find((x) => x.i === sellSel) ?? sellable[0];
+        return (
+          <div className="panel trade-panel">
+            <h3>{trade.tier === 2 ? '☠ BLACK MARKET' : 'TRADER'}<span className="sub">{trade.money} credits</span></h3>
+            <div className="craft-tabs">
+              <button className={tradeTab === 'buy' ? 'active' : ''} onClick={() => setTradeTab('buy')}>BUY</button>
+              <button className={tradeTab === 'sell' ? 'active' : ''} onClick={() => setTradeTab('sell')}>SELL{sellable.length > 0 ? ` (${sellable.length})` : ''}</button>
+              <button className={tradeTab === 'jobs' ? 'active' : ''} onClick={() => setTradeTab('jobs')}>JOBS{openJobs > 0 ? ` (${openJobs})` : ''}</button>
+            </div>
+
+            {tradeTab === 'buy' && (
+              <div className="craft-body">
+                <div className="craft-grid trade-grid">
+                  {buyList.map((e) => (
+                    <Tip key={e.id} tip={itemTip(e.id)}>
+                      <button
+                        className={`craft-cell${buyEntry?.id === e.id ? ' active' : ''}${inv.money >= e.buy ? ' craftable' : ' locked'}`}
+                        onClick={() => setBuySel(e.id)}
+                        onDoubleClick={() => inv.money >= e.buy && emit(EV.tradeBuy, { id: e.id, qty: 1 })}
+                      >
+                        <ItemIcon id={e.id} size={28} />
+                        <span className="cc-price">{e.buy}</span>
+                      </button>
+                    </Tip>
+                  ))}
+                </div>
+                <div className="craft-detail">
+                  {buyEntry && (
+                    <>
+                      <div className="cd-head"><ItemIcon id={buyEntry.id} size={40} /><div><b>{ITEMS[buyEntry.id].name}</b></div></div>
+                      <div className="cd-desc">{ITEMS[buyEntry.id].desc}</div>
+                      <div className="cd-costs">
+                        <div className={inv.money >= buyEntry.buy ? 'have' : 'missing'}>
+                          PRICE <span className="cd-count">{buyEntry.buy} cr</span>
+                        </div>
+                        <div className="have">YOUR CREDITS <span className="cd-count">{trade.money}</span></div>
+                      </div>
+                      <div className="craft-actions">
+                        <button className="btn-primary craft-go" disabled={inv.money < buyEntry.buy} onClick={() => emit(EV.tradeBuy, { id: buyEntry.id, qty: 1 })}>BUY 1</button>
+                        <button className="btn-primary craft-go x5" disabled={inv.money < buyEntry.buy * 5} onClick={() => emit(EV.tradeBuy, { id: buyEntry.id, qty: 5 })}>×5</button>
+                      </div>
+                    </>
                   )}
                 </div>
-              ))}
-            </div>
-          )}
-          <div className="trade-cols">
-            <div>
-              <div className="trade-head">BUY</div>
-              {trade.stock.filter((e) => e.buy > 0).map((e) => (
-                <div className="trade-row" key={e.id}>
-                  <ItemIcon id={e.id} size={24} />
-                  <span className="t-name">{ITEMS[e.id].name}</span>
-                  <span className="t-price">{e.buy}cr</span>
-                  <button disabled={inv.money < e.buy} onClick={() => emit(EV.tradeBuy, { id: e.id, qty: 1 })}>+1</button>
-                  <button disabled={inv.money < e.buy * 5} onClick={() => emit(EV.tradeBuy, { id: e.id, qty: 5 })}>+5</button>
+              </div>
+            )}
+
+            {tradeTab === 'sell' && (
+              <div className="craft-body">
+                <div className="craft-grid trade-grid">
+                  {sellable.map(({ s, i, entry }) => (
+                    <Tip key={i} tip={itemTip(s.id, s.qty)}>
+                      <button
+                        className={`craft-cell craftable${sellRow?.i === i ? ' active' : ''}`}
+                        onClick={() => setSellSel(i)}
+                        onDoubleClick={() => emit(EV.tradeSell, { slot: i, qty: 1 })}
+                      >
+                        <ItemIcon id={s.id} size={28} />
+                        {s.qty > 1 && <span className="cc-qty">×{s.qty}</span>}
+                        <span className="cc-price">{entry.sell}</span>
+                      </button>
+                    </Tip>
+                  ))}
+                  {sellable.length === 0 && <div className="craft-empty">Nothing in your backpack this trader wants.</div>}
                 </div>
-              ))}
-            </div>
-            <div>
-              <div className="trade-head">SELL (from backpack)</div>
-              {inv.inv.slots.map((s, i) => {
-                if (!s) return null;
-                const entry = trade.stock.find((e) => e.id === s.id && e.sell > 0);
-                if (!entry) return null;
-                return (
-                  <div className="trade-row" key={i}>
-                    <ItemIcon id={s.id} size={24} />
-                    <span className="t-name">{ITEMS[s.id].name} ×{s.qty}</span>
-                    <span className="t-price">{entry.sell}cr</span>
-                    <button onClick={() => emit(EV.tradeSell, { slot: i, qty: 1 })}>-1</button>
-                    <button onClick={() => emit(EV.tradeSell, { slot: i, qty: s.qty })}>ALL</button>
+                <div className="craft-detail">
+                  {sellRow && (
+                    <>
+                      <div className="cd-head"><ItemIcon id={sellRow.s.id} size={40} /><div><b>{ITEMS[sellRow.s.id].name}</b><span className="cd-qty"> ×{sellRow.s.qty}</span></div></div>
+                      <div className="cd-desc">{ITEMS[sellRow.s.id].desc}</div>
+                      <div className="cd-costs">
+                        <div className="have">EACH <span className="cd-count">{sellRow.entry.sell} cr</span></div>
+                        <div className="have">WHOLE STACK <span className="cd-count">{sellRow.entry.sell * sellRow.s.qty} cr</span></div>
+                      </div>
+                      <div className="craft-actions">
+                        <button className="btn-primary craft-go" onClick={() => emit(EV.tradeSell, { slot: sellRow.i, qty: 1 })}>SELL 1</button>
+                        <button className="btn-primary craft-go x5" onClick={() => emit(EV.tradeSell, { slot: sellRow.i, qty: sellRow.s.qty })}>ALL</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {tradeTab === 'jobs' && (
+              <div className="jobs">
+                {trade.quests.map((q) => (
+                  <div className="job-row" key={q.def.id}>
+                    <div className="job-body">
+                      <b>{q.def.name}</b>
+                      <div className="job-desc">
+                        {q.def.desc || (q.def.kind === 'kill' ? `Kill ${q.def.count} ${q.def.target}s` : `Bring ${q.def.count} ${ITEMS[q.def.target as ItemId]?.name ?? q.def.target}`)}
+                        {' · '}{q.progress}/{q.def.count}
+                        {' · '}reward {q.def.rewardMoney}cr{q.def.rewardItem ? ` + ${ITEMS[q.def.rewardItem].name}` : ''}
+                      </div>
+                    </div>
+                    {q.claimed ? <span className="job-done">DONE</span> : (
+                      <button disabled={!q.done} onClick={() => emit(EV.questClaim, { id: q.def.id })}>CLAIM</button>
+                    )}
                   </div>
-                );
-              })}
+                ))}
+                {trade.quests.length === 0 && <div className="craft-empty">No work for you here yet — finish earlier jobs to unlock more.</div>}
+              </div>
+            )}
+
+            <div className="item-actions">
+              <button onClick={() => setTrade(null)}>CLOSE</button>
             </div>
           </div>
-          <div className="item-actions">
-            <button onClick={() => setTrade(null)}>CLOSE</button>
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Social */}
       {showSocial && (
@@ -1673,12 +1802,23 @@ export default function GameClient() {
               <span className={`f-dot ${f.status}`} />
               <span className="f-name">{f.name}</span>
               <span className="f-status">{f.status === 'accepted' ? 'ally' : f.incoming ? 'wants to ally' : 'pending'}</span>
-              {f.status === 'accepted' && inSafe && !inHideout && (
-                <button onClick={() => emit(EV.hideoutEnter, { owner: f.id })}>VISIT CAMP</button>
+              {f.status === 'accepted' && (ownHideout || (inSafe && !inHideout)) && (
+                <button onClick={() => { only(null); emit(EV.hideoutEnter, { owner: f.id }); }}>VISIT CAMP</button>
               )}
               {f.status !== 'accepted' && f.incoming && <button onClick={() => acceptFriend(f.id)}>ACCEPT</button>}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* ESC system menu */}
+      {escMenu && !dead && (
+        <div className="death-overlay esc-menu">
+          <h2>PAUSED</h2>
+          <p className="death-stats">The zone keeps moving while you stand still.</p>
+          <button className="btn-primary" onClick={() => setEscMenu(false)}>RESUME</button>
+          <button className="btn-primary secondary" onClick={() => setMuted(toggleMute())}>{muted ? '🔇 SOUND OFF' : '🔊 SOUND ON'}</button>
+          <button className="btn-primary secondary" onClick={leave}>LOG OUT</button>
         </div>
       )}
 

@@ -136,6 +136,8 @@ export class DbService implements OnModuleInit, OnModuleDestroy {
         rewardMoney: q.rewardMoney,
         rewardItem: (q.rewardItem as QuestDef['rewardItem']) ?? null,
         rewardQty: q.rewardQty,
+        requires: q.requiresId ?? null,
+        tier: q.tier === 2 ? 2 : 1,
       }));
     } catch (err) {
       this.log.error(`loadQuests: ${(err as Error).message}`);

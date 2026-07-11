@@ -28,6 +28,10 @@ export enum Tile {
   Door = 19, // players walk through; enemies and bullets do not
   Fence = 20, // blocks movement; bullets fly over
   Torch = 21, // walkable, lights the night
+  // ore-veined rocks (rare rock variants — mining yields stone AND ore)
+  CopperOre = 22,
+  IronOre = 23,
+  Anvil = 24, // forge station (weapons / ammo / attachments)
 }
 
 // NOTE: water is swimmable (slow), not blocking — see SWIM_SPEED_MULT
@@ -41,6 +45,9 @@ export const BLOCKS_MOVE: Record<number, boolean> = {
   [Tile.Furnace]: true,
   [Tile.WoodWall]: true,
   [Tile.Fence]: true,
+  [Tile.CopperOre]: true,
+  [Tile.IronOre]: true,
+  [Tile.Anvil]: true,
 };
 
 /** enemies and animals refuse to enter these (players can swim) */
@@ -54,6 +61,9 @@ export const BLOCKS_BULLET: Record<number, boolean> = {
   [Tile.Furnace]: true,
   [Tile.WoodWall]: true,
   [Tile.Door]: true,
+  [Tile.CopperOre]: true,
+  [Tile.IronOre]: true,
+  [Tile.Anvil]: true,
 };
 
 /** base-building floors — cosmetic ground you can build other pieces on top of */
@@ -66,12 +76,24 @@ export const FLOOR_TILES: Record<number, boolean> = {
 export const NODE_HITS: Partial<Record<Tile, number>> = {
   [Tile.Tree]: 6,
   [Tile.Rock]: 8,
+  [Tile.CopperOre]: 8,
+  [Tile.IronOre]: 10,
 };
 export const NODE_DEPLETED: Partial<Record<Tile, Tile>> = {
   [Tile.Tree]: Tile.Stump,
   [Tile.Rock]: Tile.Rubble,
+  [Tile.CopperOre]: Tile.Rubble,
+  [Tile.IronOre]: Tile.Rubble,
 };
 export const NODE_RESPAWN_MS = 240_000;
+/** which ore a veined rock yields alongside stone */
+export const ORE_YIELD: Partial<Record<Tile, ItemId>> = {
+  [Tile.CopperOre]: 'copper_ore',
+  [Tile.IronOre]: 'iron_ore',
+};
+/** rock-cluster generation: chance a rock spawns as an ore vein instead */
+export const COPPER_CHANCE = 0.14;
+export const IRON_CHANCE = 0.08;
 
 // ─── Items ──────────────────────────────────────────────────────────────────
 // The item registry lives in ./items (category builders, easy to extend).
@@ -87,47 +109,64 @@ export const BACKPACKS: BackpackTier[] = [
 
 // ─── Crafting ───────────────────────────────────────────────────────────────
 
-export type RecipeCat = 'survival' | 'medical' | 'ammo' | 'gear' | 'mods' | 'build';
+export type RecipeCat = 'survival' | 'medical' | 'gear' | 'build' | 'smelt' | 'forge';
+
+export type StationKind = 'workbench' | 'furnace' | 'anvil';
 
 export interface Recipe {
   id: string;
   cat: RecipeCat;
   out: { id: ItemId; qty: number };
   cost: { id: ItemId; qty: number }[];
-  station?: 'workbench' | 'furnace'; // craftable only near that placed structure
+  station?: StationKind; // craftable only near that placed structure (hidden elsewhere)
 }
 
+// Station philosophy:
+//  · hand (no station): primitive survival + basic base pieces — always visible
+//  · workbench: proper tools, gear, advanced build kits
+//  · furnace: SMELTING ONLY (ore → bar)
+//  · anvil: weapons, ammo, attachments
 export const RECIPES: Recipe[] = [
+  // ── hand crafts
   { id: 'craft_spear', cat: 'survival', out: { id: 'spear', qty: 1 }, cost: [{ id: 'wood', qty: 4 }, { id: 'stone', qty: 1 }] },
-  { id: 'craft_axe', cat: 'survival', out: { id: 'axe', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'stone', qty: 3 }] },
-  { id: 'craft_pickaxe', cat: 'survival', out: { id: 'pickaxe', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'stone', qty: 3 }] },
-  { id: 'craft_fishing_rod', cat: 'survival', out: { id: 'fishing_rod', qty: 1 }, cost: [{ id: 'wood', qty: 4 }, { id: 'cloth', qty: 2 }] },
   { id: 'craft_bow', cat: 'survival', out: { id: 'bow', qty: 1 }, cost: [{ id: 'wood', qty: 6 }, { id: 'cloth', qty: 3 }] },
   { id: 'craft_arrows', cat: 'survival', out: { id: 'arrow', qty: 6 }, cost: [{ id: 'wood', qty: 3 }, { id: 'stone', qty: 1 }] },
-  { id: 'craft_canteen', cat: 'survival', out: { id: 'canteen', qty: 1 }, cost: [{ id: 'scrap', qty: 4 }, { id: 'cloth', qty: 1 }] },
   { id: 'craft_bandage', cat: 'medical', out: { id: 'bandage', qty: 1 }, cost: [{ id: 'cloth', qty: 2 }] },
-  { id: 'craft_medkit', cat: 'medical', out: { id: 'medkit', qty: 1 }, cost: [{ id: 'bandage', qty: 2 }, { id: 'scrap', qty: 1 }] },
-  { id: 'craft_9mm', cat: 'ammo', out: { id: 'ammo_9mm', qty: 12 }, cost: [{ id: 'scrap', qty: 2 }], station: 'furnace' },
-  { id: 'craft_shells', cat: 'ammo', out: { id: 'ammo_shell', qty: 4 }, cost: [{ id: 'scrap', qty: 2 }, { id: 'cloth', qty: 1 }], station: 'furnace' },
-  { id: 'craft_556', cat: 'ammo', out: { id: 'ammo_556', qty: 10 }, cost: [{ id: 'scrap', qty: 3 }], station: 'furnace' },
-  { id: 'craft_helmet_scrap', cat: 'gear', out: { id: 'helmet_scrap', qty: 1 }, cost: [{ id: 'scrap', qty: 6 }, { id: 'cloth', qty: 2 }] },
-  { id: 'craft_vest_light', cat: 'gear', out: { id: 'vest_light', qty: 1 }, cost: [{ id: 'cloth', qty: 8 }, { id: 'scrap', qty: 4 }] },
-  { id: 'craft_backpack_mk2', cat: 'gear', out: { id: 'backpack_mk2', qty: 1 }, cost: [{ id: 'cloth', qty: 6 }, { id: 'scrap', qty: 4 }] },
-  { id: 'craft_backpack_mk3', cat: 'gear', out: { id: 'backpack_mk3', qty: 1 }, cost: [{ id: 'cloth', qty: 10 }, { id: 'scrap', qty: 8 }, { id: 'wood', qty: 4 }] },
-  { id: 'craft_reddot', cat: 'mods', out: { id: 'attach_reddot', qty: 1 }, cost: [{ id: 'scrap', qty: 8 }, { id: 'cloth', qty: 2 }], station: 'workbench' },
-  { id: 'craft_suppressor', cat: 'mods', out: { id: 'attach_suppressor', qty: 1 }, cost: [{ id: 'scrap', qty: 10 }, { id: 'cloth', qty: 3 }], station: 'workbench' },
-  // build kits — craft, then hold the item to place it (ghost preview)
   { id: 'craft_firepit', cat: 'build', out: { id: 'kit_firepit', qty: 1 }, cost: [{ id: 'wood', qty: 6 }, { id: 'stone', qty: 4 }] },
-  { id: 'craft_furnace', cat: 'build', out: { id: 'kit_furnace', qty: 1 }, cost: [{ id: 'stone', qty: 12 }, { id: 'scrap', qty: 6 }] },
   { id: 'craft_workbench', cat: 'build', out: { id: 'kit_workbench', qty: 1 }, cost: [{ id: 'wood', qty: 8 }, { id: 'scrap', qty: 4 }] },
-  { id: 'craft_chest', cat: 'build', out: { id: 'kit_chest', qty: 1 }, cost: [{ id: 'wood', qty: 10 }, { id: 'stone', qty: 4 }] },
-  // base construction — cheap and stackable so you can build out a whole camp
   { id: 'craft_floor_wood', cat: 'build', out: { id: 'kit_floor_wood', qty: 4 }, cost: [{ id: 'wood', qty: 4 }] },
   { id: 'craft_floor_stone', cat: 'build', out: { id: 'kit_floor_stone', qty: 4 }, cost: [{ id: 'stone', qty: 4 }] },
-  { id: 'craft_wall', cat: 'build', out: { id: 'kit_wall', qty: 2 }, cost: [{ id: 'wood', qty: 6 }, { id: 'stone', qty: 2 }] },
-  { id: 'craft_door', cat: 'build', out: { id: 'kit_door', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'scrap', qty: 2 }] },
   { id: 'craft_fence', cat: 'build', out: { id: 'kit_fence', qty: 4 }, cost: [{ id: 'wood', qty: 6 }] },
   { id: 'craft_torch', cat: 'build', out: { id: 'kit_torch', qty: 2 }, cost: [{ id: 'wood', qty: 2 }, { id: 'cloth', qty: 1 }] },
+  // ── workbench
+  { id: 'craft_axe', cat: 'survival', out: { id: 'axe', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'stone', qty: 3 }], station: 'workbench' },
+  { id: 'craft_pickaxe', cat: 'survival', out: { id: 'pickaxe', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'stone', qty: 3 }], station: 'workbench' },
+  { id: 'craft_fishing_rod', cat: 'survival', out: { id: 'fishing_rod', qty: 1 }, cost: [{ id: 'wood', qty: 4 }, { id: 'cloth', qty: 2 }], station: 'workbench' },
+  { id: 'craft_canteen', cat: 'survival', out: { id: 'canteen', qty: 1 }, cost: [{ id: 'scrap', qty: 4 }, { id: 'cloth', qty: 1 }], station: 'workbench' },
+  { id: 'craft_medkit', cat: 'medical', out: { id: 'medkit', qty: 1 }, cost: [{ id: 'bandage', qty: 2 }, { id: 'scrap', qty: 1 }], station: 'workbench' },
+  { id: 'craft_helmet_scrap', cat: 'gear', out: { id: 'helmet_scrap', qty: 1 }, cost: [{ id: 'scrap', qty: 6 }, { id: 'cloth', qty: 2 }], station: 'workbench' },
+  { id: 'craft_vest_light', cat: 'gear', out: { id: 'vest_light', qty: 1 }, cost: [{ id: 'cloth', qty: 8 }, { id: 'scrap', qty: 4 }], station: 'workbench' },
+  { id: 'craft_backpack_mk2', cat: 'gear', out: { id: 'backpack_mk2', qty: 1 }, cost: [{ id: 'cloth', qty: 6 }, { id: 'scrap', qty: 4 }], station: 'workbench' },
+  { id: 'craft_backpack_mk3', cat: 'gear', out: { id: 'backpack_mk3', qty: 1 }, cost: [{ id: 'cloth', qty: 10 }, { id: 'scrap', qty: 8 }, { id: 'wood', qty: 4 }], station: 'workbench' },
+  { id: 'craft_furnace', cat: 'build', out: { id: 'kit_furnace', qty: 1 }, cost: [{ id: 'stone', qty: 12 }, { id: 'scrap', qty: 6 }], station: 'workbench' },
+  { id: 'craft_anvil', cat: 'build', out: { id: 'kit_anvil', qty: 1 }, cost: [{ id: 'iron_bar', qty: 4 }, { id: 'stone', qty: 8 }], station: 'workbench' },
+  { id: 'craft_chest', cat: 'build', out: { id: 'kit_chest', qty: 1 }, cost: [{ id: 'wood', qty: 10 }, { id: 'stone', qty: 4 }], station: 'workbench' },
+  { id: 'craft_wall', cat: 'build', out: { id: 'kit_wall', qty: 2 }, cost: [{ id: 'wood', qty: 6 }, { id: 'stone', qty: 2 }], station: 'workbench' },
+  { id: 'craft_door', cat: 'build', out: { id: 'kit_door', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'scrap', qty: 2 }], station: 'workbench' },
+  // ── furnace: smelting only
+  { id: 'smelt_copper', cat: 'smelt', out: { id: 'copper_bar', qty: 1 }, cost: [{ id: 'copper_ore', qty: 2 }, { id: 'wood', qty: 1 }], station: 'furnace' },
+  { id: 'smelt_iron', cat: 'smelt', out: { id: 'iron_bar', qty: 1 }, cost: [{ id: 'iron_ore', qty: 2 }, { id: 'wood', qty: 2 }], station: 'furnace' },
+  // ── anvil: weapons, ammo, attachments
+  { id: 'craft_steel_axe', cat: 'forge', out: { id: 'steel_axe', qty: 1 }, cost: [{ id: 'iron_bar', qty: 2 }, { id: 'wood', qty: 2 }], station: 'anvil' },
+  { id: 'craft_steel_pickaxe', cat: 'forge', out: { id: 'steel_pickaxe', qty: 1 }, cost: [{ id: 'iron_bar', qty: 2 }, { id: 'wood', qty: 2 }], station: 'anvil' },
+  { id: 'craft_revolver', cat: 'forge', out: { id: 'revolver', qty: 1 }, cost: [{ id: 'iron_bar', qty: 3 }, { id: 'copper_bar', qty: 1 }, { id: 'wood', qty: 2 }], station: 'anvil' },
+  { id: 'craft_carbine', cat: 'forge', out: { id: 'carbine', qty: 1 }, cost: [{ id: 'iron_bar', qty: 5 }, { id: 'copper_bar', qty: 2 }, { id: 'wood', qty: 3 }], station: 'anvil' },
+  { id: 'craft_9mm', cat: 'forge', out: { id: 'ammo_9mm', qty: 12 }, cost: [{ id: 'scrap', qty: 2 }], station: 'anvil' },
+  { id: 'craft_shells', cat: 'forge', out: { id: 'ammo_shell', qty: 4 }, cost: [{ id: 'scrap', qty: 2 }, { id: 'cloth', qty: 1 }], station: 'anvil' },
+  { id: 'craft_556', cat: 'forge', out: { id: 'ammo_556', qty: 10 }, cost: [{ id: 'scrap', qty: 3 }], station: 'anvil' },
+  { id: 'craft_44', cat: 'forge', out: { id: 'ammo_44', qty: 8 }, cost: [{ id: 'copper_bar', qty: 1 }, { id: 'scrap', qty: 1 }], station: 'anvil' },
+  { id: 'craft_reddot', cat: 'forge', out: { id: 'attach_reddot', qty: 1 }, cost: [{ id: 'scrap', qty: 8 }, { id: 'copper_bar', qty: 1 }], station: 'anvil' },
+  { id: 'craft_suppressor', cat: 'forge', out: { id: 'attach_suppressor', qty: 1 }, cost: [{ id: 'scrap', qty: 10 }, { id: 'iron_bar', qty: 1 }], station: 'anvil' },
 ];
 
 // ─── Building (hideout: permanent · world: wears out & destructible) ───────
@@ -147,7 +186,8 @@ export const BUILDABLES: Record<BuildType, Buildable> = {
   chest: { type: 'chest', name: 'Storage Chest', desc: '12 extra stash slots (camp only).', tile: null, hideoutOnly: true, hp: 0 },
   workbench: { type: 'workbench', name: 'Workbench', desc: 'Unlocks weapon-mod crafting nearby.', tile: Tile.Workbench, hp: 120 },
   firepit: { type: 'firepit', name: 'Firepit', desc: 'Cook raw meat and fish nearby.', tile: Tile.Firepit, hp: 80 },
-  furnace: { type: 'furnace', name: 'Furnace', desc: 'Unlocks ammo crafting nearby.', tile: Tile.Furnace, hp: 160 },
+  furnace: { type: 'furnace', name: 'Furnace', desc: 'Smelt copper and iron ore into bars nearby.', tile: Tile.Furnace, hp: 160 },
+  anvil: { type: 'anvil', name: 'Anvil', desc: 'Forge weapons, ammo and attachments nearby.', tile: Tile.Anvil, hp: 240 },
   wood_floor: { type: 'wood_floor', name: 'Wood Floor', desc: 'Plank flooring. Build walls and stations on it.', tile: Tile.WoodFloor, hp: 40 },
   stone_floor: { type: 'stone_floor', name: 'Stone Floor', desc: 'Cut stone flooring. Build walls and stations on it.', tile: Tile.StoneFloor, hp: 60 },
   wall: { type: 'wall', name: 'Wooden Wall', desc: 'Blocks movement and bullets.', tile: Tile.WoodWall, hp: 220 },
@@ -197,6 +237,8 @@ export interface QuestDef {
   rewardMoney: number;
   rewardItem: ItemId | null;
   rewardQty: number;
+  requires: number | null; // quest tree: claim this quest first to unlock
+  tier: TraderTier; // which trader offers it (1 outpost, 2 black-market)
 }
 
 export interface QuestStatus {
@@ -210,6 +252,9 @@ export interface QuestStatus {
 
 /** buy = credits the player pays; sell = credits the player receives. 0 = not traded that way. */
 export interface TradeEntry { id: ItemId; buy: number; sell: number }
+
+/** 1 = outpost quartermaster (basics) · 2 = black-market dealer (hotzones — rare stock, pays big for valuables) */
+export type TraderTier = 1 | 2;
 
 export const TRADER_STOCK: TradeEntry[] = [
   { id: 'bandage', buy: 15, sell: 5 },
@@ -248,6 +293,37 @@ export const TRADER_STOCK: TradeEntry[] = [
   { id: 'kit_workbench', buy: 45, sell: 12 },
   { id: 'kit_furnace', buy: 65, sell: 18 },
 ];
+
+/** Black-market dealer: rare hardware in, valuables out. Found in high-loot zones. */
+export const TRADER_STOCK_T2: TradeEntry[] = [
+  { id: 'ammo_762', buy: 6, sell: 2 },
+  { id: 'ammo_44', buy: 5, sell: 2 },
+  { id: 'ammo_556', buy: 3, sell: 1 },
+  { id: 'medkit', buy: 55, sell: 22 },
+  { id: 'revolver', buy: 320, sell: 110 },
+  { id: 'carbine', buy: 480, sell: 160 },
+  { id: 'rifle', buy: 520, sell: 190 },
+  { id: 'dmr', buy: 0, sell: 520 },
+  { id: 'lmg', buy: 0, sell: 720 },
+  { id: 'prototype_rifle', buy: 0, sell: 1400 },
+  { id: 'helmet_military', buy: 340, sell: 130 },
+  { id: 'vest_military', buy: 520, sell: 210 },
+  { id: 'attach_reddot', buy: 160, sell: 55 },
+  { id: 'attach_suppressor', buy: 220, sell: 75 },
+  { id: 'copper_bar', buy: 14, sell: 5 },
+  { id: 'iron_bar', buy: 20, sell: 8 },
+  // the whole point: rare finds sell for a fortune here
+  { id: 'gold_bar', buy: 0, sell: 420 },
+  { id: 'diamond', buy: 0, sell: 900 },
+  { id: 'rolex', buy: 0, sell: 620 },
+  { id: 'data_drive', buy: 0, sell: 780 },
+  { id: 'artifact', buy: 0, sell: 1600 },
+];
+
+export const TRADER_TIER_STOCK: Record<TraderTier, TradeEntry[]> = {
+  1: TRADER_STOCK,
+  2: TRADER_STOCK_T2,
+};
 
 // ─── Inventory & equipment ──────────────────────────────────────────────────
 
@@ -322,7 +398,7 @@ export interface EnemySnap {
 
 // ─── POIs / instances ───────────────────────────────────────────────────────
 
-export type PoiKind = 'town' | 'airport' | 'outpost' | 'wilds';
+export type PoiKind = 'town' | 'airport' | 'outpost' | 'wilds' | 'hotzone';
 
 export interface PoiSnap {
   name: string;
@@ -331,6 +407,7 @@ export interface PoiSnap {
   y: number;
   r: number;
   safe?: boolean;
+  hot?: boolean; // high-loot area: rare chests, harder quests, black-market trader
 }
 
 export type InstanceKind = 'world' | 'hideout';
@@ -373,10 +450,11 @@ export interface WorldInit {
   height: number;
   tiles: number[];
   pois: PoiSnap[];
-  traders: { x: number; y: number }[];
+  traders: { x: number; y: number; tier?: TraderTier }[];
   extracts: { x: number; y: number }[]; // extraction beacons — hold E to go home with your loot
   exit: { x: number; y: number } | null; // hideout exit mat
   ownHideout: boolean; // true when this is YOUR hideout (enables building)
+  unders: Record<number, number>; // tile index → floor tile beneath a placed station
   you: string;
 }
 
@@ -404,6 +482,7 @@ export interface InventoryUpdate {
   nearWorkbench: boolean;
   nearFirepit: boolean;
   nearFurnace: boolean;
+  nearAnvil: boolean;
   nearWater: boolean;
   hunger: number; // 0-100
   thirst: number; // 0-100
@@ -435,9 +514,10 @@ export interface HitSnap {
   material?: 'wood' | 'stone';
 }
 
-export interface TileUpdate { i: number; tile: number }
+/** `under` = the floor tile a station sits on (kept for rendering + demolish restore) */
+export interface TileUpdate { i: number; tile: number; under?: number }
 
-export interface TradeOpen { stock: TradeEntry[]; money: number; quests: QuestStatus[] }
+export interface TradeOpen { stock: TradeEntry[]; money: number; quests: QuestStatus[]; tier: TraderTier }
 
 export interface ChatMsg { id: string; name: string; text: string }
 
@@ -489,7 +569,8 @@ export interface StationOpen { type: BuildType }
 export type MapObjectType =
   | 'chest' | 'chest_military' | 'loot' | 'zombie' | 'military'
   | 'deer' | 'rabbit' | 'boar' | 'wolf'
-  | 'spawn' | 'trader' | 'extract' | 'poi_town' | 'poi_airport' | 'poi_outpost';
+  | 'spawn' | 'trader' | 'trader_black' | 'extract'
+  | 'poi_town' | 'poi_airport' | 'poi_outpost' | 'poi_hotzone';
 
 export interface MapObject {
   type: MapObjectType;

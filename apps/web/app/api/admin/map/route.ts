@@ -1,14 +1,7 @@
 import { NextResponse } from 'next/server';
-import { headers } from 'next/headers';
 import { AuthoredMap, Tile } from '@holdout/shared';
-import { auth, isAdminEmail } from '@/lib/auth';
+import { requireAdmin as admin } from '@/lib/auth';
 import { prisma } from '@/lib/db';
-
-async function admin() {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session?.user || !isAdminEmail(session.user.email)) return null;
-  return session.user;
-}
 
 export async function GET() {
   const user = await admin();
@@ -20,7 +13,8 @@ export async function GET() {
 const VALID_OBJECTS = new Set([
   'chest', 'chest_military', 'loot', 'zombie', 'military',
   'deer', 'rabbit', 'boar', 'wolf',
-  'spawn', 'trader', 'extract', 'poi_town', 'poi_airport', 'poi_outpost',
+  'spawn', 'trader', 'trader_black', 'extract',
+  'poi_town', 'poi_airport', 'poi_outpost', 'poi_hotzone',
 ]);
 
 export async function POST(req: Request) {
@@ -44,9 +38,14 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Too many objects' }, { status: 400 });
 
   // validate against the allowed palette — editor output is untrusted input
+  const AUTHORABLE = new Set<number>([
+    Tile.Grass, Tile.Water, Tile.Tree, Tile.Floor, Tile.Wall, Tile.Road,
+    Tile.Sand, Tile.Rock, Tile.Asphalt, Tile.Bed, Tile.DoorMat,
+    Tile.CopperOre, Tile.IronOre,
+  ]);
   const tiles = data.tiles.map((t) => {
     const v = t | 0;
-    return v >= Tile.Grass && v <= Tile.Workbench ? v : Tile.Grass;
+    return AUTHORABLE.has(v) ? v : Tile.Grass;
   });
   const objects = data.objects
     .filter((o) => o && VALID_OBJECTS.has(o.type) && Number.isFinite(o.x) && Number.isFinite(o.y))

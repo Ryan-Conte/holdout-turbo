@@ -4,6 +4,8 @@ import { FormEvent, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { authClient } from '@/lib/auth-client';
 
+interface GameServerEntry { id: number; name: string; region: string; url: string }
+
 export default function AuthPage() {
   const router = useRouter();
   const { data: session, isPending } = authClient.useSession();
@@ -13,6 +15,31 @@ export default function AuthPage() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [servers, setServers] = useState<GameServerEntry[]>([]);
+  const [serverUrl, setServerUrl] = useState('');
+
+  // server browser — pick where to deploy (persisted for the game client)
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/servers');
+        if (!res.ok) return;
+        const list: GameServerEntry[] = (await res.json()).servers ?? [];
+        setServers(list);
+        const saved = localStorage.getItem('holdout_server_url');
+        const pick = list.find((s) => s.url === saved) ?? list[0];
+        if (pick) {
+          setServerUrl(pick.url);
+          localStorage.setItem('holdout_server_url', pick.url);
+        }
+      } catch { /* server list is optional in dev */ }
+    })();
+  }, []);
+
+  const pickServer = (url: string) => {
+    setServerUrl(url);
+    localStorage.setItem('holdout_server_url', url);
+  };
 
   useEffect(() => {
     if (!isPending && session?.user) router.replace('/play');
@@ -61,6 +88,16 @@ export default function AuthPage() {
         <div className="tagline">SCAVENGE · CRAFT · TRADE · SURVIVE</div>
       </div>
       <div className="auth-card">
+        {servers.length > 0 && (
+          <div className="server-pick">
+            <label>SERVER</label>
+            <select value={serverUrl} onChange={(e) => pickServer(e.target.value)}>
+              {servers.map((s) => (
+                <option key={s.id} value={s.url}>{s.name} · {s.region}</option>
+              ))}
+            </select>
+          </div>
+        )}
         <div className="auth-tabs">
           <button className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setError(''); }}>LOG IN</button>
           <button className={mode === 'register' ? 'active' : ''} onClick={() => { setMode('register'); setError(''); }}>ENLIST</button>

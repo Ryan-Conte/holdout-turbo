@@ -69,7 +69,7 @@ const T = {
 
 // ── tiles.png ─────────────────────────────────────────────────────────────
 {
-  const png = sheet(25, 2);
+  const png = sheet(28, 2);
   const cell = (c, r) => [c * C, r * C];
 
   // 0 grass A / 1 grass B
@@ -282,6 +282,33 @@ const T = {
     px(png, x + 10, y + 8, T.rockD[0] ? T.rockD : T.rockD);
     rect(png, x + 9, y + 8, 3, 1, T.rockD);
   }
+  // 25 copper-veined rock / 26 iron-veined rock (rock silhouette + ore glints)
+  for (const [col, veinA, veinB] of [
+    [25, hex('#c87a3a'), hex('#e09a52')],
+    [26, hex('#9aa4b0'), hex('#c8d2dc')],
+  ]) {
+    const [x, y] = cell(col, 0);
+    rect(png, x + 2, y + 6, 12, 8, T.rock);
+    rect(png, x + 4, y + 3, 8, 4, T.rock);
+    rect(png, x + 5, y + 4, 4, 3, T.rockL);
+    rect(png, x + 3, y + 12, 10, 2, T.rockD);
+    rect(png, x + 5, y + 8, 2, 2, veinA);
+    rect(png, x + 9, y + 6, 2, 2, veinB);
+    rect(png, x + 8, y + 11, 2, 1, veinA);
+    px(png, x + 6, y + 5, veinB);
+    px(png, x + 11, y + 9, veinA);
+  }
+  // 27 anvil (on grass)
+  {
+    const [x, y] = cell(27, 0);
+    rect(png, x, y, C, C, T.grassA);
+    speckle(png, x, y, [T.grassD, T.grassL], 6, 41);
+    rect(png, x + 3, y + 12, 10, 2, hex('#3a3a40')); // base
+    rect(png, x + 6, y + 9, 4, 3, hex('#4a4a52')); // waist
+    rect(png, x + 2, y + 6, 12, 3, hex('#5c5c64')); // top
+    rect(png, x + 2, y + 6, 12, 1, hex('#7a7a84')); // highlight
+    rect(png, x + 12, y + 7, 3, 2, hex('#5c5c64')); // horn
+  }
   save(png, 'tiles.png');
 }
 
@@ -407,6 +434,10 @@ const ITEM_ORDER = [
   'kit_firepit', 'kit_furnace', 'kit_workbench', 'kit_chest',
   'kit_floor_wood', 'kit_floor_stone', 'kit_wall', 'kit_door', 'kit_fence', 'kit_torch',
   'bow', 'arrow',
+  'revolver', 'carbine', 'dmr', 'lmg', 'prototype_rifle',
+  'steel_axe', 'steel_pickaxe', 'ammo_44', 'ammo_762',
+  'copper_ore', 'iron_ore', 'copper_bar', 'iron_bar',
+  'gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact', 'kit_anvil',
 ];
 {
   const png = sheet(ITEM_ORDER.length, 1);
@@ -470,6 +501,30 @@ const ITEM_ORDER = [
         px(png, x + ax, ay - 1, hex('#c25047')); px(png, x + ax, ay + 1, hex('#c25047'));
       }
     },
+    // ── forged / rare guns
+    revolver(x) { rect(png, x + 3, 6, 10, 3, hex('#7a7a84')); rect(png, x + 6, 8, 3, 3, hex('#5c5c64')); rect(png, x + 4, 9, 3, 4, hex('#6a4c2a')); rect(png, x + 11, 5, 2, 1, hex('#9a9aa4')); },
+    carbine(x) { rect(png, x + 1, 7, 13, 2, hex('#7a7a84')); rect(png, x + 2, 9, 4, 3, woodC); rect(png, x + 8, 9, 2, 3, hex('#5c5c64')); rect(png, x + 12, 5, 2, 2, hex('#5c5c64')); },
+    dmr(x) { rect(png, x + 0, 7, 15, 2, dark); rect(png, x + 1, 9, 4, 3, woodC); rect(png, x + 8, 9, 2, 4, steelD); rect(png, x + 8, 4, 5, 2, hex('#3a4a3a')); rect(png, x + 9, 5, 3, 1, hex('#78c8f0')); },
+    lmg(x) { rect(png, x + 0, 6, 14, 3, dark); rect(png, x + 3, 9, 4, 4, hex('#3a3a40')); rect(png, x + 9, 9, 2, 3, steelD); rect(png, x + 1, 4, 3, 2, steelD); rect(png, x + 12, 4, 3, 2, dark); },
+    prototype_rifle(x) { rect(png, x + 0, 6, 15, 3, hex('#2a3a4a')); rect(png, x + 2, 5, 10, 1, hex('#66c0f4')); rect(png, x + 4, 9, 3, 4, hex('#1c2833')); rect(png, x + 13, 6, 2, 3, hex('#8af0e8')); px(png, x + 8, 4, hex('#8af0e8')); },
+    // ── steel tools
+    steel_axe(x) { for (let i = 0; i < 9; i++) px(png, x + 4 + i, 13 - i, woodC); rect(png, x + 9, 1, 5, 5, hex('#9aa4b0')); rect(png, x + 12, 2, 2, 5, hex('#c8d2dc')); },
+    steel_pickaxe(x) { for (let i = 0; i < 9; i++) px(png, x + 4 + i, 13 - i, woodC); rect(png, x + 8, 2, 8, 2, hex('#9aa4b0')); rect(png, x + 7, 3, 2, 3, hex('#c8d2dc')); rect(png, x + 14, 4, 2, 3, hex('#c8d2dc')); },
+    // ── new ammo
+    ammo_44(x) { for (const [bx, by] of [[4, 4], [8, 4], [6, 9]]) { rect(png, x + bx, by, 3, 6, hex('#d8a24a')); px(png, x + bx + 1, by, hex('#8a6a2a')); } },
+    ammo_762(x) { for (const [bx, by] of [[3, 3], [7, 3], [11, 3]]) { rect(png, x + bx, by, 2, 9, hex('#b87848')); px(png, x + bx, by, hex('#6a4a2a')); px(png, x + bx + 1, by + 8, hex('#8a5a34')); } },
+    // ── ores & bars
+    copper_ore(x) { rect(png, x + 4, 6, 8, 6, T.rock); rect(png, x + 5, 5, 5, 3, T.rockL); rect(png, x + 6, 8, 2, 2, hex('#c87a3a')); rect(png, x + 10, 7, 2, 2, hex('#e09a52')); px(png, x + 8, 11, hex('#c87a3a')); },
+    iron_ore(x) { rect(png, x + 4, 6, 8, 6, T.rock); rect(png, x + 5, 5, 5, 3, T.rockL); rect(png, x + 6, 8, 2, 2, hex('#9aa4b0')); rect(png, x + 10, 7, 2, 2, hex('#c8d2dc')); px(png, x + 8, 11, hex('#9aa4b0')); },
+    copper_bar(x) { rect(png, x + 3, 6, 10, 5, hex('#c87a3a')); rect(png, x + 4, 5, 10, 5, hex('#e09a52')); rect(png, x + 5, 6, 4, 1, hex('#f0b87a')); },
+    iron_bar(x) { rect(png, x + 3, 6, 10, 5, hex('#7a848e')); rect(png, x + 4, 5, 10, 5, hex('#9aa4b0')); rect(png, x + 5, 6, 4, 1, hex('#c8d2dc')); },
+    // ── rare valuables
+    gold_bar(x) { rect(png, x + 3, 7, 10, 5, hex('#b8860b')); rect(png, x + 4, 5, 10, 5, hex('#e8c84a')); rect(png, x + 5, 6, 5, 1, hex('#f8e88a')); px(png, x + 12, 7, hex('#f8e88a')); },
+    diamond(x) { for (let j = 0; j < 4; j++) rect(png, x + 6 - j, 6 + j, 4 + j * 2, 1, hex('#a8e8f0')); for (let j = 0; j < 5; j++) rect(png, x + 3 + j, 10 + j, 10 - j * 2, 1, hex('#78c8e0')); px(png, x + 7, 7, hex('#ffffff')); },
+    rolex(x) { rect(png, x + 6, 2, 4, 3, hex('#e8c84a')); rect(png, x + 6, 11, 4, 3, hex('#e8c84a')); rect(png, x + 4, 5, 8, 6, hex('#c8a83a')); rect(png, x + 6, 6, 4, 4, hex('#f8f8f0')); px(png, x + 8, 7, hex('#1c1814')); px(png, x + 8, 8, hex('#1c1814')); },
+    data_drive(x) { rect(png, x + 4, 4, 8, 9, hex('#1c2833')); rect(png, x + 5, 5, 6, 3, hex('#2a3a4a')); rect(png, x + 6, 9, 4, 2, hex('#66c0f4')); px(png, x + 10, 5, hex('#5ff08a')); },
+    artifact(x) { for (let j = 0; j < 6; j++) { rect(png, x + 7 - (j % 3), 3 + j * 2, 3 + (j % 3) * 2, 1, hex('#b078e0')); } rect(png, x + 6, 6, 4, 5, hex('#d0a0f8')); px(png, x + 7, 8, hex('#ffffff')); px(png, x + 9, 5, hex('#e8c8ff')); },
+    kit_anvil(x) { rect(png, x + 2, 5, 12, 9, hex('#7a5a34')); rect(png, x + 2, 5, 12, 2, hex('#8a6a3c')); rect(png, x + 4, 8, 8, 2, hex('#5c5c64')); rect(png, x + 6, 10, 4, 2, hex('#4a4a52')); },
   };
   ITEM_ORDER.forEach((id, i) => draw[id](i * C));
   save(png, 'items.png');

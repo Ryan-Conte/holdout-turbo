@@ -46,6 +46,28 @@ const MILITARY_TABLE: LootEntry[] = [
   { id: 'backpack_mk3', weight: 4, min: 1, max: 1 },
 ];
 
+// hotzone chests — high-grade weapons, attachments and the valuables worth showing off
+const RARE_TABLE: LootEntry[] = [
+  { id: 'ammo_762', weight: 16, min: 8, max: 20 },
+  { id: 'ammo_556', weight: 10, min: 10, max: 24 },
+  { id: 'medkit', weight: 10, min: 1, max: 2 },
+  { id: 'rifle', weight: 7, min: 1, max: 1 },
+  { id: 'dmr', weight: 5, min: 1, max: 1 },
+  { id: 'lmg', weight: 2, min: 1, max: 1 },
+  { id: 'prototype_rifle', weight: 1, min: 1, max: 1 },
+  { id: 'attach_reddot', weight: 6, min: 1, max: 1 },
+  { id: 'attach_suppressor', weight: 5, min: 1, max: 1 },
+  { id: 'helmet_military', weight: 5, min: 1, max: 1 },
+  { id: 'vest_military', weight: 4, min: 1, max: 1 },
+  { id: 'backpack_mk3', weight: 4, min: 1, max: 1 },
+  { id: 'iron_bar', weight: 6, min: 1, max: 3 },
+  { id: 'gold_bar', weight: 5, min: 1, max: 1 },
+  { id: 'rolex', weight: 4, min: 1, max: 1 },
+  { id: 'data_drive', weight: 3, min: 1, max: 1 },
+  { id: 'diamond', weight: 2, min: 1, max: 1 },
+  { id: 'artifact', weight: 1, min: 1, max: 1 },
+];
+
 const GROUND_TABLE: LootEntry[] = [
   { id: 'cloth', weight: 26, min: 1, max: 3 },
   { id: 'scrap', weight: 22, min: 1, max: 2 },
@@ -108,8 +130,8 @@ function pick(table: LootEntry[], rnd: () => number): { id: ItemId; qty: number 
 }
 
 export function rollChest(rnd: () => number, tier: ChestTier = 'normal'): InvSlot[] {
-  const table = tier === 'military' ? MILITARY_TABLE : CHEST_TABLE;
-  const n = tier === 'military' ? 3 + Math.floor(rnd() * 2) : 2 + Math.floor(rnd() * 3);
+  const table = tier === 'rare' ? RARE_TABLE : tier === 'military' ? MILITARY_TABLE : CHEST_TABLE;
+  const n = tier === 'normal' ? 2 + Math.floor(rnd() * 3) : 3 + Math.floor(rnd() * 2);
   const slots: InvSlot[] = [];
   for (let i = 0; i < n; i++) slots.push(pick(table, rnd));
   return slots;

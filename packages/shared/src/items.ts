@@ -26,18 +26,23 @@ export type ArmorPiece = 'helmet' | 'vest';
 
 /** Structures you can place in the world / your camp. */
 export type BuildType =
-  | 'chest' | 'workbench' | 'firepit' | 'furnace'
+  | 'chest' | 'workbench' | 'firepit' | 'furnace' | 'anvil'
   | 'wood_floor' | 'stone_floor' | 'wall' | 'door' | 'fence' | 'torch';
 
 export type ItemId =
   // weapons
   | 'pistol' | 'smg' | 'shotgun' | 'rifle' | 'bow'
+  | 'revolver' | 'carbine' | 'dmr' | 'lmg' | 'prototype_rifle'
   // tools
   | 'spear' | 'axe' | 'pickaxe' | 'fishing_rod'
+  | 'steel_axe' | 'steel_pickaxe'
   // ammo
-  | 'ammo_9mm' | 'ammo_shell' | 'ammo_556' | 'arrow'
+  | 'ammo_9mm' | 'ammo_shell' | 'ammo_556' | 'arrow' | 'ammo_44' | 'ammo_762'
   // materials
   | 'cloth' | 'scrap' | 'wood' | 'stone'
+  | 'copper_ore' | 'iron_ore' | 'copper_bar' | 'iron_bar'
+  // rare valuables (no use — sell them for a fortune / show them off)
+  | 'gold_bar' | 'diamond' | 'rolex' | 'data_drive' | 'artifact'
   // medical
   | 'bandage' | 'medkit'
   // food & water
@@ -49,7 +54,7 @@ export type ItemId =
   // weapon mods
   | 'attach_reddot' | 'attach_suppressor'
   // placeables (craft then place)
-  | 'kit_firepit' | 'kit_furnace' | 'kit_workbench' | 'kit_chest'
+  | 'kit_firepit' | 'kit_furnace' | 'kit_workbench' | 'kit_chest' | 'kit_anvil'
   // base building (Minecraft-style camp construction)
   | 'kit_floor_wood' | 'kit_floor_stone' | 'kit_wall' | 'kit_door' | 'kit_fence' | 'kit_torch';
 
@@ -148,6 +153,16 @@ export const ITEMS: Record<ItemId, ItemDef> = {
     { damage: 13, fireRateMs: 130, ammo: 'ammo_556', pellets: 1, spread: 0.07, bulletSpeed: 820, range: 560, magSize: 30, reloadMs: 1900 }),
   bow: weapon('bow', 'Hunting Bow', 1.0, 'Silent and deadly. Craft arrows from wood and stone.',
     { damage: 24, fireRateMs: 1000, ammo: 'arrow', pellets: 1, spread: 0.035, bulletSpeed: 540, range: 440, magSize: 1, reloadMs: 500, noise: 90 }),
+  revolver: weapon('revolver', 'Iron Revolver', 1.5, 'Hard-hitting six-shooter. Uses .44. Forged at an anvil.',
+    { damage: 34, fireRateMs: 480, ammo: 'ammo_44', pellets: 1, spread: 0.045, bulletSpeed: 760, range: 540, magSize: 6, reloadMs: 1900 }),
+  carbine: weapon('carbine', 'Scout Carbine', 2.8, 'Reliable semi-auto rifle. Uses 5.56. Forged at an anvil.',
+    { damage: 20, fireRateMs: 200, ammo: 'ammo_556', pellets: 1, spread: 0.05, bulletSpeed: 860, range: 640, magSize: 20, reloadMs: 1800 }),
+  dmr: weapon('dmr', 'Marksman Rifle', 4.0, 'Long-range precision. Uses 7.62. Rare military hardware.',
+    { damage: 58, fireRateMs: 620, ammo: 'ammo_762', pellets: 1, spread: 0.015, bulletSpeed: 1000, range: 820, magSize: 10, reloadMs: 2400 }),
+  lmg: weapon('lmg', 'Belt-Fed LMG', 8.5, 'A wall of lead. Uses 7.62, 100-round belt. Very rare.',
+    { damage: 22, fireRateMs: 95, ammo: 'ammo_762', pellets: 1, spread: 0.11, bulletSpeed: 900, range: 620, magSize: 100, reloadMs: 4200 }),
+  prototype_rifle: weapon('prototype_rifle', 'Prototype Railgun', 5.0, 'Experimental. Devastating. Worth a fortune. Uses 7.62.',
+    { damage: 95, fireRateMs: 900, ammo: 'ammo_762', pellets: 1, spread: 0.008, bulletSpeed: 1400, range: 1000, magSize: 5, reloadMs: 2600 }),
 
   // ── tools
   spear: tool('spear', 'Wooden Spear', 1.4, 'Sharpened branch. Better reach than fists.',
@@ -158,18 +173,34 @@ export const ITEMS: Record<ItemId, ItemDef> = {
     { damage: 18, cooldownMs: 650, range: 38, wood: 1, stone: 3 }),
   fishing_rod: tool('fishing_rod', 'Fishing Rod', 1.0, 'Equip, face water and click to fish.',
     { damage: 4, cooldownMs: 800, range: 40, wood: 1, stone: 1 }),
+  steel_axe: tool('steel_axe', 'Steel Hatchet', 2.0, 'Forged at an anvil. Chews through forests.',
+    { damage: 30, cooldownMs: 600, range: 40, wood: 5, stone: 1 }),
+  steel_pickaxe: tool('steel_pickaxe', 'Steel Pickaxe', 2.4, 'Forged at an anvil. Cracks rock and ore fast.',
+    { damage: 26, cooldownMs: 600, range: 40, wood: 1, stone: 5 }),
 
   // ── ammo
   ammo_9mm: ammo('ammo_9mm', '9mm Rounds', 0.01, 60, 'Pistol & SMG ammunition.'),
   ammo_shell: ammo('ammo_shell', 'Shotgun Shells', 0.03, 24, 'Shotgun ammunition.'),
   ammo_556: ammo('ammo_556', '5.56 Rounds', 0.012, 60, 'Rifle ammunition.'),
   arrow: ammo('arrow', 'Arrows', 0.05, 30, 'Bow ammunition. Cheap to craft.'),
+  ammo_44: ammo('ammo_44', '.44 Rounds', 0.02, 36, 'Revolver ammunition. Forged at an anvil.'),
+  ammo_762: ammo('ammo_762', '7.62 Rounds', 0.015, 60, 'DMR / LMG ammunition. Rare.'),
 
   // ── materials
   cloth: material('cloth', 'Cloth', 0.1, 'Torn fabric.'),
   scrap: material('scrap', 'Scrap Metal', 0.4, 'Rusty metal bits.'),
   wood: material('wood', 'Wood', 0.5, 'Chopped from trees.'),
   stone: material('stone', 'Stone', 0.6, 'Mined from rocks.'),
+  copper_ore: material('copper_ore', 'Copper Ore', 0.8, 'From copper-veined rocks. Smelt at a furnace.', 20),
+  iron_ore: material('iron_ore', 'Iron Ore', 0.9, 'From iron-veined rocks. Smelt at a furnace.', 20),
+  copper_bar: material('copper_bar', 'Copper Bar', 0.6, 'Smelted copper. Ammo and alloys.', 20),
+  iron_bar: material('iron_bar', 'Iron Bar', 0.7, 'Smelted iron. Weapons and tools.', 20),
+  // ── rare valuables — no use but bragging rights and a fat sale price
+  gold_bar: material('gold_bar', 'Gold Bar', 1.0, 'Solid gold. Traders pay a fortune.', 5),
+  diamond: material('diamond', 'Rough Diamond', 0.05, 'Catches the torchlight. Very valuable.', 5),
+  rolex: material('rolex', 'Luxury Watch', 0.1, 'Still ticking. Someone will pay dearly.', 5),
+  data_drive: material('data_drive', 'Encrypted Drive', 0.2, 'Military data. The black market wants it.', 5),
+  artifact: material('artifact', 'Zone Artifact', 0.5, 'Impossible geometry. The rarest find in the zone.', 3),
 
   // ── medical
   bandage: heal('bandage', 'Bandage', 0.05, 10, 30, 'Restores 30 HP.'),
@@ -208,6 +239,7 @@ export const ITEMS: Record<ItemId, ItemDef> = {
   kit_furnace: placeable('kit_furnace', 'Furnace Kit', 4.0, 'furnace', 'Place it to unlock ammo crafting nearby.'),
   kit_workbench: placeable('kit_workbench', 'Workbench Kit', 3.0, 'workbench', 'Place it to unlock weapon-mod crafting nearby.'),
   kit_chest: placeable('kit_chest', 'Chest Kit', 3.0, 'chest', 'Place it in your camp for 12 stash slots.'),
+  kit_anvil: placeable('kit_anvil', 'Anvil Kit', 6.0, 'anvil', 'Place it to forge weapons, ammo and attachments nearby.'),
 
   // ── base building (stackable, cheap — build your camp out like Minecraft)
   kit_floor_wood: placeable('kit_floor_wood', 'Wood Flooring', 0.5, 'wood_floor', 'Plank flooring for your camp.', 20),

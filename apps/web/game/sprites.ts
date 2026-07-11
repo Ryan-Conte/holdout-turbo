@@ -11,6 +11,10 @@ export const ITEM_SHEET_ORDER: ItemId[] = [
   'kit_firepit', 'kit_furnace', 'kit_workbench', 'kit_chest',
   'kit_floor_wood', 'kit_floor_stone', 'kit_wall', 'kit_door', 'kit_fence', 'kit_torch',
   'bow', 'arrow',
+  'revolver', 'carbine', 'dmr', 'lmg', 'prototype_rifle',
+  'steel_axe', 'steel_pickaxe', 'ammo_44', 'ammo_762',
+  'copper_ore', 'iron_ore', 'copper_bar', 'iron_bar',
+  'gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact', 'kit_anvil',
 ];
 
 export const ITEM_INDEX: Record<string, number> = Object.fromEntries(

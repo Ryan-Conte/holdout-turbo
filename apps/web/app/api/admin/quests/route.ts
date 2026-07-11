@@ -1,14 +1,7 @@
 import { NextResponse } from 'next/server';
-import { headers } from 'next/headers';
 import { ENEMY_DEFS, ITEMS } from '@holdout/shared';
-import { auth, isAdminEmail } from '@/lib/auth';
+import { requireAdmin as admin } from '@/lib/auth';
 import { prisma } from '@/lib/db';
-
-async function admin() {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session?.user || !isAdminEmail(session.user.email)) return null;
-  return session.user;
-}
 
 export async function GET() {
   const user = await admin();
@@ -27,6 +20,8 @@ interface QuestBody {
   rewardMoney?: number;
   rewardItem?: string | null;
   rewardQty?: number;
+  requiresId?: number | null;
+  tier?: number;
   active?: boolean;
 }
 
@@ -50,6 +45,8 @@ function toData(body: QuestBody) {
     rewardMoney: Math.max(0, Math.min(100000, Number(body.rewardMoney) | 0)),
     rewardItem: body.rewardItem || null,
     rewardQty: Math.max(1, Math.min(99, Number(body.rewardQty) | 0 || 1)),
+    requiresId: body.requiresId ? Number(body.requiresId) | 0 : null,
+    tier: Number(body.tier) === 2 ? 2 : 1,
     active: body.active !== false,
   };
 }
