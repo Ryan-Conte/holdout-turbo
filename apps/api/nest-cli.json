@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-spec.nestjs.com/nest-cli.schema.json",
+  "collection": "@nestjs/schematics",
+  "sourceRoot": "src",
+  "compilerOptions": {
+    "deleteOutDir": true
+  }
+}

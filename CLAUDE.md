@@ -1,0 +1,40 @@
+# HOLDOUT — agent guide
+
+Top-down multiplayer survival extraction shooter (DayZ / Rust / ARC Raiders loop, Zero Sievert presentation). Turborepo + npm workspaces.
+
+## Layout
+
+- `packages/shared` — recipes, trader stock, tiles, socket protocol types. **Single source of truth**; both apps import `@holdout/shared` (compiled to `dist/`, run `npm run build -w @holdout/shared` after edits). Item definitions live in `src/items.ts` — a category-builder registry (`weapon()/tool()/food()/placeable()` etc.); add an item by extending the `ItemId` union + one builder call. UI verbs come from item flags (`food/drink/heal/place/armor/weapon`) via `useVerb()`, so new items need no client changes.
+- `apps/api` — NestJS + socket.io **authoritative** game server (port 3001). All simulation server-side: movement, combat, harvesting, loot, trading, hideouts. Clients only send intents.
+- `apps/web` — Next.js 15 (App Router, React 19). Better Auth (email/password) for accounts, canvas game client with sprite renderer, admin map editor at `/editor`.
+- `tools/gen-sprites.mjs` — generates placeholder pixel-art sprite sheets into `apps/web/public/sprites/*.png`. Run `node tools/gen-sprites.mjs`. Replace PNGs with real art later; keep grid layout documented in `docs/ART.md`.
+
+## Key flows
+
+- **Database**: Prisma 6 (schema at `prisma/schema.prisma`, client generated to root node_modules, shared by both apps). Change schema → `npx prisma db push` + `npx prisma generate` at root. Runtime URL from env `DATABASE_URL`; `DIRECT_DATABASE_URL` (non-pooler host) for DDL. Do NOT upgrade to Prisma 7 without migrating to its driver-adapter config.
+- **Auth**: Better Auth on the Prisma adapter owns `user/session/account/verification`. Email/password plus **Steam login** (`/api/auth/steam` → OpenID 2.0 → `/api/auth/steam/callback` bridges the SteamID into a shadow Better Auth account: email `steam-<id>@steam.holdout.local`, password HMAC-derived from `BETTER_AUTH_SECRET`; `STEAM_API_KEY` env optional for persona names). The game socket uses a short-lived JWT from `POST /api/game-token` (web, session-gated) verified by the API (`JWT_SECRET` shared via env). Game profile data lives in `profiles.data` jsonb: `{inv, equipment, skills, quests}`.
+- **Combat**: magazine + reload per weapon (`WeaponStats.magSize/reloadMs`, server-tracked `p.mags`), armor mitigation, weapon mods in the `mod` equipment slot (red dot = spread, suppressor = aggro noise), skill bonuses (`skillLevel` from xp in profiles).
+- **Hideouts ("home base")**: per-user grass-field instance (`HIDEOUT_W×HIDEOUT_H`, bed + starter stash). **Players log in at home** and deploy via the door mat → random world spawn (`returnPos` returns you to the safe zone you entered from mid-session). Building is craft-then-place: craft a `kit_*` placeable item (shared `BUILDABLES` maps `BuildType`→tile/hp/hideoutOnly), then `c:build {slot,tx,ty}` consumes the kit and places the structure. Base pieces: wood/stone floors are foundations (`FLOOR_TILES` — other pieces can be placed on top), walls, doors (players pass; enemies/bullets don't), fences (bullets fly over), torches (client-rendered night glow, as do firepits). `c:demolish {tx,ty}` in your own camp reclaims the kit (chests must be empty); camp chest containers are rebuilt via `syncHideoutContainers` after any `hideout.objects` mutation. Camp builds are permanent; world builds wear out (`WORLD_STRUCTURE_TTL_MS`, `inst.structures`) and take melee/bullet damage. Workbench/furnace gate `Recipe.station` crafting; firepit enables cooking (`ItemDef.raw`); `E` near a placed station emits `s:station` (campfire → cook-queue panel, furnace/workbench → crafting at the right tab). Client shows a green tile ghost while placing and a red X marker in demolish mode (X key).
+- **Quests**: `quests` table, CRUD via `/api/admin/quests` (editor QUESTS tab), hot-reloaded by the API every 60s. Kill quests tick on enemy death; fetch quests check inventory at claim; claims paid at any trader.
+- **Chat**: `c:chat` allowed only in safe zones/hideouts, broadcast per instance, rendered as overhead bubbles + log.
+- **Instances**: the server runs named instances — `world` plus on-demand `h:<userId>` hideouts. Sockets join a room per instance; state broadcasts are per-instance. Changing instance re-sends `s:init`.
+- **Extraction**: world maps have extraction beacons (`inst.extracts` — authored `extract` objects or `placeExtracts` edge fallback). `E` nearby starts a 5s hold-still action (`EXTRACT_TIME_MS`); success switches you to your hideout with loot intact. Beacons refuse inside safe zones, and `hideoutEnter` no longer warps you to your own camp — extraction is the only way home (friends' camps still visitable from safe zones). Death still drops everything.
+- **NPCs & line of sight**: `inst.npcs` are survivor bots that appear as players (harvesters chop trees via `npcChop`; hostile raiders shoot on sight; all fight back and drop loot bags, respawning via `npcRespawns`). `losClear()` raycasts `BLOCKS_BULLET` tiles: enemies/NPCs can't acquire targets through walls or forest, and `broadcast()` sends per-viewer snapshots in world instances — entities without LOS (beyond `SENSE_RANGE`) are omitted entirely, so wallhacks see nothing.
+- **Day/night**: global clock (`DAY_LENGTH_MS`, `isNight()`). At night zombies get `NIGHT_SPEED_MULT`/`NIGHT_AGGRO_MULT`, wolves aggro wider; client renders deeper darkness, dusk/dawn tint, torch/firepit glow.
+- **Safe zones**: POIs with `safe: true` (trader outposts). No damage in/out, enemies don't aggro, shooting disabled. Hideouts are always safe, and resting there heals (`HOME_REST_HP_PER_S`).
+- **Maps**: server loads the active row from the `maps` table (authored via `/editor`) or falls back to procedural generation (`apps/api/src/game/mapgen.ts`).
+
+## Conventions
+
+- Socket event names only via `EV` from shared — never string literals.
+- Never trust client payloads: clamp numbers, bounds-check slots, rate-limit (see `apps/api/src/game/rate-limit.ts` and `docs/ANTICHEAT.md`).
+- Env: `apps/api/.env`, `apps/web/.env.local` (gitignored). `JWT_SECRET` must match across both.
+- `npm run dev` at root runs everything. `npx turbo run typecheck` before calling work done.
+
+## Deeper docs
+
+- `docs/ARCHITECTURE.md` — systems and data model
+- `docs/ANTICHEAT.md` — current guards + roadmap
+- `docs/PVP.md` — balance philosophy, armor/attachment plans
+- `docs/ART.md` — sprite sheet layout/pipeline
+- `docs/ROADMAP.md` — planned features and their intended shape

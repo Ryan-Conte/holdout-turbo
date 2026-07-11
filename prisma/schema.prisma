@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+  provider  = "postgresql"
+}
+
+// ── Better Auth ──────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @default(now())
+  sessions      Session[]
+  accounts      Account[]
+
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @default(now())
+
+  @@map("account")
+}
+
+model Verification {
+  id         String    @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime? @default(now())
+  updatedAt  DateTime? @default(now())
+
+  @@map("verification")
+}
+
+// ── Game ─────────────────────────────────────────────────────────────────
+
+model Profile {
+  userId    String   @id @map("user_id")
+  data      Json // { inv, equipment, skills, quests }
+  money     Int      @default(25)
+  kills     Int      @default(0)
+  deaths    Int      @default(0)
+  hideout   Json? // { storage: InvSlot[], objects: [{type, tx, ty, slots?}] }
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("profiles")
+}
+
+model Friend {
+  userId    String   @map("user_id")
+  friendId  String   @map("friend_id")
+  status    String   @default("pending")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@id([userId, friendId])
+  @@map("friends")
+}
+
+model GameMap {
+  id        Int      @id @default(autoincrement())
+  name      String
+  data      Json
+  active    Boolean  @default(false)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("maps")
+}
+
+model Quest {
+  id           Int      @id @default(autoincrement())
+  name         String
+  desc         String   @default("")
+  kind         String // 'kill' | 'fetch'
+  target       String // EnemyKind for kill, ItemId for fetch
+  count        Int      @default(1)
+  rewardMoney  Int      @default(0)
+  rewardItem   String?
+  rewardQty    Int      @default(1)
+  active       Boolean  @default(true)
+  updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("quests")
+}
