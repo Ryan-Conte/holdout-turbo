@@ -3,7 +3,12 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+      "outputs": [
+        "packages/shared/dist/**",
+        "apps/api/dist/**",
+        "apps/web/.next/**",
+        "!.next/cache/**"
+      ]
     },
     "dev": {
       "dependsOn": ["^build"],
@@ -13,6 +18,9 @@
     "typecheck": {
       "dependsOn": ["^build"]
     },
-    "lint": {}
+    "lint": {},
+    "deploy": {
+      "dependsOn": ["build"]
+    }
   }
 }

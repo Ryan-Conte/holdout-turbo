@@ -251,21 +251,17 @@ const T = {
     rect(png, x + 1, y + 10, C - 2, 1, hex('#5c4426'));
     rect(png, x + 12, y + 8, 2, 2, hex('#c8a84a')); // handle
   }
-  // 23 fence (posts + rails over grass)
+  // 23 fence (posts + rails — transparent bg so floors show through)
   {
     const [x, y] = cell(23, 0);
-    rect(png, x, y, C, C, T.grassA);
-    speckle(png, x, y, [T.grassD, T.grassL], 6, 17);
     rect(png, x + 2, y + 4, 2, 9, hex('#7a5a34')); // posts
     rect(png, x + 12, y + 4, 2, 9, hex('#7a5a34'));
     rect(png, x, y + 6, C, 2, hex('#8a683c')); // rails
     rect(png, x, y + 10, C, 2, hex('#6a4c2a'));
   }
-  // 24 torch post (stick + flame over grass)
+  // 24 torch post (transparent bg so floors show through)
   {
     const [x, y] = cell(24, 0);
-    rect(png, x, y, C, C, T.grassA);
-    speckle(png, x, y, [T.grassD, T.grassL], 6, 29);
     rect(png, x + 7, y + 5, 2, 9, hex('#5c3f26')); // post
     rect(png, x + 6, y + 13, 4, 2, hex('#4a331e')); // base
     rect(png, x + 6, y + 3, 4, 3, hex('#d8722a')); // flame
@@ -298,11 +294,9 @@ const T = {
     px(png, x + 6, y + 5, veinB);
     px(png, x + 11, y + 9, veinA);
   }
-  // 27 anvil (on grass)
+  // 27 anvil (transparent bg so floors show through)
   {
     const [x, y] = cell(27, 0);
-    rect(png, x, y, C, C, T.grassA);
-    speckle(png, x, y, [T.grassD, T.grassL], 6, 41);
     rect(png, x + 3, y + 12, 10, 2, hex('#3a3a40')); // base
     rect(png, x + 6, y + 9, 4, 3, hex('#4a4a52')); // waist
     rect(png, x + 2, y + 6, 12, 3, hex('#5c5c64')); // top
@@ -437,7 +431,7 @@ const ITEM_ORDER = [
   'revolver', 'carbine', 'dmr', 'lmg', 'prototype_rifle',
   'steel_axe', 'steel_pickaxe', 'ammo_44', 'ammo_762',
   'copper_ore', 'iron_ore', 'copper_bar', 'iron_bar',
-  'gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact', 'kit_anvil',
+  'gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact', 'kit_anvil', 'kit_bed',
 ];
 {
   const png = sheet(ITEM_ORDER.length, 1);
@@ -525,6 +519,7 @@ const ITEM_ORDER = [
     data_drive(x) { rect(png, x + 4, 4, 8, 9, hex('#1c2833')); rect(png, x + 5, 5, 6, 3, hex('#2a3a4a')); rect(png, x + 6, 9, 4, 2, hex('#66c0f4')); px(png, x + 10, 5, hex('#5ff08a')); },
     artifact(x) { for (let j = 0; j < 6; j++) { rect(png, x + 7 - (j % 3), 3 + j * 2, 3 + (j % 3) * 2, 1, hex('#b078e0')); } rect(png, x + 6, 6, 4, 5, hex('#d0a0f8')); px(png, x + 7, 8, hex('#ffffff')); px(png, x + 9, 5, hex('#e8c8ff')); },
     kit_anvil(x) { rect(png, x + 2, 5, 12, 9, hex('#7a5a34')); rect(png, x + 2, 5, 12, 2, hex('#8a6a3c')); rect(png, x + 4, 8, 8, 2, hex('#5c5c64')); rect(png, x + 6, 10, 4, 2, hex('#4a4a52')); },
+    kit_bed(x) { rect(png, x + 2, 5, 12, 9, hex('#7a5a34')); rect(png, x + 2, 5, 12, 2, hex('#8a6a3c')); rect(png, x + 4, 8, 8, 4, hex('#7a8a99')); rect(png, x + 4, 8, 3, 4, hex('#c8c8bd')); },
   };
   ITEM_ORDER.forEach((id, i) => draw[id](i * C));
   save(png, 'items.png');

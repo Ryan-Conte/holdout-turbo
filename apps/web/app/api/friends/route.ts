@@ -101,3 +101,27 @@ export async function PUT(req: Request) {
   });
   return NextResponse.json({ ok: true });
 }
+
+/** Remove a friend / cancel an outgoing request / decline an incoming one: { id: <userId> } */
+export async function DELETE(req: Request) {
+  const user = await me();
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  let body: { id?: string };
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid body' }, { status: 400 });
+  }
+  const other = (body.id ?? '').trim();
+  if (!other) return NextResponse.json({ error: 'id required' }, { status: 400 });
+  // wipe the relationship in both directions, whatever state it was in
+  await prisma.friend.deleteMany({
+    where: {
+      OR: [
+        { userId: user.id, friendId: other },
+        { userId: other, friendId: user.id },
+      ],
+    },
+  });
+  return NextResponse.json({ ok: true });
+}

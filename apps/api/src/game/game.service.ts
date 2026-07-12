@@ -208,7 +208,9 @@ interface Instance {
 const ENEMY_RADIUS = 12;
 const ENEMY_RESPAWN_MS = 90_000;
 const WORLD = 'world';
-const LOS_MEMORY_MS = 3000; // how long an enemy hunts a target it can no longer see
+const LOS_MEMORY_MS = 12_000; // how long an enemy keeps hunting a target it can't see
+const LOS_GIVE_UP_MS = 2500; // …but once it reaches your last-seen spot, it gives up fast
+const OVERWEIGHT_SPEED_MULT = 0.45; // hauling too much makes you a slow, juicy target
 
 @Injectable()
 export class GameService implements OnModuleInit, OnModuleDestroy {
@@ -329,14 +331,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const tiles = new Uint8Array(W * H).fill(Tile.Grass);
     for (let x = 0; x < W; x++) { tiles[x] = Tile.Tree; tiles[(H - 1) * W + x] = Tile.Tree; }
     for (let y = 0; y < H; y++) { tiles[y * W] = Tile.Tree; tiles[y * W + W - 1] = Tile.Tree; }
-    tiles[3 * W + 3] = Tile.Bed;
-    tiles[4 * W + 3] = Tile.Bed;
     const exitTx = Math.floor(W / 2);
     tiles[(H - 2) * W + exitTx] = Tile.DoorMat;
 
     const hideout = await this.db.loadHideout(ownerId);
     while (hideout.storage.length < HIDEOUT_STORAGE_SLOTS) hideout.storage.push(null);
     hideout.storage.length = HIDEOUT_STORAGE_SLOTS;
+    // the bed is a movable object now — seed one for camps that predate this
+    if (!hideout.objects.some((o) => o.type === 'bed')) hideout.objects.unshift({ type: 'bed', tx: 3, ty: 3 });
 
     const inst: Instance = {
       id,
@@ -351,7 +353,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       traders: [],
       extracts: [],
       exit: { x: (exitTx + 0.5) * TILE, y: (H - 2 + 0.5) * TILE },
-      spawns: [{ x: 4.5 * TILE, y: 4.5 * TILE }], // wake up next to your bed
+      spawns: [{ x: 4.5 * TILE, y: 4.5 * TILE }], // repositioned next to the bed below
       lootSpots: [],
       containers: new Map(),
       ground: new Map(),
@@ -388,8 +390,25 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       }
     }
     this.syncHideoutContainers(inst);
+    this.syncHideoutSpawn(inst);
     this.instances.set(id, inst);
     return inst;
+  }
+
+  /** Home spawn = a walkable tile next to your bed (the bed is movable). */
+  private syncHideoutSpawn(inst: Instance) {
+    if (inst.kind !== 'hideout' || !inst.hideout) return;
+    const bed = inst.hideout.objects.find((o) => o.type === 'bed');
+    if (!bed) return; // no bed? keep the previous spawn
+    for (const [dx, dy] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1]]) {
+      const tx = bed.tx + dx;
+      const ty = bed.ty + dy;
+      if (tx < 1 || ty < 1 || tx >= inst.w - 1 || ty >= inst.h - 1) continue;
+      if (!BLOCKS_MOVE[inst.tiles[ty * inst.w + tx]]) {
+        inst.spawns = [{ x: (tx + 0.5) * TILE, y: (ty + 0.5) * TILE }];
+        return;
+      }
+    }
   }
 
   /** Rebuild the hideout's built-chest containers from hideout.objects (slot arrays shared by reference). */
@@ -1085,12 +1104,6 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         return false;
       }
     }
-    const costKg = recipe.cost.reduce((s, c) => s + ITEMS[c.id].kg * c.qty, 0);
-    const outKg = ITEMS[recipe.out.id].kg * recipe.out.qty;
-    if (invWeight(p.inv) - costKg + outKg > invCapacity(p.inv).maxKg + 1e-9) {
-      this.toast(p.sid, 'Too heavy to carry');
-      return false;
-    }
     return true;
   }
 
@@ -1178,6 +1191,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       this.io?.to(inst.id).emit(EV.tile, { i, tile: buildable.tile, under });
       if (inHideout && inst.hideout) {
         inst.hideout.objects.push({ type, tx, ty });
+        if (type === 'bed') this.syncHideoutSpawn(inst); // your spawn follows your bed
         this.persistHideout(inst);
       } else {
         inst.structures.set(i, { type, hp: buildable.hp, expiresAt: Date.now() + WORLD_STRUCTURE_TTL_MS, under });
@@ -1237,6 +1251,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       this.io?.to(inst.id).emit(EV.tile, { i, tile: restore });
     }
     this.syncHideoutContainers(inst);
+    if (obj.type === 'bed') this.syncHideoutSpawn(inst);
     this.persistHideout(inst);
     this.toast(sid, `Demolished ${buildable.name}${kit ? ` — ${ITEMS[kit.id].name} returned` : ''}`);
     this.pushInventory(p);
@@ -1447,6 +1462,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const spawn = h.spawns[0];
     this.switchInstance(p, h, spawn.x, spawn.y);
     this.toast(sid, 'Entered a friend’s camp — have a look around');
+    // let the owner know they have company
+    for (const op of this.players.values())
+      if (op.userId === owner) this.toast(op.sid, `👋 ${p.name} is visiting your camp`);
   }
 
   async leaveHideout(sid: string) {
@@ -1479,12 +1497,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   // ── inventory primitives ──────────────────────────────────────────────────
 
   private addItem(inv: Inventory, id: ItemId, qty: number): number {
+    // no hard weight cap — carrying too much slows you down instead (see tick)
     const def = ITEMS[id];
-    const cap = invCapacity(inv);
-    const room = Math.max(0, cap.maxKg - invWeight(inv));
-    const maxByWeight = def.kg > 0 ? Math.floor(room / def.kg + 1e-9) : qty;
-    const remaining = Math.min(qty, maxByWeight);
-    if (remaining <= 0) return qty;
+    const remaining = qty;
     let toPlace = remaining;
     for (const s of inv.slots) {
       if (toPlace <= 0) break;
@@ -1674,7 +1689,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         const len = Math.hypot(dx, dy);
         dx /= len;
         dy /= len;
-        const speed = PLAYER_SPEED * (this.inWater(inst, p) ? SWIM_SPEED_MULT : 1);
+        // overweight = crawling pace; everyone can see the loot mule coming
+        const overweight = invWeight(p.inv) > invCapacity(p.inv).maxKg;
+        const speed = PLAYER_SPEED * (this.inWater(inst, p) ? SWIM_SPEED_MULT : 1) * (overweight ? OVERWEIGHT_SPEED_MULT : 1);
         this.moveEntity(inst, p, dx * speed * dt, dy * speed * dt, PLAYER_RADIUS);
         p.moving = true;
       } else {
@@ -2067,6 +2084,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         const dy = aimY - e.y;
         const dist = Math.hypot(dx, dy) || 1;
         e.angle = Math.atan2(dy, dx);
+
+        // it searched your last-seen spot and found nothing — the trail is cold
+        if (!seen && dist < 18 && now - e.lastSeenAt > LOS_GIVE_UP_MS) {
+          e.targetSid = null;
+          continue;
+        }
 
         // wall-stuck safeguard: steer around obstacles instead of grinding into them
         const steer = (speed: number, dirX: number, dirY: number) => {

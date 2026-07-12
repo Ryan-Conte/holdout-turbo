@@ -138,6 +138,7 @@ export const RECIPES: Recipe[] = [
   { id: 'craft_floor_stone', cat: 'build', out: { id: 'kit_floor_stone', qty: 4 }, cost: [{ id: 'stone', qty: 4 }] },
   { id: 'craft_fence', cat: 'build', out: { id: 'kit_fence', qty: 4 }, cost: [{ id: 'wood', qty: 6 }] },
   { id: 'craft_torch', cat: 'build', out: { id: 'kit_torch', qty: 2 }, cost: [{ id: 'wood', qty: 2 }, { id: 'cloth', qty: 1 }] },
+  { id: 'craft_bed', cat: 'build', out: { id: 'kit_bed', qty: 1 }, cost: [{ id: 'wood', qty: 8 }, { id: 'cloth', qty: 4 }] },
   // ── workbench
   { id: 'craft_axe', cat: 'survival', out: { id: 'axe', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'stone', qty: 3 }], station: 'workbench' },
   { id: 'craft_pickaxe', cat: 'survival', out: { id: 'pickaxe', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'stone', qty: 3 }], station: 'workbench' },
@@ -188,6 +189,7 @@ export const BUILDABLES: Record<BuildType, Buildable> = {
   firepit: { type: 'firepit', name: 'Firepit', desc: 'Cook raw meat and fish nearby.', tile: Tile.Firepit, hp: 80 },
   furnace: { type: 'furnace', name: 'Furnace', desc: 'Smelt copper and iron ore into bars nearby.', tile: Tile.Furnace, hp: 160 },
   anvil: { type: 'anvil', name: 'Anvil', desc: 'Forge weapons, ammo and attachments nearby.', tile: Tile.Anvil, hp: 240 },
+  bed: { type: 'bed', name: 'Bed', desc: 'You wake up next to it at home. Camp only.', tile: Tile.Bed, hideoutOnly: true, hp: 0 },
   wood_floor: { type: 'wood_floor', name: 'Wood Floor', desc: 'Plank flooring. Build walls and stations on it.', tile: Tile.WoodFloor, hp: 40 },
   stone_floor: { type: 'stone_floor', name: 'Stone Floor', desc: 'Cut stone flooring. Build walls and stations on it.', tile: Tile.StoneFloor, hp: 60 },
   wall: { type: 'wall', name: 'Wooden Wall', desc: 'Blocks movement and bullets.', tile: Tile.WoodWall, hp: 220 },

@@ -366,7 +366,7 @@ export class Renderer {
         break;
       }
       case Tile.Bed: {
-        this.blitTile(ctx, hash2(tx, ty) < 0.5 ? 0 : 1, dx, dy);
+        this.blitUnderlay(ctx, tx, ty, dx, dy);
         const isTop =
           this.tileAt(tx, ty + 1) === Tile.Bed &&
           this.tileAt(tx, ty - 1) !== Tile.Bed;
@@ -386,9 +386,11 @@ export class Renderer {
         this.blitTile(ctx, 22, dx, dy);
         break;
       case Tile.Fence:
+        this.blitUnderlay(ctx, tx, ty, dx, dy);
         this.blitTile(ctx, 23, dx, dy);
         break;
       case Tile.Torch:
+        this.blitUnderlay(ctx, tx, ty, dx, dy);
         this.blitTile(ctx, 24, dx, dy);
         break;
       case Tile.Anvil: {
@@ -1355,6 +1357,7 @@ function tileSpriteCol(tile: number): number {
     case Tile.Fence: return 23;
     case Tile.Torch: return 24;
     case Tile.Anvil: return 27;
+    case Tile.Bed: return 13;
     default: return -1; // chest has no tile sprite; ghost falls back to the green box
   }
 }

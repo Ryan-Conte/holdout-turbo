@@ -14,7 +14,7 @@ export const ITEM_SHEET_ORDER: ItemId[] = [
   'revolver', 'carbine', 'dmr', 'lmg', 'prototype_rifle',
   'steel_axe', 'steel_pickaxe', 'ammo_44', 'ammo_762',
   'copper_ore', 'iron_ore', 'copper_bar', 'iron_bar',
-  'gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact', 'kit_anvil',
+  'gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact', 'kit_anvil', 'kit_bed',
 ];
 
 export const ITEM_INDEX: Record<string, number> = Object.fromEntries(

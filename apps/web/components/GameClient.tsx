@@ -147,6 +147,7 @@ export default function GameClient() {
   const clockRef = useRef('');
   const lastHowlAt = useRef(0);
   const lastGruntAt = useRef(0);
+  const prevOverRef = useRef(false);
   const demolishRef = useRef(false);
 
   const [connected, setConnected] = useState(false);
@@ -511,6 +512,10 @@ export default function GameClient() {
         if (u.reloading && !prevReloading.current) sfx.reload();
         prevReloading.current = u.reloading;
         if (u.hp > 0) setDead(null);
+        // overweight warning — once per transition, not a nag
+        const over = invWeight(u.inv) > invCapacity(u.inv).maxKg;
+        if (over && !prevOverRef.current) pushToast('⚠ OVERWEIGHT — you move at a crawl. Drop or stash something.');
+        prevOverRef.current = over;
         // XP gain floats + level-up fanfare
         const prev = prevSkillsRef.current;
         if (prev) {
@@ -1111,6 +1116,12 @@ export default function GameClient() {
     void refreshFriends();
   };
 
+  /** remove an ally / cancel an outgoing request / decline an incoming one */
+  const removeFriend = async (id: string) => {
+    await fetch('/api/friends', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+    void refreshFriends();
+  };
+
   if (failed) {
     return (
       <div className="game-root">
@@ -1222,8 +1233,8 @@ export default function GameClient() {
             <div className="label">HP {inv.hp}/100</div>
           </div>
           <div className="bar">
-            <div className="fill" style={{ width: `${Math.min(100, (weight / cap.maxKg) * 100)}%`, background: 'var(--blue)' }} />
-            <div className="label">{weight.toFixed(1)} / {cap.maxKg} KG</div>
+            <div className="fill" style={{ width: `${Math.min(100, (weight / cap.maxKg) * 100)}%`, background: weight > cap.maxKg ? 'var(--red)' : 'var(--blue)' }} />
+            <div className="label">{weight.toFixed(1)} / {cap.maxKg} KG{weight > cap.maxKg ? ' — ⚠ OVERWEIGHT' : ''}</div>
           </div>
           <div className="survival-row">
             <div className="bar mini" title="Hunger — hunt deer, fish, cook at a firepit">
@@ -1400,7 +1411,7 @@ export default function GameClient() {
 
           {container && (
             <section className="gear-col">
-              <h3>{container.storage ? 'STASH' : container.id.startsWith('b') ? 'LOOT BAG' : 'STORAGE'}<span className="sub">click to take</span></h3>
+              <h3>{container.storage ? 'STASH' : container.id.startsWith('b') ? 'LOOT BAG' : 'STORAGE'}</h3>
               <div className="slot-grid">
                 {container.slots.map((s, i) => {
                   const looting = !!action && action.kind === 'loot' && action.container === container.id && action.slot === i;
@@ -1806,6 +1817,9 @@ export default function GameClient() {
                 <button onClick={() => { only(null); emit(EV.hideoutEnter, { owner: f.id }); }}>VISIT CAMP</button>
               )}
               {f.status !== 'accepted' && f.incoming && <button onClick={() => acceptFriend(f.id)}>ACCEPT</button>}
+              {f.status !== 'accepted' && f.incoming && <button className="f-remove" onClick={() => removeFriend(f.id)}>DECLINE</button>}
+              {f.status !== 'accepted' && !f.incoming && <button className="f-remove" onClick={() => removeFriend(f.id)}>CANCEL</button>}
+              {f.status === 'accepted' && <button className="f-remove" onClick={() => removeFriend(f.id)}>REMOVE</button>}
             </div>
           ))}
         </div>

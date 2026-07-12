@@ -26,7 +26,7 @@ export type ArmorPiece = 'helmet' | 'vest';
 
 /** Structures you can place in the world / your camp. */
 export type BuildType =
-  | 'chest' | 'workbench' | 'firepit' | 'furnace' | 'anvil'
+  | 'chest' | 'workbench' | 'firepit' | 'furnace' | 'anvil' | 'bed'
   | 'wood_floor' | 'stone_floor' | 'wall' | 'door' | 'fence' | 'torch';
 
 export type ItemId =
@@ -54,7 +54,7 @@ export type ItemId =
   // weapon mods
   | 'attach_reddot' | 'attach_suppressor'
   // placeables (craft then place)
-  | 'kit_firepit' | 'kit_furnace' | 'kit_workbench' | 'kit_chest' | 'kit_anvil'
+  | 'kit_firepit' | 'kit_furnace' | 'kit_workbench' | 'kit_chest' | 'kit_anvil' | 'kit_bed'
   // base building (Minecraft-style camp construction)
   | 'kit_floor_wood' | 'kit_floor_stone' | 'kit_wall' | 'kit_door' | 'kit_fence' | 'kit_torch';
 
@@ -240,6 +240,7 @@ export const ITEMS: Record<ItemId, ItemDef> = {
   kit_workbench: placeable('kit_workbench', 'Workbench Kit', 3.0, 'workbench', 'Place it to unlock weapon-mod crafting nearby.'),
   kit_chest: placeable('kit_chest', 'Chest Kit', 3.0, 'chest', 'Place it in your camp for 12 stash slots.'),
   kit_anvil: placeable('kit_anvil', 'Anvil Kit', 6.0, 'anvil', 'Place it to forge weapons, ammo and attachments nearby.'),
+  kit_bed: placeable('kit_bed', 'Bed Kit', 4.0, 'bed', 'Your bed is where you wake up at home. Demolish (X) to move it.'),
 
   // ── base building (stackable, cheap — build your camp out like Minecraft)
   kit_floor_wood: placeable('kit_floor_wood', 'Wood Flooring', 0.5, 'wood_floor', 'Plank flooring for your camp.', 20),
