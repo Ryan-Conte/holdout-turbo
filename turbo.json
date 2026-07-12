@@ -1,8 +1,10 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "globalEnv": ["DATABASE_URL", "JWT_SECRET"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
+      "env": ["DATABASE_URL", "JWT_SECRET", "PORT", "CORS_ORIGIN"],
       "outputs": [
         "packages/shared/dist/**",
         "apps/api/dist/**",
