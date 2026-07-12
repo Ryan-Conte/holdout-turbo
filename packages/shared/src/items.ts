@@ -24,6 +24,9 @@ export type ItemKind =
 
 export type ArmorPiece = 'helmet' | 'vest';
 
+/** Placed crafting stations that gate certain recipes. */
+export type StationKind = 'workbench' | 'furnace' | 'anvil';
+
 /** Structures you can place in the world / your camp. */
 export type BuildType =
   | 'chest' | 'workbench' | 'firepit' | 'furnace' | 'anvil' | 'bed'
@@ -102,6 +105,23 @@ export interface ItemDef {
   fillFrom?: ItemId; // filled version, produced by using this near water (canteen)
   backpackTier?: number;
   place?: BuildType; // placing this item builds this structure
+  durability?: number; // max wear for weapons/tools/armor; degrades with use, repairable
+}
+
+/** Where an item is repaired, and the scrap/bar cost to fully mend it from broken. */
+export function repairInfo(def: ItemDef): { station: StationKind; scrap: number; bar?: ItemId } | null {
+  if (!def.durability) return null;
+  if (def.kind === 'weapon') {
+    // forged guns need a bar; looted firearms just need scrap and an anvil
+    const bar: ItemId | undefined = def.id === 'revolver' || def.id === 'carbine' ? 'iron_bar' : undefined;
+    return { station: 'anvil', scrap: 6, bar };
+  }
+  if (def.kind === 'tool') {
+    const bar: ItemId | undefined = def.id === 'steel_axe' || def.id === 'steel_pickaxe' ? 'iron_bar' : undefined;
+    return { station: 'workbench', scrap: 3, bar };
+  }
+  if (def.kind === 'armor') return { station: 'workbench', scrap: 5 };
+  return null;
 }
 
 // bare hands — always available
@@ -109,11 +129,11 @@ export const FISTS: MeleeStats = { damage: 8, cooldownMs: 450, range: 34, wood: 
 
 // ─── category builders (keep item defs to one readable line) ─────────────────
 
-const weapon = (id: ItemId, name: string, kg: number, desc: string, w: WeaponStats): ItemDef =>
-  ({ id, name, kind: 'weapon', kg, stack: 1, desc, weapon: w });
+const weapon = (id: ItemId, name: string, kg: number, desc: string, w: WeaponStats, durability = 220): ItemDef =>
+  ({ id, name, kind: 'weapon', kg, stack: 1, desc, weapon: w, durability });
 
-const tool = (id: ItemId, name: string, kg: number, desc: string, m: MeleeStats): ItemDef =>
-  ({ id, name, kind: 'tool', kg, stack: 1, desc, melee: m });
+const tool = (id: ItemId, name: string, kg: number, desc: string, m: MeleeStats, durability = 180): ItemDef =>
+  ({ id, name, kind: 'tool', kg, stack: 1, desc, melee: m, durability });
 
 const ammo = (id: ItemId, name: string, kg: number, stack: number, desc: string): ItemDef =>
   ({ id, name, kind: 'ammo', kg, stack, desc });
@@ -127,8 +147,8 @@ const heal = (id: ItemId, name: string, kg: number, stack: number, hp: number, d
 const food = (id: ItemId, name: string, kg: number, stack: number, hunger: number, desc: string, raw?: ItemId): ItemDef =>
   ({ id, name, kind: 'consumable', kg, stack, desc, food: hunger, ...(raw ? { raw } : {}) });
 
-const armorItem = (id: ItemId, name: string, kg: number, piece: ArmorPiece, reduction: number, desc: string): ItemDef =>
-  ({ id, name, kind: 'armor', kg, stack: 1, desc, armor: { piece, reduction } });
+const armorItem = (id: ItemId, name: string, kg: number, piece: ArmorPiece, reduction: number, desc: string, durability = 140): ItemDef =>
+  ({ id, name, kind: 'armor', kg, stack: 1, desc, armor: { piece, reduction }, durability });
 
 const backpack = (id: ItemId, name: string, kg: number, tier: number, desc: string): ItemDef =>
   ({ id, name, kind: 'backpack', kg, stack: 1, desc, backpackTier: tier });
@@ -172,11 +192,11 @@ export const ITEMS: Record<ItemId, ItemDef> = {
   pickaxe: tool('pickaxe', 'Pickaxe', 2.2, 'Breaks rock fast. Decent melee weapon.',
     { damage: 18, cooldownMs: 650, range: 38, wood: 1, stone: 3 }),
   fishing_rod: tool('fishing_rod', 'Fishing Rod', 1.0, 'Equip, face water and click to fish.',
-    { damage: 4, cooldownMs: 800, range: 40, wood: 1, stone: 1 }),
+    { damage: 4, cooldownMs: 800, range: 40, wood: 1, stone: 1 }, 120),
   steel_axe: tool('steel_axe', 'Steel Hatchet', 2.0, 'Forged at an anvil. Chews through forests.',
-    { damage: 30, cooldownMs: 600, range: 40, wood: 5, stone: 1 }),
+    { damage: 30, cooldownMs: 600, range: 40, wood: 5, stone: 1 }, 320),
   steel_pickaxe: tool('steel_pickaxe', 'Steel Pickaxe', 2.4, 'Forged at an anvil. Cracks rock and ore fast.',
-    { damage: 26, cooldownMs: 600, range: 40, wood: 1, stone: 5 }),
+    { damage: 26, cooldownMs: 600, range: 40, wood: 1, stone: 5 }, 320),
 
   // ── ammo
   ammo_9mm: ammo('ammo_9mm', '9mm Rounds', 0.01, 60, 'Pistol & SMG ammunition.'),

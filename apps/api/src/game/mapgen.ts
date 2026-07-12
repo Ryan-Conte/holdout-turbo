@@ -360,7 +360,7 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
   const AUTHORABLE = new Set<number>([
     Tile.Grass, Tile.Water, Tile.Tree, Tile.Floor, Tile.Wall, Tile.Road,
     Tile.Sand, Tile.Rock, Tile.Asphalt, Tile.Bed, Tile.DoorMat,
-    Tile.CopperOre, Tile.IronOre,
+    Tile.CopperOre, Tile.IronOre, Tile.Cliff,
   ]);
   for (let i = 0; i < W * H && i < map.tiles.length; i++) {
     const v = map.tiles[i] | 0;

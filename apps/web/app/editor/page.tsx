@@ -227,6 +227,7 @@ const TILE_TOOLS: { tile: Tile; label: string; color: string }[] = [
   { tile: Tile.Rock, label: 'Rock', color: '#77777d' },
   { tile: Tile.CopperOre, label: 'Copper vein', color: '#c87a3a' },
   { tile: Tile.IronOre, label: 'Iron vein', color: '#9aa4b0' },
+  { tile: Tile.Cliff, label: 'Cliff', color: '#5a5048' },
 ];
 
 const OBJECT_TOOLS: { type: MapObjectType; label: string; color: string; letter: string }[] = [

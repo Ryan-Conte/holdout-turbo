@@ -56,6 +56,8 @@ interface FloatRec { x: number; y: number; amount: number; kind: DamageFloat['ki
 interface Friend { id: string; name: string; status: string; incoming: boolean }
 
 const SKILL_ABBR: Record<string, string> = { woodcutting: 'WC', mining: 'MIN', shooting: 'SHT', melee: 'MEL', crafting: 'CRF' };
+// outfit swatch colors — mirror the survivor shirt rows in tools/gen-sprites.mjs
+const LOOK_COLORS = ['#8a3a3a', '#3a5a8a', '#3a7a4a', '#8a6a2a', '#6a4a8a', '#2a7a7a', '#8a4a6a', '#5a6a2a'];
 
 // starter objectives — gives new players a direction (tracked locally, once done stays done)
 const OBJECTIVES: { id: string; label: string }[] = [
@@ -117,6 +119,7 @@ export default function GameClient() {
   const youRef = useRef<string>('');
   const displayPos = useRef(new Map<string, { x: number; y: number }>());
   const keys = useRef({ up: false, down: false, left: false, right: false });
+  const sprintRef = useRef(false);
   const mouse = useRef({ x: 0, y: 0, down: false });
   const panelsOpenRef = useRef(false);
   const floatsRef = useRef<FloatRec[]>([]);
@@ -133,6 +136,7 @@ export default function GameClient() {
   const dragRef = useRef<DragState | null>(null);
   const dragStart = useRef({ x: 0, y: 0 });
   const dragConsumed = useRef(false);
+  const justDragged = useRef(false); // set on a real drag so the trailing onClick is ignored
   const lastStepAt = useRef(0);
   const lastGroanAt = useRef(0);
   const heldKitRef = useRef<{ slot: number; item: ItemId } | null>(null); // equipped placeable = placement mode
@@ -326,6 +330,13 @@ export default function GameClient() {
     craftAwaitRef.current = Date.now();
     socketRef.current?.emit(EV.craft, { recipe: id });
   }, [action, craftQueue, inv]);
+
+  // if you walk away from a station while its exclusive craft tab is open, fall back
+  useEffect(() => {
+    if (!inv) return;
+    const away = (craftTab === 'smelt' && !inv.nearFurnace) || (craftTab === 'forge' && !inv.nearAnvil);
+    if (away) setCraftTab('survival');
+  }, [inv, craftTab]);
 
   useEffect(() => {
     menuRef.current = { gear: showGear, craft: showCraft, skills: showSkills, social: showSocial };
@@ -650,6 +661,7 @@ export default function GameClient() {
       if (e.target instanceof HTMLElement && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
       if (e.repeat && !keyMap[e.code]) return; // held keys must not spam interactions (E after extraction!)
       if (keyMap[e.code]) { keys.current[keyMap[e.code]] = true; e.preventDefault(); startAmbient(); }
+      else if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') sprintRef.current = true;
       else if (e.code === 'KeyE') emit(EV.interact);
       else if (e.code === 'KeyR') emit(EV.reload);
       else if (e.code === 'Tab' || e.code === 'KeyI') { e.preventDefault(); only(menuRef.current.gear ? null : 'gear'); }
@@ -682,6 +694,7 @@ export default function GameClient() {
     };
     const onKeyUp = (e: KeyboardEvent) => {
       if (keyMap[e.code]) keys.current[keyMap[e.code]] = false;
+      else if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') sprintRef.current = false;
     };
     const onMouseMove = (e: MouseEvent) => {
       mouse.current.x = e.clientX;
@@ -731,6 +744,7 @@ export default function GameClient() {
     };
     const onBlur = () => {
       keys.current = { up: false, down: false, left: false, right: false };
+      sprintRef.current = false;
       mouse.current.down = false;
     };
     const onWheel = (e: WheelEvent) => {
@@ -772,6 +786,7 @@ export default function GameClient() {
         ...dirs,
         angle,
         shoot: mouse.current.down && !locked && !heldKitRef.current && !demolishRef.current,
+        sprint: sprintRef.current && !locked,
       });
       const now = performance.now();
       if (moving && now - lastStepAt.current > 340) {
@@ -1026,6 +1041,7 @@ export default function GameClient() {
     e.preventDefault();
     dragStart.current = { x: e.clientX, y: e.clientY };
     dragConsumed.current = false;
+    justDragged.current = false;
     dragRef.current = { zone, index, item, qty };
     setDrag(dragRef.current);
     setDragPos({ x: e.clientX, y: e.clientY });
@@ -1034,12 +1050,17 @@ export default function GameClient() {
   const dropOn = (zone: DragZone, index: number) => {
     const d = dragRef.current;
     if (!d) return;
+    // did the pointer actually move? a plain click (no drag) is handled by onClick instead
+    const moved = Math.hypot(mouse.current.x - dragStart.current.x, mouse.current.y - dragStart.current.y) > 6;
+    const sameSpot = d.zone === zone && d.index === index;
+    if (!moved || sameSpot) { dragRef.current = null; setDrag(null); return; }
     dragConsumed.current = true;
+    justDragged.current = true; // suppress the click that follows this mouseup
     const cont = containerRef.current;
     if (d.zone === 'inv') {
       if (zone === 'inv' && index !== d.index) emit(EV.invMove, { from: d.index, to: index });
       else if (zone === 'cont' && cont) {
-        emit(EV.containerPut, { id: cont.id, slot: d.index }); // dump into any open container
+        emit(EV.containerPut, { id: cont.id, slot: d.index, target: index }); // drop onto this exact slot
       } else if (zone === 'weapon') {
         const kind = ITEMS[d.item].kind;
         if (kind === 'weapon' || kind === 'tool') emit(EV.invEquip, { slot: d.index });
@@ -1051,7 +1072,8 @@ export default function GameClient() {
         else pushToast(`That does not fit the ${zone.toUpperCase()} slot`);
       }
     } else if (d.zone === 'cont' && cont) {
-      if (zone !== 'cont') enqueueLoot(d.index);
+      if (zone === 'cont') emit(EV.containerMove, { id: cont.id, from: d.index, to: index }); // reorder inside the chest
+      else enqueueLoot(d.index); // dragged out to your backpack — take it
     } else if (d.zone === 'helmet' || d.zone === 'vest' || d.zone === 'mod') {
       if (zone === 'inv' || zone === 'weapon') emit(EV.unequipArmor, { piece: d.zone });
     } else if (d.zone === 'weapon') {
@@ -1079,6 +1101,7 @@ export default function GameClient() {
       case 'dropall': emit(EV.invDrop, { slot: m.index, qty: m.qty }); break;
       case 'store': if (cont) emit(EV.containerPut, { id: cont.id, slot: m.index }); break;
       case 'take': if (cont) enqueueLoot(m.index); break;
+      case 'repair': emit(EV.repair, { slot: m.index }); break;
     }
   };
 
@@ -1095,6 +1118,12 @@ export default function GameClient() {
   const leave = async () => {
     socketRef.current?.disconnect();
     await authClient.signOut();
+    router.push('/');
+  };
+
+  // back to the deploy screen without signing out (the socket drops = combat-log rules apply)
+  const returnToMenu = () => {
+    socketRef.current?.disconnect();
     router.push('/');
   };
 
@@ -1136,8 +1165,17 @@ export default function GameClient() {
     );
   }
 
-  const invSlot = (s: { id: ItemId; qty: number } | null, i: number) => (
-    <Tip key={i} tip={s ? itemTip(s.id, s.qty) : null}>
+  const durStrip = (s: { id: ItemId; qty: number; dur?: number } | null) => {
+    if (!s) return null;
+    const max = ITEMS[s.id].durability;
+    if (max === undefined) return null;
+    const frac = (s.dur ?? max) / max;
+    if (frac >= 0.999) return null;
+    return <div className="dur-strip"><div style={{ width: `${frac * 100}%`, background: frac > 0.3 ? '#5fb96a' : '#c25047' }} /></div>;
+  };
+
+  const invSlot = (s: { id: ItemId; qty: number; dur?: number } | null, i: number) => (
+    <Tip key={i} tip={s ? itemTip(s.id, s.qty, s.dur) : null}>
       <div
         className={`slot${inv?.equipped === i ? ' equipped' : ''}${drag?.zone === 'inv' && drag.index === i ? ' dragging' : ''}`}
         onMouseDown={(e) => {
@@ -1155,7 +1193,7 @@ export default function GameClient() {
         onDoubleClick={() => s && useSlot(i)}
       >
         {i < 5 && <span className="keycap">{i + 1}</span>}
-        {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}</>)}
+        {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}{durStrip(s)}</>)}
       </div>
     </Tip>
   );
@@ -1234,7 +1272,10 @@ export default function GameClient() {
           </div>
           <div className="bar">
             <div className="fill" style={{ width: `${Math.min(100, (weight / cap.maxKg) * 100)}%`, background: weight > cap.maxKg ? 'var(--red)' : 'var(--blue)' }} />
-            <div className="label">{weight.toFixed(1)} / {cap.maxKg} KG{weight > cap.maxKg ? ' — ⚠ OVERWEIGHT' : ''}</div>
+            <div className="label">
+              {weight > cap.maxKg ? '⚠ OVERWEIGHT' : `${weight.toFixed(1)} / ${cap.maxKg} KG`}
+            </div> 
+            {/* <div className="label">{weight.toFixed(1)} / {cap.maxKg} KG{weight > cap.maxKg ? ' — ⚠ OVERWEIGHT' : ''}</div> */}
           </div>
           <div className="survival-row">
             <div className="bar mini" title="Hunger — hunt deer, fish, cook at a firepit">
@@ -1245,6 +1286,10 @@ export default function GameClient() {
               <div className="fill" style={{ width: `${inv.thirst}%`, background: '#4a90c8' }} />
               <div className="label">H2O {inv.thirst}</div>
             </div>
+          </div>
+          <div className="bar mini stamina" title="Stamina — hold SHIFT to sprint; mining and chopping cost it">
+            <div className="fill" style={{ width: `${inv.stamina}%`, background: inv.stamina > 25 ? '#5fd0a0' : 'var(--gold)' }} />
+            <div className="label">STAM {inv.stamina}{' · SHIFT run'}</div>
           </div>
           <div className="weapon-line">
             {equippedItem
@@ -1407,6 +1452,18 @@ export default function GameClient() {
             </div>
             <div className="quick-label">QUICK SLOTS</div>
             <div className="quick-row">{inv.inv.slots.slice(0, 5).map((s, i) => invSlot(s, i))}</div>
+            <div className="quick-label">APPEARANCE</div>
+            <div className="look-row">
+              {Array.from({ length: 8 }, (_, n) => (
+                <button
+                  key={n}
+                  className={`look-swatch${inv.look === n ? ' active' : ''}`}
+                  style={{ background: LOOK_COLORS[n] }}
+                  onClick={() => emit(EV.look, { look: n })}
+                  title={`Outfit ${n + 1}`}
+                />
+              ))}
+            </div>
           </section>
 
           {container && (
@@ -1422,7 +1479,7 @@ export default function GameClient() {
                       className={`slot${drag?.zone === 'cont' && drag.index === i ? ' dragging' : ''}${looting ? ' looting' : ''}${queuePos >= 0 ? ' queued' : ''}`}
                       onMouseDown={(e) => s && beginDrag('cont', i, s.id, s.qty, e)}
                       onMouseUp={() => dropOn('cont', i)}
-                      onClick={() => s && enqueueLoot(i)}
+                      onClick={() => { if (justDragged.current) { justDragged.current = false; return; } if (s) enqueueLoot(i); }}
                       onContextMenu={(e) => s && openCtx('cont', i, s.id, s.qty, e)}
                     >
                       {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}</>)}
@@ -1472,9 +1529,14 @@ export default function GameClient() {
           {ctxMenu.zone === 'inv' && (() => {
             const def = ITEMS[ctxMenu.item];
             const verb = useVerb(def);
+            const rep = def.durability !== undefined && inv
+              ? (def.kind === 'weapon' ? inv.nearAnvil : inv.nearWorkbench)
+              : false;
+            const worn = (() => { const s = inv?.inv.slots[ctxMenu.index]; return s && def.durability !== undefined && (s.dur ?? def.durability) < def.durability; })();
             return (
               <>
                 {verb && <button onClick={() => ctxAction(def.place ? 'place' : 'use')}>{verb}</button>}
+                {rep && worn && <button onClick={() => ctxAction('repair')}>REPAIR</button>}
                 {container && <button onClick={() => ctxAction('store')}>{container.storage ? 'STASH' : 'STORE'}</button>}
                 <button onClick={() => ctxAction('drop1')}>DROP 1</button>
                 <button onClick={() => ctxAction('dropall')}>DROP ALL</button>
@@ -1509,7 +1571,16 @@ export default function GameClient() {
               </span>
             </h3>
             <div className="craft-tabs">
-              {CRAFT_TABS.map((t) => (
+              {CRAFT_TABS.filter((t) => {
+                // a tab whose recipes are ALL behind one station only shows at that station
+                const cats = RECIPES.filter((r) => r.cat === t.cat);
+                const stations = new Set(cats.map((r) => r.station));
+                if (stations.size === 1 && cats[0]?.station) {
+                  const st = cats[0].station;
+                  return st === 'furnace' ? inv.nearFurnace : st === 'anvil' ? inv.nearAnvil : st === 'workbench' ? inv.nearWorkbench : true;
+                }
+                return true;
+              }).map((t) => (
                 <button key={t.cat} className={craftTab === t.cat ? 'active' : ''} onClick={() => { setCraftTab(t.cat); setCraftSel(null); }}>{t.label}</button>
               ))}
             </div>
@@ -1830,8 +1901,12 @@ export default function GameClient() {
         <div className="death-overlay esc-menu">
           <h2>PAUSED</h2>
           <p className="death-stats">The zone keeps moving while you stand still.</p>
+          {!inHideout && !inSafe && (
+            <p className="esc-warn">⚠ You&apos;re out in the open — if you leave now your body stays in the zone for 60s and can be killed and looted. Extract or reach a safe zone first to be safe.</p>
+          )}
           <button className="btn-primary" onClick={() => setEscMenu(false)}>RESUME</button>
           <button className="btn-primary secondary" onClick={() => setMuted(toggleMute())}>{muted ? '🔇 SOUND OFF' : '🔊 SOUND ON'}</button>
+          <button className="btn-primary secondary" onClick={returnToMenu}>RETURN TO MENU</button>
           <button className="btn-primary secondary" onClick={leave}>LOG OUT</button>
         </div>
       )}

@@ -216,6 +216,10 @@ input { font-family: inherit; }
 
 .f-remove { border-color: #a04a3a !important; color: #f08a6a !important; }
 
+.look-row { display: flex; gap: 5px; flex-wrap: wrap; }
+.look-swatch { width: 26px; height: 26px; border: 1px solid var(--steel-cell-border); cursor: pointer; }
+.look-swatch.active { border-color: var(--gold); box-shadow: inset 0 0 0 1px var(--gold); }
+
 .server-pick { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .server-pick label { color: var(--muted); font-size: 10px; letter-spacing: 2px; }
 .server-pick select {
@@ -1215,6 +1219,7 @@ input { font-family: inherit; }
 /* ESC system menu — reuses the death-overlay layout, minus the blood tint */
 .esc-menu { background: rgba(6, 8, 12, 0.82); }
 .esc-menu h2 { color: var(--gold); letter-spacing: 6px; }
+.esc-warn { max-width: 420px; text-align: center; color: #f0a060; font-size: 12px; line-height: 1.55; border: 1px solid #a0602a; background: rgba(60, 34, 8, 0.5); padding: 10px 14px; }
 
 /* ── campfire cook panel ─────────────────────── */
 .cook-panel {
@@ -1280,6 +1285,13 @@ input { font-family: inherit; }
 }
 
 .tip-title { color: var(--gold); font-size: 12px; margin-bottom: 3px; letter-spacing: 0.5px; }
+.tip-dur { display: flex; align-items: center; gap: 6px; margin-top: 5px; font-size: 10px; color: var(--steel-dim); }
+.tip-dur-bar { flex: 1; height: 4px; background: #0a0c07; border: 1px solid var(--border); }
+.tip-dur-bar > div { height: 100%; }
+
+/* durability strip on inventory slots */
+.slot .dur-strip { position: absolute; left: 2px; right: 2px; bottom: 1px; height: 2px; background: rgba(0,0,0,0.5); }
+.slot .dur-strip > div { height: 100%; }
 .tip-desc { color: var(--steel-dim, #8a887c); line-height: 1.45; }
 .tip-stats { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font-size: 10px; color: var(--steel-text, #d8d5c8); }
 .tip-stats .tip-good { color: var(--green); }

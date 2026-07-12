@@ -17,6 +17,8 @@ export interface ProfileRow {
   deaths: number;
   hunger: number;
   thirst: number;
+  armorDur: Partial<Record<'helmet' | 'vest', number>>;
+  look: number;
 }
 
 export interface HideoutData {
@@ -56,6 +58,8 @@ export class DbService implements OnModuleInit, OnModuleDestroy {
       deaths: row.deaths,
       hunger: typeof data.hunger === 'number' ? data.hunger : 100,
       thirst: typeof data.thirst === 'number' ? data.thirst : 100,
+      armorDur: (data.armorDur ?? {}) as Partial<Record<'helmet' | 'vest', number>>,
+      look: typeof data.look === 'number' ? data.look : 0,
     };
   }
 
@@ -70,8 +74,10 @@ export class DbService implements OnModuleInit, OnModuleDestroy {
     deaths: number,
     hunger: number,
     thirst: number,
+    armorDur: Partial<Record<'helmet' | 'vest', number>> = {},
+    look = 0,
   ) {
-    const data = JSON.parse(JSON.stringify({ inv, equipment, skills, quests, hunger, thirst }));
+    const data = JSON.parse(JSON.stringify({ inv, equipment, skills, quests, hunger, thirst, armorDur, look }));
     try {
       await this.prisma.profile.upsert({
         where: { userId },

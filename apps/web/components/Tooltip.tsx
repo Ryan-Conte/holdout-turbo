@@ -39,14 +39,22 @@ export function Tip({ tip, children }: { tip: ReactNode; children: ReactNode }) 
 }
 
 /** Rich item card: name, description and the stats that matter. */
-export function itemTip(id: ItemId, qty = 1): ReactNode {
+export function itemTip(id: ItemId, qty = 1, dur?: number): ReactNode {
   const def = ITEMS[id];
   const w = def.weapon;
   const m = def.melee;
+  const maxDur = def.durability;
+  const curDur = maxDur !== undefined ? (dur ?? maxDur) : undefined;
   return (
     <>
       <div className="tip-title">{def.name}{qty > 1 ? ` ×${qty}` : ''}</div>
       <div className="tip-desc">{def.desc}</div>
+      {maxDur !== undefined && curDur !== undefined && (
+        <div className="tip-dur">
+          <div className="tip-dur-bar"><div style={{ width: `${Math.round((curDur / maxDur) * 100)}%`, background: curDur / maxDur > 0.3 ? 'var(--green)' : 'var(--red)' }} /></div>
+          <span>{curDur}/{maxDur}</span>
+        </div>
+      )}
       <div className="tip-stats">
         {w && (
           <>

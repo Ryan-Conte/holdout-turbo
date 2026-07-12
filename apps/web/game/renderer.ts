@@ -128,6 +128,7 @@ const MINI_COLORS: Record<number, string> = {
   [Tile.CopperOre]: "#c87a3a",
   [Tile.IronOre]: "#9aa4b0",
   [Tile.Anvil]: "#5c5c64",
+  [Tile.Cliff]: "#5a5048",
 };
 
 export class Renderer {
@@ -398,6 +399,9 @@ export class Renderer {
         this.blitTile(ctx, 27, dx, dy);
         break;
       }
+      case Tile.Cliff:
+        this.blitTile(ctx, 28, dx, dy);
+        break;
     }
   }
 
@@ -1112,7 +1116,7 @@ export class Renderer {
     view: WorldView,
   ) {
     const seed = hashStr(p.name);
-    const row = seed % CHAR_ROWS.survivorCount;
+    const row = p.look !== undefined ? p.look % CHAR_ROWS.survivorCount : seed % CHAR_ROWS.survivorCount;
     const swingPhase =
       p.swing > 0 && view.serverNow - p.swing < 400
         ? Math.min(1, (view.serverNow - p.swing) / 400)

@@ -90,9 +90,15 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   }
 
   @SubscribeMessage(EV.containerPut)
-  onContainerPut(@ConnectedSocket() socket: Socket, @MessageBody() body: { id: string; slot: number }) {
+  onContainerPut(@ConnectedSocket() socket: Socket, @MessageBody() body: { id: string; slot: number; target?: number }) {
     if (!body || typeof body.id !== 'string' || !this.allowed(socket, this.actionLimit)) return;
-    this.game.containerPut(socket.id, body.id, Number(body.slot) | 0);
+    this.game.containerPut(socket.id, body.id, Number(body.slot) | 0, body.target === undefined ? -1 : Number(body.target) | 0);
+  }
+
+  @SubscribeMessage(EV.containerMove)
+  onContainerMove(@ConnectedSocket() socket: Socket, @MessageBody() body: { id: string; from: number; to: number }) {
+    if (!body || typeof body.id !== 'string' || !this.allowed(socket, this.actionLimit)) return;
+    this.game.containerMove(socket.id, body.id, Number(body.from) | 0, Number(body.to) | 0);
   }
 
   @SubscribeMessage(EV.containerClose)
@@ -146,6 +152,18 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   onDemolish(@ConnectedSocket() socket: Socket, @MessageBody() body: { tx: number; ty: number }) {
     if (!body || !this.allowed(socket, this.actionLimit)) return;
     this.game.demolish(socket.id, Number(body.tx) | 0, Number(body.ty) | 0);
+  }
+
+  @SubscribeMessage(EV.repair)
+  onRepair(@ConnectedSocket() socket: Socket, @MessageBody() body: { slot: number }) {
+    if (!body || !this.allowed(socket, this.actionLimit)) return;
+    this.game.repair(socket.id, Number(body.slot) | 0);
+  }
+
+  @SubscribeMessage(EV.look)
+  onLook(@ConnectedSocket() socket: Socket, @MessageBody() body: { look: number }) {
+    if (!body || !this.allowed(socket, this.actionLimit)) return;
+    this.game.setLook(socket.id, Number(body.look) | 0);
   }
 
   @SubscribeMessage(EV.chat)

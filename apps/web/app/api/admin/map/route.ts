@@ -41,7 +41,7 @@ export async function POST(req: Request) {
   const AUTHORABLE = new Set<number>([
     Tile.Grass, Tile.Water, Tile.Tree, Tile.Floor, Tile.Wall, Tile.Road,
     Tile.Sand, Tile.Rock, Tile.Asphalt, Tile.Bed, Tile.DoorMat,
-    Tile.CopperOre, Tile.IronOre,
+    Tile.CopperOre, Tile.IronOre, Tile.Cliff,
   ]);
   const tiles = data.tiles.map((t) => {
     const v = t | 0;

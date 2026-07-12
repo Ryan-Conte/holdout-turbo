@@ -61,9 +61,17 @@ import {
   QuestDef,
   QuestStatus,
   RECIPES,
+  repairInfo,
   REGEN_HP_PER_S,
   REGEN_THRESHOLD,
   STARTING_MONEY,
+  SPRINT_DRAIN_PER_S,
+  SPRINT_MIN,
+  SPRINT_SPEED_MULT,
+  STAMINA_MAX,
+  STAMINA_REGEN_DELAY_MS,
+  STAMINA_REGEN_PER_S,
+  MINE_STAMINA_COST,
   SUPPRESSED_AGGRO_RANGE,
   Skills,
   StateSnap,
@@ -104,9 +112,12 @@ interface ServerPlayer {
   quests: Record<string, QuestProg>;
   hunger: number;
   thirst: number;
+  stamina: number;
+  lastExertAt: number; // ms of last stamina drain — regen waits a beat after
   starveAcc: number;
   regenAcc: number;
   lastPushedSurvival: number; // floor(hunger)*1000 + floor(thirst), change-detect
+  lastStaminaBucket: number; // change-detect for the stamina bar (coarse, to limit pushes)
   action: { kind: 'loot' | 'fish' | 'drink' | 'fill' | 'cook' | 'extract' | 'craft'; until: number; data?: { id?: string; slot?: number } } | null;
   actionStart: { x: number; y: number };
   mags: Partial<Record<ItemId, number>>;
@@ -121,6 +132,8 @@ interface ServerPlayer {
   ignoreInteractUntil: number; // swallow held-E repeats right after an instance switch
   loggedOutAt: number | null; // combat-log: body lingers in the world, killable, for a bit
   lastStationMask: number; // change-detect for near-station flags so the UI is never stale
+  armorDur: Partial<Record<'helmet' | 'vest', number>>; // current durability of worn armor
+  look: number; // chosen character sprite row (0..survivorCount-1)
 }
 
 interface Enemy {
@@ -257,12 +270,47 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   private saveProfileOf(p: ServerPlayer) {
     return this.db.saveProfile(
       p.userId, p.inv, p.equipment, p.skills, p.quests, p.money, p.kills, p.deaths,
-      Math.round(p.hunger), Math.round(p.thirst),
+      Math.round(p.hunger), Math.round(p.thirst), p.armorDur, p.look,
     );
   }
 
   private addXp(p: ServerPlayer, skill: keyof Skills, amount: number) {
     p.skills[skill] = (p.skills[skill] ?? 0) + Math.max(0, Math.round(amount));
+  }
+
+  /** Wear down an inventory slot; break it (destroy) at 0. Returns true if it broke. */
+  private wearSlot(p: ServerPlayer, slot: number, amount = 1): boolean {
+    const item = p.inv.slots[slot];
+    if (!item) return false;
+    const max = ITEMS[item.id].durability;
+    if (max === undefined) return false;
+    const dur = (item.dur ?? max) - amount;
+    if (dur <= 0) {
+      this.toast(p.sid, `Your ${ITEMS[item.id].name} broke!`);
+      p.inv.slots[slot] = null;
+      if (p.equipped === slot) p.equipped = null;
+      return true;
+    }
+    item.dur = dur;
+    if (dur === Math.ceil(max * 0.2)) this.toast(p.sid, `${ITEMS[item.id].name} is badly worn — repair it at a ${repairInfo(ITEMS[item.id])?.station}`);
+    return false;
+  }
+
+  /** Wear down an equipped armor piece; break it at 0. */
+  private wearArmor(p: ServerPlayer, piece: 'helmet' | 'vest'): void {
+    const id = p.equipment[piece];
+    if (!id) return;
+    const max = ITEMS[id].durability;
+    if (max === undefined) return;
+    const cur = p.armorDur[piece] ?? max;
+    const dur = cur - 1;
+    if (dur <= 0) {
+      this.toast(p.sid, `Your ${ITEMS[id].name} was destroyed!`);
+      p.equipment[piece] = null;
+      delete p.armorDur[piece];
+    } else {
+      p.armorDur[piece] = dur;
+    }
   }
 
   setServer(io: Server) {
@@ -556,9 +604,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       quests,
       hunger,
       thirst,
+      stamina: STAMINA_MAX,
+      lastExertAt: 0,
       starveAcc: 0,
       regenAcc: 0,
       lastPushedSurvival: -1,
+      lastStaminaBucket: -1,
       action: null,
       actionStart: { x: spawn.x, y: spawn.y },
       mags: {},
@@ -573,6 +624,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       ignoreInteractUntil: Date.now() + 900, // a key held through the login screen opens nothing
       loggedOutAt: null,
       lastStationMask: -1,
+      armorDur: (row?.armorDur as ServerPlayer['armorDur']) ?? {},
+      look: typeof row?.look === 'number' ? row.look : 0,
     };
     this.players.set(sid, p);
     home.players++;
@@ -638,6 +691,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       right: !!input.right,
       angle: Number.isFinite(angle) ? angle : p.angle,
       shoot: !!input.shoot,
+      sprint: !!input.sprint,
     };
     p.angle = p.input.angle;
   }
@@ -884,19 +938,45 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /** Deposit into hideout storage. */
-  containerPut(sid: string, containerId: string, slot: number) {
+  private reachableContainer(p: ServerPlayer, containerId: string): Container | null {
+    const c = this.inst(p).containers.get(containerId);
+    if (!c || c.kind === 'bag') return null;
+    if (Math.hypot(c.x - p.x, c.y - p.y) > INTERACT_RANGE * 1.5) return null;
+    return c;
+  }
+
+  /** Deposit a backpack slot into a container. `target` (optional) = a specific slot to drop onto. */
+  containerPut(sid: string, containerId: string, slot: number, target = -1) {
     const p = this.players.get(sid);
     if (!p || p.dead) return;
     const inst = this.inst(p);
-    const c = inst.containers.get(containerId);
-    // deposit into any reachable container (world chests/crates for dumping loot,
-    // or your hideout stash) — bags are ephemeral, skip them
-    if (!c || c.kind === 'bag' || Math.hypot(c.x - p.x, c.y - p.y) > INTERACT_RANGE * 1.5) return;
+    const c = this.reachableContainer(p, containerId);
+    if (!c) return;
     if (slot < 0 || slot >= p.inv.slots.length) return;
     const item = p.inv.slots[slot];
     if (!item) return;
     const def = ITEMS[item.id];
+
+    // dropped onto a specific slot: stack if same item, else swap the two stacks
+    if (target >= 0 && target < c.slots.length) {
+      const dest = c.slots[target];
+      if (dest && dest.id === item.id) {
+        const add = Math.min(def.stack - dest.qty, item.qty);
+        dest.qty += add;
+        item.qty -= add;
+        if (item.qty <= 0) { p.inv.slots[slot] = null; if (p.equipped === slot) p.equipped = null; }
+      } else {
+        c.slots[target] = { id: item.id, qty: item.qty };
+        p.inv.slots[slot] = dest ?? null;
+        if (p.equipped === slot && !p.inv.slots[slot]) p.equipped = null;
+      }
+      if (c.kind === 'storage') this.persistHideout(inst);
+      this.pushInventory(p);
+      this.emitTo(sid, EV.container, { id: c.id, slots: c.slots, storage: c.kind === 'storage' });
+      return;
+    }
+
+    // no target: stack into matching slots, then first free
     let qty = item.qty;
     for (const s of c.slots) {
       if (qty <= 0) break;
@@ -924,6 +1004,30 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     }
     if (c.kind === 'storage') this.persistHideout(inst);
     this.pushInventory(p);
+    this.emitTo(sid, EV.container, { id: c.id, slots: c.slots, storage: c.kind === 'storage' });
+  }
+
+  /** Reorder / stack items within one container (drag a chest slot onto another). */
+  containerMove(sid: string, containerId: string, from: number, to: number) {
+    const p = this.players.get(sid);
+    if (!p || p.dead) return;
+    const inst = this.inst(p);
+    const c = this.reachableContainer(p, containerId);
+    if (!c) return;
+    if (from === to || from < 0 || to < 0 || from >= c.slots.length || to >= c.slots.length) return;
+    const a = c.slots[from];
+    if (!a) return;
+    const b = c.slots[to];
+    if (b && b.id === a.id && ITEMS[a.id].stack > 1) {
+      const moved = Math.min(ITEMS[a.id].stack - b.qty, a.qty);
+      b.qty += moved;
+      a.qty -= moved;
+      if (a.qty <= 0) c.slots[from] = null;
+    } else {
+      c.slots[from] = b;
+      c.slots[to] = a;
+    }
+    if (c.kind === 'storage') this.persistHideout(inst);
     this.emitTo(sid, EV.container, { id: c.id, slots: c.slots, storage: c.kind === 'storage' });
   }
 
@@ -1205,6 +1309,52 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.addXp(p, 'crafting', 6);
     this.toast(sid, `Placed ${buildable.name}${inHideout ? '' : ' (wears out out here)'}`);
     this.pushInventory(p);
+  }
+
+  /** Mend a worn weapon/tool/armor at the right station, paying scrap (+ bars for steel). */
+  repair(sid: string, slot: number) {
+    const p = this.players.get(sid);
+    if (!p || p.dead || slot < 0 || slot >= p.inv.slots.length) return;
+    const item = p.inv.slots[slot];
+    if (!item) return;
+    const def = ITEMS[item.id];
+    const info = repairInfo(def);
+    if (!info || def.durability === undefined) {
+      this.toast(sid, 'That cannot be repaired');
+      return;
+    }
+    const stationTile = info.station === 'anvil' ? Tile.Anvil : info.station === 'furnace' ? Tile.Furnace : Tile.Workbench;
+    if (!this.nearTile(p, stationTile)) {
+      this.toast(sid, `Repair it at a ${info.station}`);
+      return;
+    }
+    const cur = item.dur ?? def.durability;
+    const missing = def.durability - cur;
+    if (missing <= 0) {
+      this.toast(sid, 'That is already in good shape');
+      return;
+    }
+    const frac = missing / def.durability;
+    const scrapCost = Math.max(1, Math.ceil(info.scrap * frac));
+    const barCost = info.bar ? Math.max(1, Math.round(2 * frac)) : 0;
+    if (this.countItem(p.inv, 'scrap') < scrapCost || (info.bar && this.countItem(p.inv, info.bar) < barCost)) {
+      this.toast(sid, `Need ${scrapCost} scrap${info.bar ? ` + ${barCost} ${ITEMS[info.bar].name}` : ''} to repair`);
+      return;
+    }
+    this.removeItem(p.inv, 'scrap', scrapCost);
+    if (info.bar) this.removeItem(p.inv, info.bar, barCost);
+    item.dur = def.durability;
+    this.toast(sid, `Repaired ${def.name}`);
+    this.pushInventory(p);
+  }
+
+  /** Change your character's look (sprite row); persisted with your profile. */
+  setLook(sid: string, look: number) {
+    const p = this.players.get(sid);
+    if (!p) return;
+    p.look = ((look | 0) % 8 + 8) % 8;
+    this.pushInventory(p);
+    void this.saveProfileOf(p);
   }
 
   /** Reclaim a piece you built in your own camp — returns the kit item. */
@@ -1685,17 +1835,34 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       }
       let dx = (p.input.right ? 1 : 0) - (p.input.left ? 1 : 0);
       let dy = (p.input.down ? 1 : 0) - (p.input.up ? 1 : 0);
-      if (dx || dy) {
+      const moving = !!(dx || dy);
+      // sprint: hold to run, drains stamina; can't sprint while swimming/overweight/exhausted
+      const overweight = invWeight(p.inv) > invCapacity(p.inv).maxKg;
+      const wantSprint = !!p.input.sprint && moving && !this.inWater(inst, p) && !overweight && p.stamina > SPRINT_MIN;
+      if (wantSprint) {
+        p.stamina = Math.max(0, p.stamina - SPRINT_DRAIN_PER_S * dt);
+        p.lastExertAt = now;
+      } else if (now - p.lastExertAt > STAMINA_REGEN_DELAY_MS && p.stamina < STAMINA_MAX) {
+        p.stamina = Math.min(STAMINA_MAX, p.stamina + STAMINA_REGEN_PER_S * dt);
+      }
+      if (moving) {
         const len = Math.hypot(dx, dy);
         dx /= len;
         dy /= len;
-        // overweight = crawling pace; everyone can see the loot mule coming
-        const overweight = invWeight(p.inv) > invCapacity(p.inv).maxKg;
-        const speed = PLAYER_SPEED * (this.inWater(inst, p) ? SWIM_SPEED_MULT : 1) * (overweight ? OVERWEIGHT_SPEED_MULT : 1);
+        const speed = PLAYER_SPEED
+          * (this.inWater(inst, p) ? SWIM_SPEED_MULT : 1)
+          * (overweight ? OVERWEIGHT_SPEED_MULT : 1)
+          * (wantSprint ? SPRINT_SPEED_MULT : 1);
         this.moveEntity(inst, p, dx * speed * dt, dy * speed * dt, PLAYER_RADIUS);
         p.moving = true;
       } else {
         p.moving = false;
+      }
+      // push the stamina bar on coarse change (keeps broadcasts light)
+      const staBucket = Math.round(p.stamina / 4);
+      if (staBucket !== p.lastStaminaBucket) {
+        p.lastStaminaBucket = staBucket;
+        this.pushInventory(p);
       }
       if (p.input.shoot) this.tryAttack(p, inst, now);
     }
@@ -1859,6 +2026,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     }
     p.mags[weaponId] = mag - 1;
     p.lastAttackAt = now;
+    if (p.equipped !== null && this.wearSlot(p, p.equipped)) return; // weapon wore out mid-shot
     // skills + mods tighten spread
     let spread = w.spread * (1 - 0.01 * (skillLevel(p.skills.shooting) - 1));
     if (p.equipment.mod === 'attach_reddot') spread *= MOD_SPREAD_MULT;
@@ -1975,6 +2143,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (victim) {
         const dmg = Math.round(m.damage * Math.min(1.3, 1 + 0.01 * (skillLevel(p.skills.melee) - 1)));
         this.addXp(p, 'melee', dmg);
+        if (p.equipped !== null) this.wearSlot(p, p.equipped); // melee weapon wears from hits
         if (victimIsEnemy) this.damageEnemy(inst, victim as Enemy, dmg, p);
         else this.damagePlayer(victim as ServerPlayer, dmg, p.name, null, p);
         return;
@@ -1999,6 +2168,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const bonus = Math.floor((skillLevel(p.skills[skill]) - 1) / 5);
       const yieldQty = (isTree ? m.wood : m.stone) + bonus;
       const resource: ItemId = isTree ? 'wood' : 'stone';
+      // swinging at a node is hard work — costs stamina and slows you when spent
+      p.stamina = Math.max(0, p.stamina - MINE_STAMINA_COST);
+      p.lastExertAt = now;
+      if (p.equipped !== null) this.wearSlot(p, p.equipped); // tools wear from harvesting
       this.addXp(p, skill, 6);
       const leftover = this.addItem(p.inv, resource, yieldQty);
       if (leftover >= yieldQty) {
@@ -2303,6 +2476,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   ) {
     if (target.dead) return;
     const mitigated = Math.max(1, Math.round(dmg * armorMultiplier(target.equipment)));
+    // armor soaks the hit and wears down for it
+    if (target.equipment.helmet) this.wearArmor(target, 'helmet');
+    if (target.equipment.vest) this.wearArmor(target, 'vest');
     target.hp -= mitigated;
     if (target.hp > 0) {
       this.pushInventory(target);
@@ -2366,6 +2542,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         dead: p.dead,
         moving: p.moving,
         swing: now - p.lastSwingAt < 400 ? p.lastSwingAt : 0,
+        look: p.look,
       });
     }
     const allEnemies: StateSnap['enemies'] = [...inst.enemies.values()].map((e) => ({
@@ -2433,6 +2610,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       nearWater: this.nearTile(p, Tile.Water),
       hunger: Math.round(p.hunger),
       thirst: Math.round(p.thirst),
+      stamina: Math.round(p.stamina),
+      look: p.look,
     });
   }
 

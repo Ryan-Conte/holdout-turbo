@@ -32,6 +32,7 @@ export enum Tile {
   CopperOre = 22,
   IronOre = 23,
   Anvil = 24, // forge station (weapons / ammo / attachments)
+  Cliff = 25, // vertical terrain / high ground — impassable, blocks sight & bullets
 }
 
 // NOTE: water is swimmable (slow), not blocking — see SWIM_SPEED_MULT
@@ -48,6 +49,7 @@ export const BLOCKS_MOVE: Record<number, boolean> = {
   [Tile.CopperOre]: true,
   [Tile.IronOre]: true,
   [Tile.Anvil]: true,
+  [Tile.Cliff]: true,
 };
 
 /** enemies and animals refuse to enter these (players can swim) */
@@ -64,6 +66,7 @@ export const BLOCKS_BULLET: Record<number, boolean> = {
   [Tile.CopperOre]: true,
   [Tile.IronOre]: true,
   [Tile.Anvil]: true,
+  [Tile.Cliff]: true,
 };
 
 /** base-building floors — cosmetic ground you can build other pieces on top of */
@@ -98,7 +101,7 @@ export const IRON_CHANCE = 0.08;
 // ─── Items ──────────────────────────────────────────────────────────────────
 // The item registry lives in ./items (category builders, easy to extend).
 export * from './items';
-import { BuildType, ItemId, ITEMS } from './items';
+import { BuildType, ItemId, ITEMS, StationKind } from './items';
 
 export interface BackpackTier { name: string; slots: number; maxKg: number }
 export const BACKPACKS: BackpackTier[] = [
@@ -110,8 +113,6 @@ export const BACKPACKS: BackpackTier[] = [
 // ─── Crafting ───────────────────────────────────────────────────────────────
 
 export type RecipeCat = 'survival' | 'medical' | 'gear' | 'build' | 'smelt' | 'forge';
-
-export type StationKind = 'workbench' | 'furnace' | 'anvil';
 
 export interface Recipe {
   id: string;
@@ -329,7 +330,14 @@ export const TRADER_TIER_STOCK: Record<TraderTier, TradeEntry[]> = {
 
 // ─── Inventory & equipment ──────────────────────────────────────────────────
 
-export type InvSlot = { id: ItemId; qty: number } | null;
+export type InvSlot = { id: ItemId; qty: number; dur?: number } | null;
+
+/** Current durability of a slot (falls back to the item's max when unset/legacy). */
+export function slotDur(s: NonNullable<InvSlot>): number {
+  const max = ITEMS[s.id].durability;
+  if (max === undefined) return Infinity;
+  return s.dur ?? max;
+}
 
 export interface Inventory {
   backpack: number;
@@ -430,6 +438,7 @@ export interface PlayerSnap {
   dead: boolean;
   moving: boolean;
   swing: number; // server ms timestamp of last melee swing (0 if stale)
+  look?: number; // chosen character sprite row
 }
 
 export interface ProjectileSnap { id: number; x: number; y: number; angle: number }
@@ -488,6 +497,8 @@ export interface InventoryUpdate {
   nearWater: boolean;
   hunger: number; // 0-100
   thirst: number; // 0-100
+  stamina: number; // 0-100 — sprinting and heavy actions drain it
+  look: number; // chosen character sprite row
 }
 
 /** timed action feedback (looting/fishing/drinking/cooking) — ms 0 clears the bar.
@@ -504,6 +515,7 @@ export interface InputPayload {
   right: boolean;
   angle: number;
   shoot: boolean;
+  sprint?: boolean; // hold to run — drains stamina
 }
 
 export interface KillFeedEntry { killer: string; victim: string; weapon: ItemId | null }
@@ -529,6 +541,7 @@ export const EV = {
   interact: 'c:interact',
   containerTake: 'c:container:take',
   containerPut: 'c:container:put',
+  containerMove: 'c:container:move', // reorder within an open container
   containerClose: 'c:container:close',
   invMove: 'c:inv:move',
   invDrop: 'c:inv:drop',
@@ -544,6 +557,8 @@ export const EV = {
   reload: 'c:reload',
   build: 'c:build',
   demolish: 'c:demolish', // reclaim a built piece in your own camp (returns the kit)
+  repair: 'c:repair', // mend a worn weapon/tool/armor at the right station
+  look: 'c:look', // pick your character's appearance
   chat: 'c:chat',
   questClaim: 'c:quest:claim',
   // server → client
@@ -606,6 +621,15 @@ export const NIGHT_AGGRO_MULT = 1.6; // zombies & wolves see further in the dark
 export const NIGHT_SPEED_MULT = 1.2; // zombies shamble faster at night
 export const EXTRACT_TIME_MS = 5000; // hold still at a beacon to extract
 export const HOME_REST_HP_PER_S = 2; // resting at your base heals fast
+
+// ── stamina — sprinting and heavy actions cost it
+export const STAMINA_MAX = 100;
+export const SPRINT_SPEED_MULT = 1.55;
+export const SPRINT_DRAIN_PER_S = 22; // ~4.5s of continuous sprint from full
+export const STAMINA_REGEN_PER_S = 14; // refills while you catch your breath
+export const STAMINA_REGEN_DELAY_MS = 700; // brief pause after exertion before regen
+export const MINE_STAMINA_COST = 6; // per swing chopping/mining a node
+export const SPRINT_MIN = 8; // can't start sprinting below this
 export const SWIM_SPEED_MULT = 0.45;
 export const HUNGER_DECAY_PER_S = 100 / 3600; // empty in ~1h of play
 export const THIRST_DECAY_PER_S = 100 / 2400; // empty in ~40min

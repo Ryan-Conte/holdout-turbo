@@ -69,7 +69,7 @@ const T = {
 
 // ── tiles.png ─────────────────────────────────────────────────────────────
 {
-  const png = sheet(28, 2);
+  const png = sheet(29, 2);
   const cell = (c, r) => [c * C, r * C];
 
   // 0 grass A / 1 grass B
@@ -302,6 +302,17 @@ const T = {
     rect(png, x + 2, y + 6, 12, 3, hex('#5c5c64')); // top
     rect(png, x + 2, y + 6, 12, 1, hex('#7a7a84')); // highlight
     rect(png, x + 12, y + 7, 3, 2, hex('#5c5c64')); // horn
+  }
+  // 28 cliff (raised rock face — high ground you can't cross or shoot through)
+  {
+    const [x, y] = cell(28, 0);
+    rect(png, x, y, C, C, hex('#5a5048'));
+    rect(png, x, y, C, 4, hex('#7a6f63')); // lit top edge
+    speckle(png, x, y, [hex('#4a423a'), hex('#6a6055')], 10, 71);
+    rect(png, x + 2, y + 6, 4, 1, hex('#3a332c')); // strata cracks
+    rect(png, x + 8, y + 9, 5, 1, hex('#3a332c'));
+    rect(png, x + 4, y + 12, 6, 1, hex('#3a332c'));
+    rect(png, x, y + 14, C, 2, hex('#2e2822')); // shadow base
   }
   save(png, 'tiles.png');
 }
