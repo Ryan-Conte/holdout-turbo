@@ -14,9 +14,10 @@ import { EV, InputPayload } from '@holdout/shared';
 import { verifyToken } from '../auth/jwt.util';
 import { GameService } from './game.service';
 import { RateLimiter } from './rate-limit';
+import { corsOrigins } from '../config/cors';
 
 @WebSocketGateway({
-  cors: { origin: process.env.CORS_ORIGIN ?? 'http://localhost:3000' },
+  cors: { origin: corsOrigins() },
 })
 export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   private readonly log = new Logger('Gateway');
@@ -143,9 +144,9 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   }
 
   @SubscribeMessage(EV.build)
-  onBuild(@ConnectedSocket() socket: Socket, @MessageBody() body: { slot: number; tx: number; ty: number }) {
+  onBuild(@ConnectedSocket() socket: Socket, @MessageBody() body: { slot: number; tx: number; ty: number; rotation?: number }) {
     if (!body || !this.allowed(socket, this.actionLimit)) return;
-    this.game.build(socket.id, Number(body.slot) | 0, Number(body.tx) | 0, Number(body.ty) | 0);
+    this.game.build(socket.id, Number(body.slot) | 0, Number(body.tx) | 0, Number(body.ty) | 0, Number(body.rotation) | 0);
   }
 
   @SubscribeMessage(EV.demolish)

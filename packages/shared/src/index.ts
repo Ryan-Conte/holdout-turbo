@@ -369,7 +369,8 @@ export function armorMultiplier(eq: Equipment): number {
 
 // ─── Enemies ────────────────────────────────────────────────────────────────
 
-export type EnemyKind = 'zombie' | 'military' | 'deer' | 'rabbit' | 'boar' | 'wolf';
+export type KnownEnemyKind = 'zombie' | 'military' | 'deer' | 'rabbit' | 'boar' | 'wolf';
+export type EnemyKind = KnownEnemyKind | (string & {});
 
 /** flee = runs from players (huntable) · melee = chases and bites · ranged = keeps distance and shoots */
 export type EnemyBehavior = 'flee' | 'melee' | 'ranged';
@@ -385,7 +386,7 @@ export interface EnemyDef {
   name: string; // display/killfeed name
 }
 
-export const ENEMY_DEFS: Record<EnemyKind, EnemyDef> = {
+export const ENEMY_DEFS: Record<KnownEnemyKind, EnemyDef> = {
   zombie: { behavior: 'melee', maxHp: 50, speed: 105, aggroRange: 230, attackRange: 28, damage: 10, attackMs: 900, name: 'zombie' },
   military: { behavior: 'ranged', maxHp: 80, speed: 120, aggroRange: 320, attackRange: 250, damage: 10, attackMs: 1400, name: 'military guard' },
   deer: { behavior: 'flee', maxHp: 30, speed: 165, aggroRange: 240, attackRange: 0, damage: 0, attackMs: 0, name: 'deer' },
@@ -404,6 +405,8 @@ export interface EnemySnap {
   hp: number;
   maxHp: number;
   moving: boolean;
+  attackAt?: number;
+  hitAt?: number;
 }
 
 // ─── POIs / instances ───────────────────────────────────────────────────────
@@ -422,6 +425,64 @@ export interface PoiSnap {
 
 export type InstanceKind = 'world' | 'hideout';
 
+export interface CharacterAppearance {
+  body: number;
+  skinTone: number;
+  hairStyle: number;
+  hairColor: number;
+  outfit: number;
+  accent: number;
+  cosmetics: {
+    head: string | null;
+    face: string | null;
+    back: string | null;
+    badge: string | null;
+  };
+}
+
+export const CHARACTER_BODY_NAMES = ['Standard', 'Compact', 'Broad'] as const;
+export const CHARACTER_HAIR_NAMES = ['Shaved', 'Crop', 'Sidecut', 'Mohawk', 'Long'] as const;
+export const CHARACTER_SKIN_COLORS = ['#f2c7a5', '#dca477', '#bd7f55', '#925d3f', '#68402f', '#3f2923'] as const;
+export const CHARACTER_HAIR_COLORS = ['#201a17', '#493326', '#7a5030', '#b07a3d', '#d2b071', '#7a2e26', '#d5d1c5', '#34404d'] as const;
+export const CHARACTER_OUTFIT_COLORS = ['#8a3a3a', '#3a5a8a', '#3a7a4a', '#8a6a2a', '#6a4a8a', '#2a7a7a', '#8a4a6a', '#5a6a2a'] as const;
+export const CHARACTER_ACCENT_COLORS = ['#d8a24a', '#d8d2b8', '#6fa6bd', '#76b069', '#c85a4a', '#9b79c4', '#d27d48', '#555b63'] as const;
+
+export const DEFAULT_CHARACTER_APPEARANCE: CharacterAppearance = {
+  body: 0,
+  skinTone: 1,
+  hairStyle: 1,
+  hairColor: 1,
+  outfit: 0,
+  accent: 0,
+  cosmetics: { head: null, face: null, back: null, badge: null },
+};
+
+export function sanitizeCharacterAppearance(value: unknown, legacyLook = 0): CharacterAppearance {
+  const source = value && typeof value === 'object' ? value as Partial<CharacterAppearance> : {};
+  const cosmetics: Partial<CharacterAppearance['cosmetics']> = source.cosmetics && typeof source.cosmetics === 'object'
+    ? source.cosmetics
+    : {};
+  const index = (candidate: unknown, max: number, fallback: number) => {
+    const number = Number(candidate);
+    return Number.isFinite(number) ? Math.max(0, Math.min(max - 1, number | 0)) : fallback;
+  };
+  const cosmetic = (candidate: unknown) => typeof candidate === 'string' && candidate.trim()
+    ? candidate.trim().slice(0, 60)
+    : null;
+  return {
+    body: index(source.body, CHARACTER_BODY_NAMES.length, DEFAULT_CHARACTER_APPEARANCE.body),
+    skinTone: index(source.skinTone, CHARACTER_SKIN_COLORS.length, DEFAULT_CHARACTER_APPEARANCE.skinTone),
+    hairStyle: index(source.hairStyle, CHARACTER_HAIR_NAMES.length, DEFAULT_CHARACTER_APPEARANCE.hairStyle),
+    hairColor: index(source.hairColor, CHARACTER_HAIR_COLORS.length, DEFAULT_CHARACTER_APPEARANCE.hairColor),
+    outfit: index(source.outfit, CHARACTER_OUTFIT_COLORS.length, index(legacyLook, CHARACTER_OUTFIT_COLORS.length, 0)),
+    accent: index(source.accent, CHARACTER_ACCENT_COLORS.length, DEFAULT_CHARACTER_APPEARANCE.accent),
+    cosmetics: {
+      head: cosmetic(cosmetics.head), face: cosmetic(cosmetics.face),
+      back: cosmetic(cosmetics.back), badge: cosmetic(cosmetics.badge),
+    },
+  };
+}
+
 // ─── Networked state ────────────────────────────────────────────────────────
 
 export interface PlayerSnap {
@@ -429,7 +490,8 @@ export interface PlayerSnap {
   name: string;
   x: number;
   y: number;
-  angle: number;
+  angle: number; // weapon/action aim
+  facing: number; // body movement/action direction
   hp: number;
   maxHp: number;
   weapon: ItemId | null;
@@ -438,7 +500,10 @@ export interface PlayerSnap {
   dead: boolean;
   moving: boolean;
   swing: number; // server ms timestamp of last melee swing (0 if stale)
+  attackAt?: number;
+  hitAt?: number;
   look?: number; // chosen character sprite row
+  appearance?: CharacterAppearance;
 }
 
 export interface ProjectileSnap { id: number; x: number; y: number; angle: number }
@@ -466,6 +531,13 @@ export interface WorldInit {
   exit: { x: number; y: number } | null; // hideout exit mat
   ownHideout: boolean; // true when this is YOUR hideout (enables building)
   unders: Record<number, number>; // tile index → floor tile beneath a placed station
+  elevations: number[];
+  terrainKinds: Record<string, string>; // tile index -> published terrain definition
+  resourceKinds: Record<string, string>; // tile index -> published resource definition
+  blockKinds: Record<string, string>; // tile index -> published world-block definition
+  blockRotations: Record<string, number>; // tile index -> clockwise quarter turns (0-3)
+  openDoors: number[]; // currently open block indexes
+  visuals: import('./engine').RuntimeVisualContent;
   you: string;
 }
 
@@ -498,7 +570,9 @@ export interface InventoryUpdate {
   hunger: number; // 0-100
   thirst: number; // 0-100
   stamina: number; // 0-100 — sprinting and heavy actions drain it
+  staminaExhausted: boolean;
   look: number; // chosen character sprite row
+  appearance: CharacterAppearance;
 }
 
 /** timed action feedback (looting/fishing/drinking/cooking) — ms 0 clears the bar.
@@ -526,11 +600,14 @@ export interface HitSnap {
   amount: number;
   kind: 'player' | 'enemy' | 'node';
   material?: 'wood' | 'stone';
+  soundId?: string;
 }
 
 /** `under` = the floor tile a station sits on (kept for rendering + demolish restore) */
 export interface TileUpdate { i: number; tile: number; under?: number }
 
+export interface EntityDeathSnap { x: number; y: number; target: string; fallbackRow: number }
+export interface BlockUpdate { i: number; blockId?: string; rotation?: number; open?: boolean }
 export interface TradeOpen { stock: TradeEntry[]; money: number; quests: QuestStatus[]; tier: TraderTier }
 
 export interface ChatMsg { id: string; name: string; text: string }
@@ -576,6 +653,9 @@ export const EV = {
   chatMsg: 's:chat',
   action: 's:action',
   station: 's:station', // opened a placed structure (firepit/furnace/workbench)
+  visuals: 's:visuals', // hot-reloaded pixel frames and entity animation profiles
+  entityDeath: 's:entity-death',
+  block: 's:block',
 } as const;
 
 /** payload of EV.station */
@@ -586,8 +666,9 @@ export interface StationOpen { type: BuildType }
 export type MapObjectType =
   | 'chest' | 'chest_military' | 'loot' | 'zombie' | 'military'
   | 'deer' | 'rabbit' | 'boar' | 'wolf'
+  | 'chest_custom' | 'mob'
   | 'spawn' | 'trader' | 'trader_black' | 'extract'
-  | 'poi_town' | 'poi_airport' | 'poi_outpost' | 'poi_hotzone';
+  | 'poi_town' | 'poi_airport' | 'poi_outpost' | 'poi_hotzone' | 'poi_zone';
 
 export interface MapObject {
   type: MapObjectType;
@@ -595,14 +676,28 @@ export interface MapObject {
   y: number;
   name?: string; // for POIs
   r?: number; // poi radius in tiles
+  contentId?: string; // custom mob/trader/content record id
+  lootTable?: string; // chest or mob drop table id
+  respawnMs?: number;
+  zoneKind?: PoiKind; // custom zone presentation on the minimap
+  safe?: boolean;
+  hot?: boolean;
 }
 
 export interface AuthoredMap {
   w: number;
   h: number;
   tiles: number[];
+  elevations?: number[];
+  terrain?: Record<string, string>; // tile index -> terrain definition id
+  resources?: Record<string, string>; // tile index -> resource definition id
+  blocks?: Record<string, string>; // tile index -> world-block definition id
+  blockRotations?: Record<string, number>; // tile index -> clockwise quarter turns (0-3)
   objects: MapObject[];
 }
+
+// Game-engine persistence types and the shared fallback loot registry.
+export * from './engine';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -628,8 +723,9 @@ export const SPRINT_SPEED_MULT = 1.55;
 export const SPRINT_DRAIN_PER_S = 22; // ~4.5s of continuous sprint from full
 export const STAMINA_REGEN_PER_S = 14; // refills while you catch your breath
 export const STAMINA_REGEN_DELAY_MS = 700; // brief pause after exertion before regen
+export const STAMINA_EXHAUSTED_REGEN_DELAY_MS = 2600; // hitting zero carries a meaningful recovery penalty
+export const STAMINA_EXHAUSTED_RECOVERY = 25; // sprint remains locked until this much stamina returns
 export const MINE_STAMINA_COST = 6; // per swing chopping/mining a node
-export const SPRINT_MIN = 8; // can't start sprinting below this
 export const SWIM_SPEED_MULT = 0.45;
 export const HUNGER_DECAY_PER_S = 100 / 3600; // empty in ~1h of play
 export const THIRST_DECAY_PER_S = 100 / 2400; // empty in ~40min

@@ -4,11 +4,10 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "env": ["DATABASE_URL", "JWT_SECRET", "PORT", "CORS_ORIGIN"],
+      "env": ["DATABASE_URL", "JWT_SECRET", "PORT", "CORS_ORIGIN", "NEXT_PUBLIC_API_URL", "BETTER_AUTH_SECRET", "BETTER_AUTH_URL", "ADMIN_EMAILS", "STEAM_API_KEY"],
       "outputs": [
-        "packages/shared/dist/**",
-        "apps/api/dist/**",
-        "apps/web/.next/**",
+        "dist/**",
+        ".next/**",
         "!.next/cache/**"
       ]
     },

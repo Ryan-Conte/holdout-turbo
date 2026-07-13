@@ -7,13 +7,41 @@ export interface GeneratedMap {
   w: number;
   h: number;
   tiles: Uint8Array;
-  chestSpots: { x: number; y: number; tier: ChestTier }[]; // pixel centers
+  elevations: Uint8Array;
+  terrainKinds: Record<string, string>;
+  resourceKinds: Record<string, string>;
+  blockKinds: Record<string, string>;
+  blockRotations: Record<string, number>;
+  chestSpots: { x: number; y: number; tier: ChestTier; lootTable?: string }[]; // pixel centers
   lootSpots: { x: number; y: number }[];
   spawns: { x: number; y: number }[];
   pois: PoiSnap[];
   traders: { x: number; y: number; tier?: TraderTier }[];
   extracts: { x: number; y: number }[];
-  enemySpawns: { x: number; y: number; kind: EnemyKind }[];
+  enemySpawns: { x: number; y: number; kind: EnemyKind; respawnMs?: number }[];
+}
+
+export const TERRAIN_ID_BY_TILE: Record<number, string> = {
+  [Tile.Grass]: 'grass', [Tile.Water]: 'water', [Tile.Tree]: 'tree', [Tile.Floor]: 'floor',
+  [Tile.Wall]: 'wall', [Tile.Road]: 'road', [Tile.Sand]: 'sand', [Tile.Rock]: 'rock',
+  [Tile.Asphalt]: 'asphalt', [Tile.Bed]: 'bed', [Tile.DoorMat]: 'doormat',
+  [Tile.CopperOre]: 'copper_ore', [Tile.IronOre]: 'iron_ore', [Tile.Cliff]: 'cliff',
+};
+
+export function terrainKindsFromTiles(tiles: ArrayLike<number>): Record<string, string> {
+  const terrain: Record<string, string> = {};
+  for (let index = 0; index < tiles.length; index++) terrain[String(index)] = TERRAIN_ID_BY_TILE[tiles[index]] ?? 'grass';
+  return terrain;
+}
+
+export function resourceKindsFromTiles(tiles: ArrayLike<number>): Record<string, string> {
+  const resources: Record<string, string> = {};
+  for (let index = 0; index < tiles.length; index++) {
+    const id = tiles[index] === Tile.Tree ? 'tree' : tiles[index] === Tile.Rock ? 'rock'
+      : tiles[index] === Tile.CopperOre ? 'copper_vein' : tiles[index] === Tile.IronOre ? 'iron_vein' : '';
+    if (id) resources[String(index)] = id;
+  }
+  return resources;
 }
 
 export function mulberry32(seed: number) {
@@ -36,6 +64,7 @@ export function generateMap(seed = (Math.random() * 2 ** 31) | 0): GeneratedMap 
   const W = MAP_W;
   const H = MAP_H;
   const t = new Uint8Array(W * H).fill(Tile.Grass);
+  const elevations = new Uint8Array(W * H);
   const idx = (x: number, y: number) => y * W + x;
   const inB = (x: number, y: number) => x >= 0 && y >= 0 && x < W && y < H;
   const ri = (lo: number, hi: number) => lo + Math.floor(rnd() * (hi - lo + 1));
@@ -321,7 +350,29 @@ export function generateMap(seed = (Math.random() * 2 ** 31) | 0): GeneratedMap 
   // extraction beacons — one per map quadrant edge, away from POIs
   const extracts = placeExtracts(t, W, H, pois);
 
-  return { seed, w: W, h: H, tiles: t, chestSpots, lootSpots, spawns, pois, traders, extracts, enemySpawns };
+  // Broad elevation fields make the procedural wilderness three-dimensional.
+  // Most rings rise one level at a time; occasional mesas have a steep face.
+  for (let hill = 0; hill < 7; hill++) {
+    let cx = ri(12, W - 13); let cy = ri(12, H - 13);
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if (pois.every((poi) => Math.hypot(px(cx) - poi.x, px(cy) - poi.y) > poi.r + 12 * TILE)) break;
+      cx = ri(12, W - 13); cy = ri(12, H - 13);
+    }
+    const radius = ri(8, 15);
+    const mesa = hill % 3 === 0;
+    for (let y = Math.max(1, cy - radius); y <= Math.min(H - 2, cy + radius); y++) for (let x = Math.max(1, cx - radius); x <= Math.min(W - 2, cx + radius); x++) {
+      if (t[idx(x, y)] === Tile.Water) continue;
+      const distance = Math.hypot((x - cx) * (0.82 + rnd() * .04), y - cy) / radius;
+      const level = mesa ? distance < .34 ? 3 : distance < .78 ? 1 : 0 : distance < .3 ? 3 : distance < .58 ? 2 : distance < .88 ? 1 : 0;
+      elevations[idx(x, y)] = Math.max(elevations[idx(x, y)], level);
+    }
+  }
+  for (const point of [...spawns, ...extracts]) {
+    const cx = Math.floor(point.x / TILE); const cy = Math.floor(point.y / TILE);
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if (inB(cx + dx, cy + dy)) elevations[idx(cx + dx, cy + dy)] = 0;
+  }
+
+  return { seed, w: W, h: H, tiles: t, elevations, terrainKinds: terrainKindsFromTiles(t), resourceKinds: resourceKindsFromTiles(t), blockKinds: {}, blockRotations: {}, chestSpots, lootSpots, spawns, pois, traders, extracts, enemySpawns };
 }
 
 /** Find grass tiles near the four map edges for extraction beacons. */
@@ -356,6 +407,7 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
   const W = Math.max(20, Math.min(200, map.w | 0));
   const H = Math.max(20, Math.min(200, map.h | 0));
   const tiles = new Uint8Array(W * H).fill(Tile.Grass);
+  const elevations = new Uint8Array(W * H);
   // editor may paint terrain + resource nodes; structures/stations stay player-built
   const AUTHORABLE = new Set<number>([
     Tile.Grass, Tile.Water, Tile.Tree, Tile.Floor, Tile.Wall, Tile.Road,
@@ -366,12 +418,20 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
     const v = map.tiles[i] | 0;
     tiles[i] = AUTHORABLE.has(v) ? v : Tile.Grass;
   }
+  if (Array.isArray(map.elevations) && map.elevations.length === W * H) {
+    for (let i = 0; i < elevations.length; i++) elevations[i] = Math.max(0, Math.min(3, Number(map.elevations[i]) | 0));
+  }
 
   const out: GeneratedMap = {
     seed: 0,
     w: W,
     h: H,
     tiles,
+    elevations,
+    terrainKinds: {},
+    resourceKinds: {},
+    blockKinds: {},
+    blockRotations: {},
     chestSpots: [],
     lootSpots: [],
     spawns: [],
@@ -381,6 +441,39 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
     enemySpawns: [],
   };
 
+  if (map.terrain && typeof map.terrain === 'object') {
+    for (const [rawIndex, terrainId] of Object.entries(map.terrain)) {
+      const index = Number(rawIndex) | 0;
+      if (index < 0 || index >= W * H || typeof terrainId !== 'string' || !terrainId) continue;
+      out.terrainKinds[String(index)] = terrainId.slice(0, 50);
+    }
+  }
+  for (let index = 0; index < W * H; index++) {
+    if (!out.terrainKinds[String(index)]) out.terrainKinds[String(index)] = TERRAIN_ID_BY_TILE[tiles[index]] ?? 'grass';
+  }
+
+  if (map.resources && typeof map.resources === 'object') {
+    for (const [rawIndex, resourceId] of Object.entries(map.resources)) {
+      const index = Number(rawIndex) | 0;
+      if (index < 0 || index >= W * H || typeof resourceId !== 'string' || !resourceId) continue;
+      if (![Tile.Tree, Tile.Rock, Tile.CopperOre, Tile.IronOre].includes(tiles[index])) continue;
+      out.resourceKinds[String(index)] = resourceId.slice(0, 50);
+    }
+  }
+  const defaultResources = resourceKindsFromTiles(tiles);
+  for (const [index, resourceId] of Object.entries(defaultResources)) {
+    if (!out.resourceKinds[index]) out.resourceKinds[index] = resourceId;
+  }
+  if (map.blocks && typeof map.blocks === 'object') {
+    for (const [rawIndex, blockId] of Object.entries(map.blocks)) {
+      const index = Number(rawIndex) | 0;
+      if (index < 0 || index >= W * H || typeof blockId !== 'string' || !blockId) continue;
+      out.blockKinds[String(index)] = blockId.slice(0, 50);
+      const rotation = Number(map.blockRotations?.[String(index)]) | 0;
+      if (rotation) out.blockRotations[String(index)] = ((rotation % 4) + 4) % 4;
+    }
+  }
+
   for (const o of Array.isArray(map.objects) ? map.objects : []) {
     const x = Math.max(0, Math.min(W - 1, o.x | 0));
     const y = Math.max(0, Math.min(H - 1, o.y | 0));
@@ -389,6 +482,7 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
     switch (o.type) {
       case 'chest': out.chestSpots.push({ x: cx, y: cy, tier: 'normal' }); break;
       case 'chest_military': out.chestSpots.push({ x: cx, y: cy, tier: 'military' }); break;
+      case 'chest_custom': out.chestSpots.push({ x: cx, y: cy, tier: 'normal', lootTable: o.lootTable || 'chest' }); break;
       case 'loot': out.lootSpots.push({ x: cx, y: cy }); break;
       case 'zombie': out.enemySpawns.push({ x: cx, y: cy, kind: 'zombie' }); break;
       case 'military': out.enemySpawns.push({ x: cx, y: cy, kind: 'military' }); break;
@@ -396,6 +490,7 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
       case 'rabbit': out.enemySpawns.push({ x: cx, y: cy, kind: 'rabbit' }); break;
       case 'boar': out.enemySpawns.push({ x: cx, y: cy, kind: 'boar' }); break;
       case 'wolf': out.enemySpawns.push({ x: cx, y: cy, kind: 'wolf' }); break;
+      case 'mob': out.enemySpawns.push({ x: cx, y: cy, kind: o.contentId || 'zombie', respawnMs: o.respawnMs }); break;
       case 'spawn': out.spawns.push({ x: cx, y: cy }); break;
       case 'extract': out.extracts.push({ x: cx, y: cy }); break;
       case 'trader':
@@ -407,6 +502,7 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
       case 'poi_airport': out.pois.push({ name: o.name || 'Airport', kind: 'airport', x: cx, y: cy, r: (o.r ?? 16) * TILE, hot: true }); break;
       case 'poi_outpost': out.pois.push({ name: o.name || 'Outpost', kind: 'outpost', x: cx, y: cy, r: (o.r ?? 8) * TILE, safe: true }); break;
       case 'poi_hotzone': out.pois.push({ name: o.name || 'Hot Zone', kind: 'hotzone', x: cx, y: cy, r: (o.r ?? 12) * TILE, hot: true }); break;
+      case 'poi_zone': out.pois.push({ name: o.name || 'Zone', kind: o.zoneKind ?? 'wilds', x: cx, y: cy, r: (o.r ?? 10) * TILE, safe: Boolean(o.safe), hot: Boolean(o.hot) }); break;
     }
   }
   if (out.spawns.length === 0) out.spawns.push({ x: px(W >> 1), y: px(H >> 1) });

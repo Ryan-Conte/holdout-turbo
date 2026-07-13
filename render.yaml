@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
+
+envVarGroups:
+  - name: holdout-api-shared
+    envVars:
+      - key: NODE_VERSION
+        value: 22.14.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+
+services:
+  - type: web
+    runtime: node
+    name: holdout-api-oregon
+    region: oregon
+    plan: starter
+    buildCommand: npm ci && npx prisma generate && npm run build -w @holdout/shared && npm run build -w @holdout/api
+    startCommand: npm run start -w @holdout/api
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    buildFilter:
+      paths: [apps/api/**, packages/shared/**, prisma/**, package.json, package-lock.json, turbo.json, render.yaml]
+    envVars:
+      - fromGroup: holdout-api-shared
+      - key: PUBLIC_SERVER_URL
+        sync: false
+      - key: SERVER_NAME
+        value: HOLDOUT US West
+      - key: SERVER_REGION
+        value: us-west
+      - key: SERVER_SORT
+        value: 10
+
+  - type: web
+    runtime: node
+    name: holdout-api-frankfurt
+    region: frankfurt
+    plan: starter
+    buildCommand: npm ci && npx prisma generate && npm run build -w @holdout/shared && npm run build -w @holdout/api
+    startCommand: npm run start -w @holdout/api
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    buildFilter:
+      paths: [apps/api/**, packages/shared/**, prisma/**, package.json, package-lock.json, turbo.json, render.yaml]
+    envVars:
+      - fromGroup: holdout-api-shared
+      - key: PUBLIC_SERVER_URL
+        sync: false
+      - key: SERVER_NAME
+        value: HOLDOUT Europe
+      - key: SERVER_REGION
+        value: eu-central
+      - key: SERVER_SORT
+        value: 20
+
+  - type: web
+    runtime: node
+    name: holdout-api-singapore
+    region: singapore
+    plan: starter
+    buildCommand: npm ci && npx prisma generate && npm run build -w @holdout/shared && npm run build -w @holdout/api
+    startCommand: npm run start -w @holdout/api
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    buildFilter:
+      paths: [apps/api/**, packages/shared/**, prisma/**, package.json, package-lock.json, turbo.json, render.yaml]
+    envVars:
+      - fromGroup: holdout-api-shared
+      - key: PUBLIC_SERVER_URL
+        sync: false
+      - key: SERVER_NAME
+        value: HOLDOUT Asia Pacific
+      - key: SERVER_REGION
+        value: ap-southeast
+      - key: SERVER_SORT
+        value: 30

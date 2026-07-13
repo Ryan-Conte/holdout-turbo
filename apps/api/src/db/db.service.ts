@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
-import { AuthoredMap, BuildType, EMPTY_SKILLS, Equipment, InvSlot, Inventory, QuestDef, Skills } from '@holdout/shared';
+import { AuthoredMap, BuildType, CharacterAppearance, EMPTY_SKILLS, Equipment, InvSlot, Inventory, QuestDef, Skills, sanitizeCharacterAppearance } from '@holdout/shared';
 
 export interface QuestProg {
   kills: number;
@@ -18,12 +18,12 @@ export interface ProfileRow {
   hunger: number;
   thirst: number;
   armorDur: Partial<Record<'helmet' | 'vest', number>>;
-  look: number;
+  appearance: CharacterAppearance;
 }
 
 export interface HideoutData {
   storage: InvSlot[];
-  objects: { type: BuildType; tx: number; ty: number; slots?: InvSlot[] }[];
+  objects: { type: BuildType; tx: number; ty: number; rotation?: number; slots?: InvSlot[] }[];
 }
 
 @Injectable()
@@ -35,6 +35,26 @@ export class DbService implements OnModuleInit, OnModuleDestroy {
     this.prisma = new PrismaClient();
     await this.prisma.$connect();
     this.log.log('Prisma connected to Neon');
+    await this.registerPublicServer();
+  }
+
+  private async registerPublicServer() {
+    const url = (process.env.PUBLIC_SERVER_URL ?? '').trim().replace(/\/$/, '');
+    if (!/^https:\/\//i.test(url)) return;
+    const name = (process.env.SERVER_NAME ?? 'HOLDOUT Server').trim().slice(0, 40);
+    const region = (process.env.SERVER_REGION ?? 'global').trim().slice(0, 20);
+    const sort = Number(process.env.SERVER_SORT ?? 100) | 0;
+    try {
+      const existing = await this.prisma.gameServer.findFirst({ where: { url } });
+      if (existing) {
+        this.log.log(`Public game server already registered as ${existing.name} (${url})`);
+      } else {
+        await this.prisma.gameServer.create({ data: { name, region, url, sort, active: true } });
+        this.log.log(`Registered public game server ${name} (${url})`);
+      }
+    } catch (error) {
+      this.log.error(`Public server registration failed: ${(error as Error).message}`);
+    }
   }
 
   async onModuleDestroy() {
@@ -59,8 +79,14 @@ export class DbService implements OnModuleInit, OnModuleDestroy {
       hunger: typeof data.hunger === 'number' ? data.hunger : 100,
       thirst: typeof data.thirst === 'number' ? data.thirst : 100,
       armorDur: (data.armorDur ?? {}) as Partial<Record<'helmet' | 'vest', number>>,
-      look: typeof data.look === 'number' ? data.look : 0,
+      appearance: sanitizeCharacterAppearance(data.appearance, typeof data.look === 'number' ? data.look : 0),
     };
+  }
+
+  async loadAppearance(userId: string): Promise<CharacterAppearance> {
+    const row = await this.prisma.profile.findUnique({ where: { userId }, select: { data: true } });
+    const data = (row?.data ?? {}) as Record<string, unknown>;
+    return sanitizeCharacterAppearance(data.appearance, typeof data.look === 'number' ? data.look : 0);
   }
 
   async saveProfile(
@@ -75,9 +101,14 @@ export class DbService implements OnModuleInit, OnModuleDestroy {
     hunger: number,
     thirst: number,
     armorDur: Partial<Record<'helmet' | 'vest', number>> = {},
-    look = 0,
+    appearance: CharacterAppearance,
   ) {
-    const data = JSON.parse(JSON.stringify({ inv, equipment, skills, quests, hunger, thirst, armorDur, look }));
+    const cleanAppearance = sanitizeCharacterAppearance(appearance);
+    const data = JSON.parse(JSON.stringify({
+      inv, equipment, skills, quests, hunger, thirst, armorDur,
+      appearance: cleanAppearance,
+      look: cleanAppearance.outfit,
+    }));
     try {
       await this.prisma.profile.upsert({
         where: { userId },
@@ -119,14 +150,28 @@ export class DbService implements OnModuleInit, OnModuleDestroy {
   }
 
   async loadActiveMap(): Promise<AuthoredMap | null> {
+    return (await this.loadActiveMapRevision())?.data ?? null;
+  }
+
+  async loadActiveMapRevision(): Promise<{ id: number; data: AuthoredMap } | null> {
     try {
       const row = await this.prisma.gameMap.findFirst({ where: { active: true }, orderBy: { updatedAt: 'desc' } });
       const data = row?.data as AuthoredMap | undefined;
-      if (data && Array.isArray(data.tiles) && data.w > 0 && data.h > 0) return data;
+      if (row && data && Array.isArray(data.tiles) && data.w > 0 && data.h > 0) return { id: row.id, data };
     } catch (err) {
       this.log.error(`loadActiveMap: ${(err as Error).message}`);
     }
     return null;
+  }
+
+  async loadPublishedContent(kinds: string[]): Promise<Record<string, unknown>> {
+    try {
+      const rows = await this.prisma.gameContent.findMany({ where: { kind: { in: kinds } } });
+      return Object.fromEntries(rows.filter((row) => row.published !== null).map((row) => [row.kind, row.published]));
+    } catch (err) {
+      this.log.error(`loadPublishedContent: ${(err as Error).message}`);
+      return {};
+    }
   }
 
   async loadQuests(): Promise<QuestDef[]> {

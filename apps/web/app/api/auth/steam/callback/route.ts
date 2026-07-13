@@ -71,7 +71,7 @@ export async function GET(req: Request) {
   }
 
   // 3. hand the session cookies to the browser and enter the game
-  const res = NextResponse.redirect(`${origin}/play`);
+  const res = NextResponse.redirect(`${origin}/`);
   for (const cookie of headers.getSetCookie()) res.headers.append('set-cookie', cookie);
   return res;
 }

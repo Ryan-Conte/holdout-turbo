@@ -14,13 +14,14 @@
 - Enemies: zombies (towns/wilds), military (airport); loot bags; respawns.
 - Sprite-sheet renderer + animation pass (walk frames, melee jabs/swings/thrusts, tree shake + fall, rock crumble, particles, muzzle flashes, corpses, day/night).
 - Admin map editor (`/editor`) → `maps` table → server loads active map.
+- Admin engine foundation at `/admin/{slug}`: DB-admin gate, draft/publish maps, content polling, custom spawn/loot placement and browser pixel studio.
 - Friends: requests/accept, minimap markers.
 - Zero Sievert-flavored UI theme (inventory w/ equipment slots, tabbed crafting, trade, social).
 
 ## Next
 1. Gun attachments + item instances (see docs/PVP.md #1).
 2. Snapshot culling + client prediction (docs/ANTICHEAT.md).
-3. Editor v2: building stamps, POI naming UI, multi-map rotation.
+3. Engine v2: dynamic DB-only items, sprite atlas composition, building stamps, revision rollback and multi-map rotation.
 4. Wandering trader; night-only enemy spawns / horde events.
 5. Base raiding rules for world structures (decay tuning, offline protection).
 6. Real art to replace generated sprite templates (docs/ART.md).

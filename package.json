@@ -1,6 +1,9 @@
 {
   "name": "holdout",
   "private": true,
+  "engines": {
+    "node": "22.x"
+  },
   "packageManager": "npm@11.2.0",
   "workspaces": [
     "apps/*",
@@ -9,8 +12,10 @@
   "scripts": {
     "dev": "turbo run dev",
     "build": "turbo run build",
+    "check": "npm run typecheck && npm run build",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
+    "seed:engine": "npm run build -w @holdout/shared && node tools/seed-engine.mjs",
     "deploy:api": "npm --workspace=apps/api run build && npm --workspace=apps/api run deploy",
     "deploy:web": "npm --workspace=apps/web run build && npm --workspace=apps/web run deploy",
     "deploy:api:ci": "npm --workspace=apps/api run build --if-present && echo \"Replace this with your CI/CD deploy command (scp/rsync/docker push, etc.)\"",

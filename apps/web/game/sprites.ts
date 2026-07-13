@@ -1,21 +1,7 @@
-import { ItemId } from '@holdout/shared';
+import { ItemId, ITEM_SPRITE_ORDER } from '@holdout/shared';
 
 // Column order in items.png — must match tools/gen-sprites.mjs
-export const ITEM_SHEET_ORDER: ItemId[] = [
-  'pistol', 'smg', 'shotgun', 'rifle', 'spear', 'axe', 'pickaxe',
-  'ammo_9mm', 'ammo_shell', 'ammo_556', 'cloth', 'scrap', 'wood', 'stone',
-  'bandage', 'medkit', 'backpack_mk2', 'backpack_mk3',
-  'helmet_scrap', 'helmet_military', 'vest_light', 'vest_military',
-  'attach_reddot', 'attach_suppressor',
-  'fishing_rod', 'raw_fish', 'cooked_fish', 'raw_meat', 'cooked_meat', 'canteen', 'canteen_full',
-  'kit_firepit', 'kit_furnace', 'kit_workbench', 'kit_chest',
-  'kit_floor_wood', 'kit_floor_stone', 'kit_wall', 'kit_door', 'kit_fence', 'kit_torch',
-  'bow', 'arrow',
-  'revolver', 'carbine', 'dmr', 'lmg', 'prototype_rifle',
-  'steel_axe', 'steel_pickaxe', 'ammo_44', 'ammo_762',
-  'copper_ore', 'iron_ore', 'copper_bar', 'iron_bar',
-  'gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact', 'kit_anvil', 'kit_bed',
-];
+export const ITEM_SHEET_ORDER: ItemId[] = [...ITEM_SPRITE_ORDER];
 
 export const ITEM_INDEX: Record<string, number> = Object.fromEntries(
   ITEM_SHEET_ORDER.map((id, i) => [id, i]),

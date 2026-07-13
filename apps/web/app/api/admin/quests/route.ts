@@ -25,10 +25,16 @@ interface QuestBody {
   active?: boolean;
 }
 
-function validate(body: QuestBody) {
+async function validate(body: QuestBody) {
   const kind = body.kind === 'fetch' ? 'fetch' : 'kill';
   const target = String(body.target ?? '');
-  if (kind === 'kill' && !(target in ENEMY_DEFS)) return 'Kill target must be: zombie or military';
+  if (kind === 'kill' && !(target in ENEMY_DEFS)) {
+    const content = await prisma.gameContent.findUnique({ where: { kind: 'mobs' }, select: { published: true } });
+    const mobs = content?.published && typeof content.published === 'object' && !Array.isArray(content.published)
+      ? content.published as Record<string, unknown>
+      : {};
+    if (!(target in mobs)) return 'Kill target must be a published mob id';
+  }
   if (kind === 'fetch' && !(target in ITEMS)) return 'Fetch target must be a valid item id';
   if (body.rewardItem && !(body.rewardItem in ITEMS)) return 'Reward item must be a valid item id';
   if (!body.name?.trim()) return 'Name required';
@@ -61,7 +67,7 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({ error: 'Invalid body' }, { status: 400 });
   }
-  const err = validate(body);
+  const err = await validate(body);
   if (err) return NextResponse.json({ error: err }, { status: 400 });
   const data = toData(body);
   const quest = body.id

@@ -1,6 +1,8 @@
 import {
   BLOCKS_BULLET,
+  DEFAULT_CHARACTER_APPEARANCE,
   ContainerSnap,
+  EntityDeathSnap,
   EnemySnap,
   GroundItemSnap,
   HitSnap,
@@ -10,9 +12,12 @@ import {
   PlayerSnap,
   PoiSnap,
   ProjectileSnap,
+  RuntimeVisualContent,
+  EntityAnimationState,
   TILE,
   Tile,
 } from "@holdout/shared";
+import { drawCharacterAppearance } from "./character-appearance";
 import { CHAR_ROWS, ITEM_INDEX, Sheets } from "./sprites";
 
 const SPR = 16; // art cell size; rendered at 2× (TILE = 32)
@@ -64,7 +69,7 @@ export interface WorldView {
   time: number; // seconds, client clock
   serverNow: number; // ms, server clock
   day: number;
-  ghost: { tile: number; tx: number; ty: number; valid: boolean } | null; // build placement preview
+  ghost: { tile: number; blockId?: string; rotation: number; tx: number; ty: number; valid: boolean } | null; // build placement preview
   highlight: { x: number; y: number } | null; // nearest interactable — pulsing ring
   demolish: { tx: number; ty: number; valid: boolean } | null; // demolish-mode tile marker
   fog: boolean; // dim tiles the player has no line of sight to (world only)
@@ -99,6 +104,7 @@ interface Corpse {
   x: number;
   y: number;
   row: number;
+  target?: string;
   t0: number;
 }
 
@@ -152,6 +158,11 @@ export class Renderer {
   private kickAngle = 0;
 
   private unders: Map<number, number>;
+  private visualFrames = new Map<string, HTMLCanvasElement[]>();
+  private animationSoundSteps = new Map<string, string>();
+  private entitySoundStates = new Map<string, EntityAnimationState>();
+  private lastTerrainFootstepAt = 0;
+  private openDoors = new Set<number>();
 
   constructor(
     private tiles: number[],
@@ -163,8 +174,19 @@ export class Renderer {
     private exit: { x: number; y: number } | null,
     private extracts: { x: number; y: number }[] = [],
     unders: Record<number, number> = {},
+    private elevations: number[] = [],
+    private visuals: RuntimeVisualContent = { assets: {}, animations: {}, resources: {}, sounds: { presets: {}, actions: {} }, mobSounds: {}, blocks: {}, terrain: {} },
+    private terrainKinds: Record<string, string> = {},
+    private resourceKinds: Record<string, string> = {},
+    private blockKinds: Record<string, string> = {},
+    private blockRotations: Record<string, number> = {},
+    initialOpenDoors: number[] = [],
+    private onSound?: (soundId: string, volume: number) => void,
   ) {
+    this.openDoors = new Set(initialOpenDoors);
     this.unders = new Map(Object.entries(unders).map(([k, v]) => [Number(k), v]));
+    if (this.elevations.length !== w * h) this.elevations = new Array(w * h).fill(0);
+    this.buildVisualFrames();
     this.mapCanvas = document.createElement("canvas");
     this.mapCanvas.width = w * TILE;
     this.mapCanvas.height = h * TILE;
@@ -174,9 +196,144 @@ export class Renderer {
     this.prerender();
   }
 
+  private buildVisualFrames() {
+    this.visualFrames.clear();
+    for (const [id, asset] of Object.entries(this.visuals.assets ?? {})) {
+      const frames = asset.frames?.length ? asset.frames : asset.pixels?.length ? [asset.pixels] : [];
+      const canvases = frames.filter((frame) => frame.length === asset.width * asset.height).map((frame) => {
+        const canvas = document.createElement('canvas');
+        canvas.width = asset.width; canvas.height = asset.height;
+        const ctx = canvas.getContext('2d')!;
+        frame.forEach((color, index) => { ctx.fillStyle = color; ctx.fillRect(index % asset.width, Math.floor(index / asset.width), 1, 1); });
+        return canvas;
+      });
+      if (canvases.length) this.visualFrames.set(id, canvases);
+    }
+  }
+
+  applyVisuals(visuals: RuntimeVisualContent) {
+    this.visuals = visuals;
+    this.buildVisualFrames();
+    this.prerender();
+  }
+
+  applyBlock(index: number, blockId?: string, rotation = 0, open?: boolean) {
+    if (blockId) this.blockKinds[String(index)] = blockId;
+    else delete this.blockKinds[String(index)];
+    rotation = ((rotation | 0) % 4 + 4) % 4;
+    if (blockId && rotation) this.blockRotations[String(index)] = rotation;
+    else delete this.blockRotations[String(index)];
+    if (!blockId || open === false) this.openDoors.delete(index);
+    else if (open === true) this.openDoors.add(index);
+    const context = this.miniCanvas.getContext('2d');
+    if (!context) return;
+    const x = index % this.w; const y = Math.floor(index / this.w);
+    const mapContext = this.mapCanvas.getContext('2d');
+    if (mapContext) { this.drawTerrainCell(mapContext, x, y); this.drawFoundationLayer(mapContext, x, y); }
+    context.fillStyle = blockId ? '#b58b45' : this.terrainAt(x, y)?.minimapColor ?? '#527741';
+    context.fillRect(x, y, 1, 1);
+  }
+
+  playerBlockId(buildType: string): string | undefined {
+    return Object.values(this.visuals.blocks ?? {}).find((block) => block.playerPlacement?.buildType === buildType)?.id;
+  }
+
+  entityDeath(death: EntityDeathSnap) {
+    this.corpses.push({
+      x: death.x,
+      y: death.y,
+      row: death.fallbackRow,
+      target: death.target,
+      t0: this.lastTime,
+    });
+    this.burst(death.x, death.y, ["#a83232", "#7c1f1f"], 12, 70);
+    if (death.target.startsWith('mob:')) {
+      const cue = this.visuals.mobSounds?.[death.target.slice(4)]?.death;
+      if (cue) this.onSound?.(cue, 0.7);
+    }
+  }
+
+  private animationFrame(target: string, state: EntityAnimationState, elapsedMs: number, seed: number, totalFrames: number): number {
+    const profile = this.visuals.animations?.[target];
+    const clip = profile?.clips?.[state] ?? profile?.clips?.idle;
+    if (clip?.keyframes?.length) {
+      const keyframes = clip.keyframes;
+      const totalMs = keyframes.reduce((sum, keyframe) => sum + Math.max(16, keyframe.durationMs), 0);
+      const shifted = Math.max(0, elapsedMs + (clip.loop === false ? 0 : seed * 17));
+      const phase = clip.loop === false ? Math.min(totalMs - 1, shifted) : shifted % totalMs;
+      let elapsed = 0;
+      let at = keyframes.length - 1;
+      for (let index = 0; index < keyframes.length; index++) {
+        elapsed += Math.max(16, keyframes[index].durationMs);
+        if (phase < elapsed) { at = index; break; }
+      }
+      const cycle = clip.loop === false ? 0 : Math.floor(shifted / totalMs);
+      const soundKey = `${target}:${state}:${seed}`;
+      const soundStep = `${cycle}:${at}`;
+      const previous = this.animationSoundSteps.get(soundKey);
+      if (previous !== soundStep) {
+        this.animationSoundSteps.set(soundKey, soundStep);
+        const cue = keyframes[at].soundId;
+        if (cue && (previous !== undefined || elapsedMs < keyframes[at].durationMs)) this.onSound?.(cue, 0.65);
+      }
+      return Math.max(0, Math.min(totalFrames - 1, keyframes[at].frame));
+    }
+    const sequence = clip?.frames?.length ? clip.frames : state === 'walk' ? [0, 1] : [0];
+    const phaseMs = clip?.loop === false ? elapsedMs : elapsedMs + seed * 17;
+    const step = Math.max(0, Math.floor(phaseMs / Math.max(16, clip?.frameMs ?? 125)));
+    const at = clip?.loop === false ? Math.min(sequence.length - 1, step) : step % sequence.length;
+    return Math.max(0, Math.min(totalFrames - 1, sequence[at] ?? 0));
+  }
+
+  private drawResourceSprite(ctx: CanvasRenderingContext2D, spriteId: string | undefined, x: number, y: number, shakeX: number): boolean {
+    const frame = spriteId ? this.visualFrames.get(spriteId)?.[0] : undefined;
+    if (!frame) return false;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(frame, x - frame.width + shakeX, y - frame.height * 2, frame.width * 2, frame.height * 2);
+    return true;
+  }
+
+  private drawWorldBlock(ctx: CanvasRenderingContext2D, blockId: string, x: number, y: number, rotation = 0) {
+    const block = this.visuals.blocks?.[blockId];
+    if (!block) return;
+    const frame = this.visualFrames.get(block.spriteId)?.[0];
+    if (frame) {
+      const width = frame.width * 2 * block.scale;
+      const height = frame.height * 2 * block.scale;
+      const quarterTurn = ((rotation % 4) + 4) % 4;
+      const renderedHeight = quarterTurn % 2 ? width : height;
+      ctx.imageSmoothingEnabled = false;
+      ctx.save();
+      ctx.translate(x, y - renderedHeight / 2 - block.offsetY);
+      ctx.rotate(quarterTurn * Math.PI / 2);
+      ctx.drawImage(frame, -width / 2, -height / 2, width, height);
+      ctx.restore();
+      return;
+    }
+    ctx.fillStyle = '#8f6c38'; ctx.fillRect(x - 13, y - 25, 26, 25);
+    ctx.strokeStyle = '#e1bb65'; ctx.strokeRect(x - 13, y - 25, 26, 25);
+    ctx.fillStyle = '#17130c'; ctx.font = '5px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(blockId.slice(0, 8).toUpperCase(), x, y - 11);
+  }
+
+  private drawEngineSprite(ctx: CanvasRenderingContext2D, target: string, state: EntityAnimationState, elapsedMs: number, seed: number, x: number, y: number): boolean {
+    const profile = this.visuals.animations?.[target];
+    const frames = profile ? this.visualFrames.get(profile.spriteId) : undefined;
+    if (!frames?.length) return false;
+    const frame = frames[this.animationFrame(target, state, elapsedMs, seed, frames.length)];
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(frame, x - frame.width, y - frame.height, frame.width * 2, frame.height * 2);
+    return true;
+  }
+
   private tileAt(x: number, y: number): number {
     if (x < 0 || y < 0 || x >= this.w || y >= this.h) return Tile.Tree;
     return this.tiles[y * this.w + x];
+  }
+
+  private terrainAt(x: number, y: number) {
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h) return undefined;
+    return this.visuals.terrain?.[this.terrainKinds[String(y * this.w + x)]];
   }
 
   /** Public read of the live tile map (used by the client for build validity). */
@@ -191,11 +348,21 @@ export class Renderer {
     const steps = Math.ceil(dist / 12);
     const sx = (x2 - x1) / steps;
     const sy = (y2 - y1) / steps;
-    for (let s = 1; s < steps; s++) {
+    const startTx = Math.floor(x1 / TILE); const startTy = Math.floor(y1 / TILE);
+    let previousElevation = this.elevations[startTy * this.w + startTx] ?? 0;
+    for (let s = 1; s <= steps; s++) {
       const tx = Math.floor((x1 + sx * s) / TILE);
       const ty = Math.floor((y1 + sy * s) / TILE);
       if (tx < 0 || ty < 0 || tx >= this.w || ty >= this.h) return false;
-      if (BLOCKS_BULLET[this.tiles[ty * this.w + tx]]) return false;
+      const elevation = this.elevations[ty * this.w + tx] ?? 0;
+      if (Math.abs(elevation - previousElevation) > 1) return false;
+      const index = ty * this.w + tx;
+      const block = this.visuals.blocks?.[this.blockKinds[String(index)]];
+      const openDoor = this.openDoors.has(index);
+      const tileBlocks = BLOCKS_BULLET[this.tiles[index]] && !(openDoor && this.tiles[index] === Tile.Door);
+      const blockBlocks = block?.collision.sight && !(openDoor && block.playerPlacement?.buildType === 'door');
+      if (s < steps && (tileBlocks || blockBlocks || this.visuals.terrain?.[this.terrainKinds[String(index)]]?.collision.sight)) return false;
+      previousElevation = elevation;
     }
     return true;
   }
@@ -274,8 +441,21 @@ export class Renderer {
   private prerender() {
     const ctx = this.mapCanvas.getContext("2d")!;
     ctx.imageSmoothingEnabled = false;
-    for (let ty = 0; ty < this.h; ty++)
-      for (let tx = 0; tx < this.w; tx++) this.drawBaseTile(ctx, tx, ty);
+    ctx.clearRect(0, 0, this.mapCanvas.width, this.mapCanvas.height);
+    for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) this.drawTerrainCell(ctx, tx, ty);
+    for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) this.drawFoundationLayer(ctx, tx, ty);
+
+    for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) {
+      const level = this.elevations[ty * this.w + tx] ?? 0;
+      if (!level) continue;
+      const x = tx * TILE; const y = ty * TILE;
+      ctx.fillStyle = `rgba(222,198,132,${level * .035})`; ctx.fillRect(x, y, TILE, TILE);
+      const south = ty + 1 < this.h ? this.elevations[(ty + 1) * this.w + tx] ?? 0 : 0;
+      const east = tx + 1 < this.w ? this.elevations[ty * this.w + tx + 1] ?? 0 : 0;
+      if (level > south) { const depth = Math.min(12, (level - south) * 4); ctx.fillStyle = `rgba(38,31,25,${Math.min(.75, .24 + (level - south) * .18)})`; ctx.fillRect(x, y + TILE - depth, TILE, depth); }
+      if (level > east) { ctx.fillStyle = 'rgba(35,30,24,.3)'; ctx.fillRect(x + TILE - 3, y, 3, TILE); }
+      ctx.fillStyle = 'rgba(242,224,170,.15)'; ctx.fillRect(x, y, TILE, 2);
+    }
 
     // safe-zone and hot-zone markers baked into the ground
     for (const poi of this.pois) {
@@ -293,9 +473,34 @@ export class Renderer {
     const mctx = this.miniCanvas.getContext("2d")!;
     for (let ty = 0; ty < this.h; ty++)
       for (let tx = 0; tx < this.w; tx++) {
-        mctx.fillStyle = MINI_COLORS[this.tileAt(tx, ty)] ?? "#000";
+        mctx.fillStyle = this.terrainAt(tx, ty)?.minimapColor ?? '#527741';
         mctx.fillRect(tx, ty, 1, 1);
+        const terrain = this.visuals.terrain?.[this.terrainKinds[String(ty * this.w + tx)]];
+        if (terrain) { mctx.fillStyle = terrain.minimapColor; mctx.fillRect(tx, ty, 1, 1); }
+        if (this.blockKinds[String(ty * this.w + tx)]) { mctx.fillStyle = '#b58b45'; mctx.fillRect(tx, ty, 1, 1); }
+        const level = this.elevations[ty * this.w + tx] ?? 0;
+        if (level) { mctx.fillStyle = `rgba(245,220,160,${level * .12})`; mctx.fillRect(tx, ty, 1, 1); }
       }
+  }
+
+  private drawTerrainCell(ctx: CanvasRenderingContext2D, tx: number, ty: number) {
+    const terrain = this.terrainAt(tx, ty);
+    ctx.clearRect(tx * TILE, ty * TILE, TILE, TILE);
+    ctx.fillStyle = terrain?.minimapColor ?? '#527741';
+    ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+    const frame = terrain ? this.visualFrames.get(terrain.spriteId)?.[0] : undefined;
+    if (frame) ctx.drawImage(frame, tx * TILE, ty * TILE, TILE, TILE);
+  }
+
+  private drawFoundationLayer(ctx: CanvasRenderingContext2D, tx: number, ty: number) {
+    const index = ty * this.w + tx;
+    const blockId = this.blockKinds[String(index)];
+    const block = this.visuals.blocks?.[blockId];
+    const under = this.unders.get(index);
+    const floorId = block?.playerPlacement?.foundation
+      ? blockId
+      : under === Tile.WoodFloor ? 'wood_floor' : under === Tile.StoneFloor ? 'stone_floor' : '';
+    if (floorId && this.visuals.blocks?.[floorId]) this.drawWorldBlock(ctx, floorId, tx * TILE + TILE / 2, ty * TILE + TILE, this.blockRotations[String(index)] ?? 0);
   }
 
   /** Base under a placed piece: the floor it was built on, else grass. */
@@ -439,9 +644,10 @@ export class Renderer {
     }
     const ctx = this.mapCanvas.getContext("2d")!;
     ctx.imageSmoothingEnabled = false;
-    this.drawBaseTile(ctx, tx, ty);
+    this.drawTerrainCell(ctx, tx, ty);
+    this.drawFoundationLayer(ctx, tx, ty);
     const mctx = this.miniCanvas.getContext("2d")!;
-    mctx.fillStyle = MINI_COLORS[tile] ?? "#000";
+    mctx.fillStyle = this.terrainAt(tx, ty)?.minimapColor ?? '#527741';
     mctx.fillRect(tx, ty, 1, 1);
     this.shakes.delete(i);
   }
@@ -556,6 +762,7 @@ export class Renderer {
           x: p.dx,
           y: p.dy,
           row: hashStr(p.name) % CHAR_ROWS.survivorCount,
+          target: 'player',
           t0: view.time,
         });
         this.burst(p.dx, p.dy, ["#a83232", "#7c1f1f"], 14, 80);
@@ -590,9 +797,14 @@ export class Renderer {
       const age = (view.time - c.t0) / 2;
       ctx.save();
       ctx.globalAlpha = 0.8 * (1 - age);
-      ctx.translate(c.x, c.y + 6);
-      ctx.rotate(Math.PI / 2);
-      this.blitChar(ctx, c.row, 0, -16, -16);
+      const custom = c.target
+        ? this.drawEngineSprite(ctx, c.target, 'death', (view.time - c.t0) * 1000, 0, c.x, c.y)
+        : false;
+      if (!custom) {
+        ctx.translate(c.x, c.y + 6);
+        ctx.rotate(Math.PI / 2);
+        this.blitChar(ctx, c.row, 0, -16, -16);
+      }
       ctx.restore();
     }
 
@@ -609,6 +821,7 @@ export class Renderer {
         const t = this.tileAt(tx, ty);
         if (t === Tile.Tree) {
           const i = ty * this.w + tx;
+          const resource = this.visuals.resources?.[this.resourceKinds[String(i)]];
           const cx = tx * TILE + TILE / 2;
           const by = ty * TILE + TILE - 2;
           const shakeAt = this.shakes.get(i);
@@ -620,10 +833,11 @@ export class Renderer {
           }
           drawables.push({
             y: by,
-            fn: () => this.drawTreeSprite(ctx, cx, by, 0, 1, shakeX),
+            fn: () => { if (!this.drawResourceSprite(ctx, resource?.spriteId, cx, by, shakeX)) this.drawTreeSprite(ctx, cx, by, 0, 1, shakeX); },
           });
         } else if (t === Tile.Rock || t === Tile.CopperOre || t === Tile.IronOre) {
           const i = ty * this.w + tx;
+          const resource = this.visuals.resources?.[this.resourceKinds[String(i)]];
           const dx = tx * TILE;
           const dy = ty * TILE;
           const col = t === Tile.Rock ? 12 : t === Tile.CopperOre ? 25 : 26;
@@ -636,7 +850,8 @@ export class Renderer {
           }
           drawables.push({
             y: dy + TILE - 4,
-            fn: () =>
+            fn: () => {
+              if (this.drawResourceSprite(ctx, resource?.spriteId, dx + TILE / 2, dy + TILE, shakeX)) return;
               ctx.drawImage(
                 this.sheets.tiles,
                 col * SPR,
@@ -647,8 +862,18 @@ export class Renderer {
                 dy,
                 TILE,
                 TILE,
-              ),
+              );
+            },
           });
+        }
+        const blockId = this.blockKinds[String(ty * this.w + tx)];
+        const block = this.visuals.blocks?.[blockId];
+        if (blockId && block && !block.playerPlacement?.foundation) {
+          const cx = tx * TILE + TILE / 2;
+          const by = ty * TILE + TILE;
+          const index = ty * this.w + tx;
+          const rotation = (this.blockRotations[String(index)] ?? 0) + (this.openDoors.has(index) && block.playerPlacement?.buildType === 'door' ? 1 : 0);
+          drawables.push({ y: by, fn: () => this.drawWorldBlock(ctx, blockId, cx, by, rotation) });
         }
       }
 
@@ -687,7 +912,7 @@ export class Renderer {
     for (const e of view.enemies)
       drawables.push({
         y: e.dy + 14,
-        fn: () => this.drawEnemy(ctx, e, view.time),
+        fn: () => this.drawEnemy(ctx, e, view),
       });
 
     drawables.sort((a, b) => a.y - b.y);
@@ -768,7 +993,14 @@ export class Renderer {
       const col = tileSpriteCol(view.ghost.tile);
       ctx.save();
       ctx.globalAlpha = 0.55;
-      if (col >= 0) this.blitTile(ctx, col, gx, gy);
+      if (view.ghost.blockId && this.visuals.blocks?.[view.ghost.blockId]) this.drawWorldBlock(ctx, view.ghost.blockId, gx + TILE / 2, gy + TILE, view.ghost.rotation);
+      else if (col >= 0) {
+        ctx.save();
+        ctx.translate(gx + TILE / 2, gy + TILE / 2);
+        ctx.rotate(view.ghost.rotation * Math.PI / 2);
+        this.blitTile(ctx, col, -TILE / 2, -TILE / 2);
+        ctx.restore();
+      }
       ctx.globalAlpha = 0.35;
       ctx.fillStyle = view.ghost.valid ? "#3ad46a" : "#d43a3a";
       ctx.fillRect(gx, gy, TILE, TILE);
@@ -975,6 +1207,9 @@ export class Renderer {
 
   private drawContainer(ctx: CanvasRenderingContext2D, c: ContainerSnap) {
     const { x, y } = c;
+    const tx = Math.floor(x / TILE); const ty = Math.floor(y / TILE);
+    const block = this.visuals.blocks?.[this.blockKinds[String(ty * this.w + tx)]];
+    if (c.kind === 'storage' && block?.playerPlacement?.buildType === 'chest') return;
     ctx.save();
     if (c.looted) ctx.globalAlpha = 0.7;
     if (c.kind === "chest") {
@@ -1098,12 +1333,13 @@ export class Renderer {
     moving: boolean,
     time: number,
     seed: number,
+    frameOverride?: number,
   ) {
     ctx.fillStyle = "rgba(0,0,0,0.3)";
     ctx.beginPath();
     ctx.ellipse(x, y + 14, 9, 3.5, 0, 0, Math.PI * 2);
     ctx.fill();
-    const frame = moving ? Math.floor(time * 8 + seed) % 2 : 0;
+    const frame = frameOverride ?? (moving ? Math.floor(time * 8 + seed) % 2 : 0);
     const bob = moving ? Math.abs(Math.sin(time * 10 + seed)) * 1.5 : 0;
     this.blitChar(ctx, row, frame, x - 16, y - 16 - bob);
     return bob;
@@ -1116,16 +1352,36 @@ export class Renderer {
     view: WorldView,
   ) {
     const seed = hashStr(p.name);
-    const row = p.look !== undefined ? p.look % CHAR_ROWS.survivorCount : seed % CHAR_ROWS.survivorCount;
+    const appearance = p.appearance ?? {
+      ...DEFAULT_CHARACTER_APPEARANCE,
+      outfit: p.look !== undefined ? p.look % CHAR_ROWS.survivorCount : seed % CHAR_ROWS.survivorCount,
+    };
+    const row = appearance.outfit % CHAR_ROWS.survivorCount;
     const swingPhase =
       p.swing > 0 && view.serverNow - p.swing < 400
         ? Math.min(1, (view.serverNow - p.swing) / 400)
         : null;
+    const playerHitElapsed = p.hitAt ? view.serverNow - p.hitAt : Infinity;
+    const playerAttackElapsed = p.attackAt ? view.serverNow - p.attackAt : swingPhase !== null ? view.serverNow - p.swing : Infinity;
+    const playerState: EntityAnimationState = playerHitElapsed < 300 ? 'hit' : playerAttackElapsed < 700 ? 'attack' : p.moving ? 'walk' : 'idle';
+    const playerElapsed = playerState === 'hit' ? playerHitElapsed : playerState === 'attack' ? playerAttackElapsed : view.time * 1000;
+    const fallbackFrame = this.animationFrame('player', playerState, playerElapsed, seed, 2);
+    const drawFacing = (draw: () => void) => {
+      ctx.save();
+      if (Math.cos(p.facing ?? p.angle) < 0) { ctx.translate(p.dx * 2, 0); ctx.scale(-1, 1); }
+      draw();
+      ctx.restore();
+    };
 
     // swimming: half-submerged sprite + ripples instead of the normal body
-    const swimming =
-      this.tileAt(Math.floor(p.dx / TILE), Math.floor(p.dy / TILE)) ===
-      Tile.Water;
+    const playerTx = Math.floor(p.dx / TILE);
+    const playerTy = Math.floor(p.dy / TILE);
+    const authoredTerrain = this.terrainAt(playerTx, playerTy);
+    const swimming = this.tileAt(playerTx, playerTy) === Tile.Water || Boolean(authoredTerrain?.swimmable);
+    if (isYou && p.moving && !swimming && authoredTerrain?.footstepSound && view.serverNow - this.lastTerrainFootstepAt >= 340) {
+      this.lastTerrainFootstepAt = view.serverNow;
+      this.onSound?.(authoredTerrain.footstepSound, 0.35);
+    }
     if (swimming) {
       ctx.save();
       ctx.strokeStyle = "rgba(220,235,245,0.5)";
@@ -1144,14 +1400,29 @@ export class Renderer {
       ctx.beginPath();
       ctx.rect(p.dx - 16, p.dy - 16, 32, 22); // clip below the waterline
       ctx.clip();
-      const frame = p.moving ? Math.floor(view.time * 6 + seed) % 2 : 0;
-      this.blitChar(ctx, row, frame, p.dx - 16, p.dy - 16);
+      drawFacing(() => {
+        const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, p.dx, p.dy);
+        if (!custom) {
+          this.blitChar(ctx, row, fallbackFrame, p.dx - 16, p.dy - 16);
+          drawCharacterAppearance(ctx, appearance, p.dx - 16, p.dy - 16, 2, Boolean(p.helmet));
+        }
+      });
       ctx.restore();
       // nameplate still renders below
     }
-    const bob = swimming
-      ? 0
-      : this.drawShadowAndSprite(ctx, p.dx, p.dy, row, p.moving, view.time, seed);
+    let bob = 0;
+    if (!swimming) {
+      bob = p.moving ? Math.abs(Math.sin(view.time * 10 + seed)) * 1.5 : 0;
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      ctx.beginPath(); ctx.ellipse(p.dx, p.dy + 14, 9, 3.5, 0, 0, Math.PI * 2); ctx.fill();
+      drawFacing(() => {
+        const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, p.dx, p.dy - bob);
+        if (!custom) {
+          this.blitChar(ctx, row, fallbackFrame, p.dx - 16, p.dy - 16 - bob);
+          drawCharacterAppearance(ctx, appearance, p.dx - 16, p.dy - 16 - bob, 2, Boolean(p.helmet));
+        }
+      });
+    }
 
     // armor overlays
     if (!swimming && p.helmet) {
@@ -1202,9 +1473,22 @@ export class Renderer {
   private drawEnemy(
     ctx: CanvasRenderingContext2D,
     e: RenderEnemy,
-    time: number,
+    view: WorldView,
   ) {
+    const time = view.time;
     const seed = hashStr(e.id);
+    const attackElapsed = e.attackAt ? view.serverNow - e.attackAt : Infinity;
+    const hitElapsed = e.hitAt ? view.serverNow - e.hitAt : Infinity;
+    const state: EntityAnimationState = hitElapsed < 300 ? 'hit' : attackElapsed < 700 ? 'attack' : e.moving ? 'walk' : 'idle';
+    const elapsed = state === 'hit' ? hitElapsed : state === 'attack' ? attackElapsed : time * 1000;
+    const previousSoundState = this.entitySoundStates.get(e.id);
+    if (previousSoundState !== state) {
+      this.entitySoundStates.set(e.id, state);
+      const soundAction = state === 'attack' ? 'attack' : state === 'hit' ? 'hit' : state === 'idle' && previousSoundState === undefined ? undefined : state === 'idle' ? 'idle' : undefined;
+      const cue = soundAction ? this.visuals.mobSounds?.[e.kind]?.[soundAction] : undefined;
+      if (cue) this.onSound?.(cue, 0.55);
+    }
+    const custom = this.drawEngineSprite(ctx, `mob:${e.kind}`, state, elapsed, seed, e.dx, e.dy);
     const ANIMAL_ROWS: Partial<Record<string, number>> = {
       deer: CHAR_ROWS.deer,
       rabbit: CHAR_ROWS.rabbit,
@@ -1212,7 +1496,7 @@ export class Renderer {
       wolf: CHAR_ROWS.wolf,
     };
     const animalRow = ANIMAL_ROWS[e.kind];
-    if (animalRow !== undefined) {
+    if (!custom && animalRow !== undefined) {
       // quadruped: flip toward its heading so it runs the right way
       ctx.save();
       ctx.translate(e.dx, e.dy);
@@ -1221,10 +1505,10 @@ export class Renderer {
       ctx.beginPath();
       ctx.ellipse(0, 13, e.kind === "rabbit" ? 6 : 10, 3, 0, 0, Math.PI * 2);
       ctx.fill();
-      const frame = e.moving ? Math.floor(time * (e.kind === "rabbit" ? 14 : 10) + seed) % 2 : 0;
+      const frame = this.animationFrame(`mob:${e.kind}`, state, elapsed, seed, 2);
       this.blitChar(ctx, animalRow, frame, -16, -16);
       ctx.restore();
-    } else {
+    } else if (!custom) {
       this.drawShadowAndSprite(
         ctx,
         e.dx,
@@ -1233,6 +1517,7 @@ export class Renderer {
         e.moving,
         e.kind === "zombie" ? time * 0.7 : time,
         seed,
+        this.animationFrame(`mob:${e.kind}`, state, elapsed, seed, 2),
       );
     }
     if (e.kind === "military")

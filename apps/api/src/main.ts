@@ -1,12 +1,14 @@
 import 'dotenv/config';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { corsOrigins } from './config/cors';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-  app.enableCors({ origin: process.env.CORS_ORIGIN ?? 'http://localhost:3000' });
+  app.enableCors({ origin: corsOrigins() });
+  app.enableShutdownHooks();
   const port = Number(process.env.PORT ?? 3001);
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
   console.log(`[holdout-api] listening on http://localhost:${port}`);
 }
 bootstrap();

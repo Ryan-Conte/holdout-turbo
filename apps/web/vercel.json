@@ -1,0 +1,6 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "cd ../.. && npx prisma generate && npx turbo run build --filter=@holdout/web",
+  "outputDirectory": ".next"
+}

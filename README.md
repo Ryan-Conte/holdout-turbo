@@ -30,10 +30,24 @@ Both apps read env files that are already set up for local dev:
 
 Tables (`users`, `players`) are created automatically on first use.
 
+## Admin game engine
+
+Admins open `/admin/map`; legacy `/editor` redirects there. The engine includes draft/publish map authoring with zoom and sprite preview, content documents for mobs, items, recipes, loot, traders and blocks, plus a DB-backed pixel editor. Access is controlled by `profiles.admin`; `ADMIN_EMAILS` only bootstraps that flag.
+
+After applying the Prisma schema, seed current definitions without overwriting edits:
+
+```bash
+npm run seed:engine
+```
+
+See `docs/ENGINE.md` for publishing behavior and runtime coverage.
+
+Production deployment is configured for Vercel (`apps/web`) plus independently addressable Render game servers (`apps/api`). See `docs/DEPLOYMENT.md` before applying the Render Blueprint.
+
 ## How to play
 
-1. Register / log in — you're deployed into a procedurally generated map with named POIs: a **town** (zombie-infested), **Redfield Airport** (runway, hangars and supply crates guarded by military riflemen), scattered farms, lakes, roads, rock fields and forests.
-2. **WASD** move · **mouse** aim & attack · **E** interact · **Q** quick-heal · **1-5** hotbar · **TAB** inventory · **C** crafting · **M** mute · **ESC** close panels.
+1. Register / log in, build your survivor on the separate pre-deploy customization screen, choose a server, then deploy to your hideout.
+2. **WASD** move · **SHIFT** sprint · **mouse** aim & attack · **E** interact · **Q** quick-heal · **1-5** hotbar · **TAB** inventory · **C** crafting · **M** mute · **ESC** close panels. Emptying stamina causes a longer regeneration delay and locks sprint until you recover.
 3. **Harvesting:** punch trees for wood and rocks for stone with your bare fists (slow), or craft a **hatchet** / **pickaxe** for 3× yield. Nodes break after enough hits and regrow a few minutes later — for everyone, it's one shared world.
 4. **Enemies:** zombies chase and claw; military guards keep their distance and fire rifle bursts (gunfire aggros nearby enemies). Both drop loot bags — military can drop the **Vanguard Rifle**.
 5. Inventory is slot + weight based (kg). Find or craft **backpack upgrades** to carry more (12 slots/20 kg → 16/32 → 20/45).

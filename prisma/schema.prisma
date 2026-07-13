@@ -98,9 +98,26 @@ model GameMap {
   name      String
   data      Json
   active    Boolean  @default(false)
+  draft     Boolean  @default(false)
   updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
 
   @@map("maps")
+}
+
+// Versioned game-engine documents. Runtime systems use published; the admin
+// studio writes draft first so incomplete changes never leak into live play.
+model GameContent {
+  id                Int       @id @default(autoincrement())
+  kind              String    @unique
+  draft             Json
+  published         Json?
+  revision          Int       @default(1)
+  publishedRevision Int       @default(0) @map("published_revision")
+  updatedBy         String?   @map("updated_by")
+  updatedAt         DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+  publishedAt       DateTime? @map("published_at") @db.Timestamptz(6)
+
+  @@map("game_content")
 }
 
 model Quest {

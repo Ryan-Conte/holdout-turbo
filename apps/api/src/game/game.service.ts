@@ -25,7 +25,6 @@ import {
   COPPER_CHANCE,
   DAY_LENGTH_MS,
   EMPTY_SKILLS,
-  ENEMY_DEFS,
   EV,
   EXTRACT_TIME_MS,
   IRON_CHANCE,
@@ -66,8 +65,9 @@ import {
   REGEN_THRESHOLD,
   STARTING_MONEY,
   SPRINT_DRAIN_PER_S,
-  SPRINT_MIN,
   SPRINT_SPEED_MULT,
+  STAMINA_EXHAUSTED_RECOVERY,
+  STAMINA_EXHAUSTED_REGEN_DELAY_MS,
   STAMINA_MAX,
   STAMINA_REGEN_DELAY_MS,
   STAMINA_REGEN_PER_S,
@@ -78,7 +78,6 @@ import {
   StationOpen,
   TICK_MS,
   TILE,
-  TRADER_TIER_STOCK,
   TraderTier,
   Tile,
   WeaponStats,
@@ -88,138 +87,20 @@ import {
   invWeight,
   skillLevel,
 } from '@holdout/shared';
-import { DbService, HideoutData, QuestProg } from '../db/db.service';
-import { ChestTier, GeneratedMap, fromAuthored, generateMap, mulberry32 } from './mapgen';
-import { rollChest, rollEnemyDrop, rollGround } from './loot';
-
-interface ServerPlayer {
-  sid: string;
-  userId: string;
-  name: string;
-  instanceId: string;
-  x: number;
-  y: number;
-  angle: number;
-  hp: number;
-  dead: boolean;
-  moving: boolean;
-  input: InputPayload;
-  inv: Inventory;
-  equipment: Equipment;
-  equipped: number | null;
-  money: number;
-  skills: Skills;
-  quests: Record<string, QuestProg>;
-  hunger: number;
-  thirst: number;
-  stamina: number;
-  lastExertAt: number; // ms of last stamina drain — regen waits a beat after
-  starveAcc: number;
-  regenAcc: number;
-  lastPushedSurvival: number; // floor(hunger)*1000 + floor(thirst), change-detect
-  lastStaminaBucket: number; // change-detect for the stamina bar (coarse, to limit pushes)
-  action: { kind: 'loot' | 'fish' | 'drink' | 'fill' | 'cook' | 'extract' | 'craft'; until: number; data?: { id?: string; slot?: number } } | null;
-  actionStart: { x: number; y: number };
-  mags: Partial<Record<ItemId, number>>;
-  reloadUntil: number;
-  reloadTarget: ItemId | null;
-  lastAttackAt: number;
-  lastSwingAt: number;
-  kills: number;
-  deaths: number;
-  openContainer: string | null;
-  returnPos: { x: number; y: number } | null;
-  ignoreInteractUntil: number; // swallow held-E repeats right after an instance switch
-  loggedOutAt: number | null; // combat-log: body lingers in the world, killable, for a bit
-  lastStationMask: number; // change-detect for near-station flags so the UI is never stale
-  armorDur: Partial<Record<'helmet' | 'vest', number>>; // current durability of worn armor
-  look: number; // chosen character sprite row (0..survivorCount-1)
-}
-
-interface Enemy {
-  id: string;
-  kind: EnemyKind;
-  x: number;
-  y: number;
-  angle: number;
-  hp: number;
-  maxHp: number;
-  homeX: number;
-  homeY: number;
-  targetSid: string | null;
-  nextAttackAt: number;
-  burstLeft: number;
-  nextBurstShotAt: number;
-  wanderAngle: number;
-  nextWanderAt: number;
-  wandering: boolean;
-  moving: boolean;
-  detourUntil: number;
-  detourAngle: number;
-  enraged: boolean; // damaged animals keep chasing well past their neutral aggro radius
-  lastSeenAt: number; // sight memory — when the target was last in line of sight
-  lastSeenX: number; // …and where; hidden targets are hunted at this spot only
-  lastSeenY: number;
-}
-
-interface Container {
-  id: string;
-  x: number;
-  y: number;
-  kind: 'chest' | 'bag' | 'crate' | 'storage';
-  tier: ChestTier;
-  slots: InvSlot[];
-  restockAt: number | null;
-}
-
-interface GroundItem { id: string; x: number; y: number; item: ItemId; qty: number }
-
-interface Projectile {
-  id: number;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  angle: number;
-  traveled: number;
-  range: number;
-  damage: number;
-  owner: string;
-  ownerKind: EnemyKind | null;
-  weapon: ItemId | null;
-}
-
-interface Instance {
-  id: string;
-  kind: InstanceKind;
-  name: string;
-  ownerId: string | null;
-  seed: number;
-  w: number;
-  h: number;
-  tiles: Uint8Array;
-  pois: PoiSnap[];
-  traders: { x: number; y: number; tier?: TraderTier }[];
-  extracts: { x: number; y: number }[];
-  exit: { x: number; y: number } | null;
-  spawns: { x: number; y: number }[];
-  lootSpots: { x: number; y: number }[];
-  containers: Map<string, Container>;
-  ground: Map<string, GroundItem>;
-  enemies: Map<string, Enemy>;
-  unders: Map<number, number>; // floor tile beneath player-built stations (render + restore)
-  projectiles: Projectile[];
-  nodeHits: Map<number, number>;
-  nodeRespawns: { i: number; tile: number; at: number }[];
-  enemyRespawns: { x: number; y: number; kind: EnemyKind; at: number }[];
-  lastGroundSpawn: number;
-  players: number; // live count, for hideout GC
-  hideout?: HideoutData; // persistence backing for hideout instances
-  structures: Map<number, { type: BuildType; hp: number; expiresAt: number; under?: number }>; // world-placed, tile-indexed
-}
+import { DbService, QuestProg } from '../db/db.service';
+import { ContentService } from './content.service';
+import { ChestTier, GeneratedMap, fromAuthored, generateMap, mulberry32, resourceKindsFromTiles, terrainKindsFromTiles } from './mapgen';
+import { rollChest, rollEnemyDrop, rollGround, rollNamed } from './loot';
+import type {
+  Enemy,
+  GameContainer as Container,
+  GameInstance as Instance,
+  GroundItem,
+  Projectile,
+  ServerPlayer,
+} from './game.types';
 
 const ENEMY_RADIUS = 12;
-const ENEMY_RESPAWN_MS = 90_000;
 const WORLD = 'world';
 const LOS_MEMORY_MS = 12_000; // how long an enemy keeps hunting a target it can't see
 const LOS_GIVE_UP_MS = 2500; // …but once it reaches your last-seen spot, it gives up fast
@@ -238,10 +119,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   private tickTimer: NodeJS.Timeout;
   private saveTimer: NodeJS.Timeout;
   private questTimer: NodeJS.Timeout;
+  private mapTimer: NodeJS.Timeout;
+  private activeMapId: number | null = null;
+  private lastVisualsVersion = 0;
   private lastTick = Date.now();
   private quests: QuestDef[] = [];
 
-  constructor(private readonly db: DbService) {}
+  constructor(private readonly db: DbService, private readonly content: ContentService) {}
 
   async onModuleInit() {
     this.quests = await this.db.loadQuests().catch(() => []);
@@ -249,12 +133,16 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.questTimer = setInterval(() => {
       void this.db.loadQuests().then((q) => (this.quests = q)).catch(() => undefined);
     }, 60_000);
-    const authored = await this.db.loadActiveMap().catch(() => null);
+    const mapRevision = await this.db.loadActiveMapRevision().catch(() => null);
+    const authored = mapRevision?.data ?? null;
+    this.activeMapId = mapRevision?.id ?? null;
     const gen = authored ? fromAuthored(authored) : generateMap();
     const world = this.makeInstance(WORLD, 'world', authored ? 'Authored Zone' : 'The Exclusion Zone', null, gen);
     this.instances.set(WORLD, world);
     this.tickTimer = setInterval(() => this.tick(), TICK_MS);
     this.saveTimer = setInterval(() => this.saveAll(), 30_000);
+    this.lastVisualsVersion = this.content.visualsVersion;
+    this.mapTimer = setInterval(() => { void this.refreshPublishedMap(); this.refreshPublishedVisuals(); }, 10_000);
     this.log.log(
       `World ready (${authored ? 'authored map' : `procedural seed ${gen.seed}`}) — ${world.containers.size} containers, ${world.enemies.size} enemies, POIs: ${gen.pois.map((p) => p.name).join(', ') || 'none'}`,
     );
@@ -264,13 +152,33 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     clearInterval(this.tickTimer);
     clearInterval(this.saveTimer);
     clearInterval(this.questTimer);
+    clearInterval(this.mapTimer);
     return this.saveAll();
+  }
+
+  private async refreshPublishedMap() {
+    const revision = await this.db.loadActiveMapRevision();
+    if (!revision || revision.id === this.activeMapId) return;
+    const current = this.instances.get(WORLD);
+    if (current && current.players > 0) return;
+    const gen = fromAuthored(revision.data);
+    const world = this.makeInstance(WORLD, 'world', 'Authored Zone', null, gen);
+    this.instances.set(WORLD, world);
+    this.activeMapId = revision.id;
+    this.log.log(`Published map #${revision.id} loaded (${world.w}x${world.h})`);
+  }
+
+  private refreshPublishedVisuals() {
+    if (!this.io || this.content.visualsVersion === this.lastVisualsVersion) return;
+    this.lastVisualsVersion = this.content.visualsVersion;
+    this.io.emit(EV.visuals, this.content.visuals);
+    this.log.log(`Published visuals r${this.lastVisualsVersion} pushed to connected clients`);
   }
 
   private saveProfileOf(p: ServerPlayer) {
     return this.db.saveProfile(
       p.userId, p.inv, p.equipment, p.skills, p.quests, p.money, p.kills, p.deaths,
-      Math.round(p.hunger), Math.round(p.thirst), p.armorDur, p.look,
+      Math.round(p.hunger), Math.round(p.thirst), p.armorDur, p.appearance,
     );
   }
 
@@ -329,6 +237,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       w: gen.w,
       h: gen.h,
       tiles: gen.tiles,
+      elevations: gen.elevations,
+      terrainKinds: gen.terrainKinds,
+      resourceKinds: gen.resourceKinds,
+      blockKinds: gen.blockKinds,
+      blockRotations: gen.blockRotations,
+      openDoors: new Set(),
       pois: gen.pois,
       traders: gen.traders,
       extracts: gen.extracts,
@@ -341,6 +255,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       unders: new Map(),
       projectiles: [],
       nodeHits: new Map(),
+      blockHp: new Map(),
       nodeRespawns: [],
       enemyRespawns: [],
       lastGroundSpawn: 0,
@@ -359,12 +274,15 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         id: cid, x: spot.x, y: spot.y,
         kind: onTarmac ? 'crate' : 'chest',
         tier,
-        slots: rollChest(this.rnd, tier),
+        slots: spot.lootTable
+          ? rollNamed(this.rnd, spot.lootTable, this.content.lootTables)
+          : rollChest(this.rnd, tier, this.content.lootTables),
         restockAt: null,
+        lootTable: spot.lootTable,
       });
     }
     for (const spot of gen.lootSpots) this.spawnGroundAt(inst, spot.x, spot.y);
-    for (const s of gen.enemySpawns) this.spawnEnemy(inst, s.x, s.y, s.kind);
+    for (const s of gen.enemySpawns) this.spawnEnemy(inst, s.x, s.y, s.kind, s.respawnMs);
     return inst;
   }
 
@@ -377,8 +295,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const W = HIDEOUT_W;
     const H = HIDEOUT_H;
     const tiles = new Uint8Array(W * H).fill(Tile.Grass);
-    for (let x = 0; x < W; x++) { tiles[x] = Tile.Tree; tiles[(H - 1) * W + x] = Tile.Tree; }
-    for (let y = 0; y < H; y++) { tiles[y * W] = Tile.Tree; tiles[y * W + W - 1] = Tile.Tree; }
+    for (let x = 0; x < W; x++) { tiles[x] = Tile.Cliff; tiles[(H - 1) * W + x] = Tile.Cliff; }
+    for (let y = 0; y < H; y++) { tiles[y * W] = Tile.Cliff; tiles[y * W + W - 1] = Tile.Cliff; }
     const exitTx = Math.floor(W / 2);
     tiles[(H - 2) * W + exitTx] = Tile.DoorMat;
 
@@ -397,6 +315,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       w: W,
       h: H,
       tiles,
+      elevations: new Uint8Array(W * H),
+      resourceKinds: resourceKindsFromTiles(tiles),
+      terrainKinds: terrainKindsFromTiles(tiles),
+      blockKinds: {},
+      blockRotations: {},
+      openDoors: new Set(),
       pois: [],
       traders: [],
       extracts: [],
@@ -409,6 +333,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       unders: new Map(),
       projectiles: [],
       nodeHits: new Map(),
+      blockHp: new Map(),
       nodeRespawns: [],
       enemyRespawns: [],
       lastGroundSpawn: 0,
@@ -431,8 +356,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     for (const o of hideout.objects) {
       if (o.tx < 1 || o.ty < 1 || o.tx >= W - 1 || o.ty >= H - 1) continue;
       const b = BUILDABLES[o.type];
+      const i = o.ty * W + o.tx;
+      const engineBlock = this.content.playerBlock(o.type);
+      if (engineBlock) {
+        inst.blockKinds[String(i)] = engineBlock.id;
+        const rotation = ((Number(o.rotation) | 0) % 4 + 4) % 4;
+        if (rotation) inst.blockRotations[String(i)] = rotation;
+      }
       if (b?.tile) {
-        const i = o.ty * W + o.tx;
         if (FLOOR_TILES[tiles[i]]) inst.unders.set(i, tiles[i]);
         tiles[i] = b.tile;
       }
@@ -505,6 +436,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       exit: inst.exit,
       ownHideout: inst.kind === 'hideout' && inst.ownerId === this.players.get(sid)?.userId,
       unders: Object.fromEntries(inst.unders),
+      elevations: Array.from(inst.elevations),
+      terrainKinds: inst.terrainKinds,
+      resourceKinds: inst.resourceKinds,
+      blockKinds: inst.blockKinds,
+      blockRotations: inst.blockRotations,
+      openDoors: [...inst.openDoors],
+      visuals: this.content.visuals,
       you: sid,
     };
   }
@@ -554,7 +492,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       return this.initFor(inst, sid);
     }
 
-    const row = await this.db.loadProfile(userId);
+    const [row, appearance] = await Promise.all([
+      this.db.loadProfile(userId),
+      this.db.loadAppearance(userId),
+    ]);
     let inv: Inventory;
     let equipment: Equipment = { helmet: null, vest: null, mod: null };
     let money = STARTING_MONEY;
@@ -592,6 +533,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       x: spawn.x,
       y: spawn.y,
       angle: 0,
+      facing: 0,
       hp: PLAYER_MAX_HP,
       dead: false,
       moving: false,
@@ -605,17 +547,20 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       hunger,
       thirst,
       stamina: STAMINA_MAX,
+      staminaExhausted: false,
       lastExertAt: 0,
       starveAcc: 0,
       regenAcc: 0,
       lastPushedSurvival: -1,
       lastStaminaBucket: -1,
+      lastPushedStaminaExhausted: false,
       action: null,
       actionStart: { x: spawn.x, y: spawn.y },
       mags: {},
       reloadUntil: 0,
       reloadTarget: null,
       lastAttackAt: 0,
+      lastHitAt: 0,
       lastSwingAt: 0,
       kills,
       deaths,
@@ -625,7 +570,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       loggedOutAt: null,
       lastStationMask: -1,
       armorDur: (row?.armorDur as ServerPlayer['armorDur']) ?? {},
-      look: typeof row?.look === 'number' ? row.look : 0,
+      appearance: row?.appearance ?? appearance,
     };
     this.players.set(sid, p);
     home.players++;
@@ -693,12 +638,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       shoot: !!input.shoot,
       sprint: !!input.sprint,
     };
-    p.angle = p.input.angle;
   }
 
   interact(sid: string) {
     const p = this.players.get(sid);
     if (!p || p.dead || Date.now() < p.ignoreInteractUntil) return;
+    p.angle = p.input.angle;
+    p.facing = p.input.angle;
     const inst = this.inst(p);
 
     // hideout exit mat
@@ -874,7 +820,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         void this.extractHome(p);
         break;
       case 'craft': {
-        const recipe = RECIPES.find((r) => r.id === act.data?.id);
+        const recipe = this.content.recipes.find((r) => r.id === act.data?.id);
         // re-validate — materials may have moved while the bar filled
         if (recipe && this.craftChecks(p, recipe)) this.doCraft(p, inst, recipe);
         break;
@@ -1189,7 +1135,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   craft(sid: string, recipeId: string) {
     const p = this.players.get(sid);
     if (!p || p.dead || p.action) return;
-    const recipe = RECIPES.find((r) => r.id === recipeId);
+    const recipe = this.content.recipes.find((r) => r.id === recipeId);
     if (!recipe) return;
     if (!this.craftChecks(p, recipe)) return;
     this.startAction(p, 'craft', `Crafting ${ITEMS[recipe.out.id].name}…`, CRAFT_TIME_MS, { id: recipeId });
@@ -1225,7 +1171,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Place a placeable KIT item from an inventory slot at a tile. */
-  build(sid: string, slot: number, tx: number, ty: number) {
+  build(sid: string, slot: number, tx: number, ty: number, rotation = 0) {
     const p = this.players.get(sid);
     if (!p || p.dead) return;
     if (slot < 0 || slot >= p.inv.slots.length) return;
@@ -1244,7 +1190,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     }
     const buildable = BUILDABLES[type];
     if (!buildable) return;
-    if (!inHideout && buildable.hideoutOnly) {
+    const engineBlock = this.content.playerBlock(type);
+    const hideoutOnly = engineBlock?.playerPlacement?.hideoutOnly ?? Boolean(buildable.hideoutOnly);
+    if (!inHideout && hideoutOnly) {
       this.toast(sid, `${buildable.name} can only be placed in your camp`);
       return;
     }
@@ -1260,6 +1208,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const i = ty * inst.w + tx;
+    rotation = ((rotation | 0) % 4 + 4) % 4;
     const targetTile = inst.tiles[i];
     const isFloorPiece = type === 'wood_floor' || type === 'stone_floor';
     // floors go on grass; everything else can also sit ON a floor (Minecraft-style layering)
@@ -1293,15 +1242,27 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (under !== undefined) inst.unders.set(i, under);
       inst.tiles[i] = buildable.tile;
       this.io?.to(inst.id).emit(EV.tile, { i, tile: buildable.tile, under });
+      if (engineBlock) {
+        inst.blockKinds[String(i)] = engineBlock.id;
+        if (rotation) inst.blockRotations[String(i)] = rotation;
+        else delete inst.blockRotations[String(i)];
+        this.io?.to(inst.id).emit(EV.block, { i, blockId: engineBlock.id, rotation, open: false });
+      }
       if (inHideout && inst.hideout) {
-        inst.hideout.objects.push({ type, tx, ty });
+        inst.hideout.objects.push({ type, tx, ty, ...(rotation ? { rotation } : {}) });
         if (type === 'bed') this.syncHideoutSpawn(inst); // your spawn follows your bed
         this.persistHideout(inst);
       } else {
-        inst.structures.set(i, { type, hp: buildable.hp, expiresAt: Date.now() + WORLD_STRUCTURE_TTL_MS, under });
+        inst.structures.set(i, { type, hp: engineBlock?.maxHp ?? buildable.hp, expiresAt: Date.now() + WORLD_STRUCTURE_TTL_MS, under });
       }
     } else if (inHideout && inst.hideout) {
-      inst.hideout.objects.push({ type, tx, ty, slots: new Array<InvSlot>(HIDEOUT_STORAGE_SLOTS).fill(null) });
+      inst.hideout.objects.push({ type, tx, ty, ...(rotation ? { rotation } : {}), slots: new Array<InvSlot>(HIDEOUT_STORAGE_SLOTS).fill(null) });
+      if (engineBlock) {
+        inst.blockKinds[String(i)] = engineBlock.id;
+        if (rotation) inst.blockRotations[String(i)] = rotation;
+        else delete inst.blockRotations[String(i)];
+        this.io?.to(inst.id).emit(EV.block, { i, blockId: engineBlock.id, rotation, open: false });
+      }
       this.syncHideoutContainers(inst);
       this.persistHideout(inst);
     }
@@ -1352,7 +1313,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   setLook(sid: string, look: number) {
     const p = this.players.get(sid);
     if (!p) return;
-    p.look = ((look | 0) % 8 + 8) % 8;
+    p.appearance = { ...p.appearance, outfit: ((look | 0) % 8 + 8) % 8 };
     this.pushInventory(p);
     void this.saveProfileOf(p);
   }
@@ -1399,7 +1360,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       inst.unders.delete(i);
       inst.tiles[i] = restore;
       this.io?.to(inst.id).emit(EV.tile, { i, tile: restore });
-    }
+      this.restorePlayerBlockVisual(inst, i, restore);
+    } else this.restorePlayerBlockVisual(inst, ty * inst.w + tx, this.tileUnder(inst, (tx + .5) * TILE, (ty + .5) * TILE));
     this.syncHideoutContainers(inst);
     if (obj.type === 'bed') this.syncHideoutSpawn(inst);
     this.persistHideout(inst);
@@ -1419,8 +1381,55 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       inst.unders.delete(i);
       inst.tiles[i] = restore;
       this.io?.to(inst.id).emit(EV.tile, { i, tile: restore });
+      this.restorePlayerBlockVisual(inst, i, restore);
     }
     return true;
+  }
+
+  private damageWorldBlock(inst: Instance, i: number, dmg: number): boolean {
+    const blockId = inst.blockKinds[String(i)];
+    const block = this.content.block(blockId);
+    if (!block) return false;
+    const x = (i % inst.w) * TILE + TILE / 2;
+    const y = Math.floor(i / inst.w) * TILE + TILE / 2;
+    // Main-world map geometry is protected. Player-built structures are
+    // registered in inst.structures and are handled by damageStructure first.
+    if (inst.kind === 'world' && !inst.structures.has(i)) {
+      inst.blockHp.delete(i);
+      this.hitFx(inst, x, y, 0, 'node', 'stone', block.hitSound);
+      return true;
+    }
+    if (!block.destructible) {
+      this.hitFx(inst, x, y, 0, 'node', 'stone', block.hitSound);
+      return true;
+    }
+    const hp = (inst.blockHp.get(i) ?? block.maxHp) - dmg;
+    this.hitFx(inst, x, y, dmg, 'node', 'stone', hp <= 0 ? block.breakSound : block.hitSound);
+    if (hp > 0) {
+      inst.blockHp.set(i, hp);
+      return true;
+    }
+    inst.blockHp.delete(i);
+    delete inst.blockKinds[String(i)];
+    delete inst.blockRotations[String(i)];
+    inst.openDoors.delete(i);
+    for (const drop of block.drops) {
+      if (this.rnd() > drop.chance || !(drop.itemId in ITEMS)) continue;
+      const quantity = drop.min + Math.floor(this.rnd() * (drop.max - drop.min + 1));
+      this.dropAt(inst, x + (this.rnd() - .5) * 12, y + (this.rnd() - .5) * 12, drop.itemId as ItemId, quantity);
+    }
+    this.io?.to(inst.id).emit(EV.block, { i });
+    return true;
+  }
+
+  private restorePlayerBlockVisual(inst: Instance, i: number, restore: Tile) {
+    const buildType: BuildType | null = restore === Tile.WoodFloor ? 'wood_floor' : restore === Tile.StoneFloor ? 'stone_floor' : null;
+    const blockId = buildType ? this.content.playerBlock(buildType)?.id : undefined;
+    if (blockId) inst.blockKinds[String(i)] = blockId;
+    else delete inst.blockKinds[String(i)];
+    delete inst.blockRotations[String(i)];
+    inst.openDoors.delete(i);
+    this.io?.to(inst.id).emit(EV.block, { i, ...(blockId ? { blockId } : {}), open: false });
   }
 
   /** Safe-zone local chat with overhead bubbles. */
@@ -1459,7 +1468,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   private sendTrade(p: ServerPlayer) {
     const tier = this.traderAt(p)?.tier ?? 1;
     this.emitTo(p.sid, EV.trade, {
-      stock: TRADER_TIER_STOCK[tier],
+      stock: this.content.traderStock(tier),
       money: p.money,
       quests: this.questStatus(p, tier),
       tier,
@@ -1537,7 +1546,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (!p || p.dead) return;
     const trader = this.traderAt(p);
     if (!trader) return;
-    const stock = TRADER_TIER_STOCK[trader.tier ?? 1];
+    const stock = this.content.traderStock(trader.tier ?? 1);
     const entry = stock.find((e) => e.id === id && e.buy > 0);
     if (!entry) return;
     const n = Math.max(1, Math.min(99, Math.floor(qty) || 1));
@@ -1566,7 +1575,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (slot < 0 || slot >= p.inv.slots.length) return;
     const item = p.inv.slots[slot];
     if (!item) return;
-    const stock = TRADER_TIER_STOCK[trader.tier ?? 1];
+    const stock = this.content.traderStock(trader.tier ?? 1);
     const entry = stock.find((e) => e.id === item.id && e.sell > 0);
     if (!entry) {
       this.toast(sid, 'This trader is not interested in that');
@@ -1694,12 +1703,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   }
 
   private spawnGroundAt(inst: Instance, x: number, y: number) {
-    const roll = rollGround(this.rnd);
+    const roll = rollGround(this.rnd, this.content.lootTables);
     const gid = `g${this.nextId++}`;
     inst.ground.set(gid, { id: gid, x, y, item: roll.id, qty: roll.qty });
   }
 
-  private spawnEnemy(inst: Instance, x: number, y: number, kind: EnemyKind) {
+  private spawnEnemy(inst: Instance, x: number, y: number, kind: EnemyKind, respawnMs?: number) {
     // never spawn inside solid tiles — search nearby free ground
     if (this.isBlocked(inst, x, y, ENEMY_RADIUS)) {
       let found = false;
@@ -1716,7 +1725,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
           }
       if (!found) return; // nowhere sane to put it
     }
-    const def = ENEMY_DEFS[kind];
+    const def = this.content.enemy(kind);
     const id = `e${this.nextId++}`;
     inst.enemies.set(id, {
       id, kind, x, y,
@@ -1739,6 +1748,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       lastSeenAt: 0,
       lastSeenX: x,
       lastSeenY: y,
+      respawnMs: respawnMs ?? this.content.enemyRespawnMs(kind),
+      lastAttackAt: 0,
+      lastHitAt: 0,
     });
   }
 
@@ -1836,14 +1848,24 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       let dx = (p.input.right ? 1 : 0) - (p.input.left ? 1 : 0);
       let dy = (p.input.down ? 1 : 0) - (p.input.up ? 1 : 0);
       const moving = !!(dx || dy);
+      const actionFacing = p.input.shoot || p.action !== null || p.reloadTarget !== null || now - Math.max(p.lastAttackAt, p.lastSwingAt) < 450;
+      p.angle = p.input.angle;
+      if (moving) p.facing = Math.atan2(dy, dx);
+      else if (actionFacing) p.facing = p.input.angle;
       // sprint: hold to run, drains stamina; can't sprint while swimming/overweight/exhausted
       const overweight = invWeight(p.inv) > invCapacity(p.inv).maxKg;
-      const wantSprint = !!p.input.sprint && moving && !this.inWater(inst, p) && !overweight && p.stamina > SPRINT_MIN;
+      const wantSprint = !!p.input.sprint && moving && !this.inWater(inst, p) && !overweight
+        && !p.staminaExhausted && p.stamina > 0;
       if (wantSprint) {
         p.stamina = Math.max(0, p.stamina - SPRINT_DRAIN_PER_S * dt);
         p.lastExertAt = now;
-      } else if (now - p.lastExertAt > STAMINA_REGEN_DELAY_MS && p.stamina < STAMINA_MAX) {
-        p.stamina = Math.min(STAMINA_MAX, p.stamina + STAMINA_REGEN_PER_S * dt);
+        if (p.stamina === 0) p.staminaExhausted = true;
+      } else {
+        const regenDelay = p.staminaExhausted ? STAMINA_EXHAUSTED_REGEN_DELAY_MS : STAMINA_REGEN_DELAY_MS;
+        if (now - p.lastExertAt > regenDelay && p.stamina < STAMINA_MAX) {
+          p.stamina = Math.min(STAMINA_MAX, p.stamina + STAMINA_REGEN_PER_S * dt);
+          if (p.staminaExhausted && p.stamina >= STAMINA_EXHAUSTED_RECOVERY) p.staminaExhausted = false;
+        }
       }
       if (moving) {
         const len = Math.hypot(dx, dy);
@@ -1851,6 +1873,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         dy /= len;
         const speed = PLAYER_SPEED
           * (this.inWater(inst, p) ? SWIM_SPEED_MULT : 1)
+          * this.terrainMoveMultiplier(inst, p.x, p.y)
           * (overweight ? OVERWEIGHT_SPEED_MULT : 1)
           * (wantSprint ? SPRINT_SPEED_MULT : 1);
         this.moveEntity(inst, p, dx * speed * dt, dy * speed * dt, PLAYER_RADIUS);
@@ -1860,8 +1883,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       }
       // push the stamina bar on coarse change (keeps broadcasts light)
       const staBucket = Math.round(p.stamina / 4);
-      if (staBucket !== p.lastStaminaBucket) {
+      if (staBucket !== p.lastStaminaBucket || p.staminaExhausted !== p.lastPushedStaminaExhausted) {
         p.lastStaminaBucket = staBucket;
+        p.lastPushedStaminaExhausted = p.staminaExhausted;
         this.pushInventory(p);
       }
       if (p.input.shoot) this.tryAttack(p, inst, now);
@@ -1874,7 +1898,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         // chest restock
         for (const c of inst.containers.values()) {
           if (c.kind !== 'bag' && c.kind !== 'storage' && c.restockAt && now >= c.restockAt) {
-            c.slots = rollChest(this.rnd, c.tier);
+            c.slots = c.lootTable
+              ? rollNamed(this.rnd, c.lootTable, this.content.lootTables)
+              : rollChest(this.rnd, c.tier, this.content.lootTables);
             c.restockAt = null;
           }
         }
@@ -1894,10 +1920,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             continue;
           }
           let tile = nr.tile;
-          if (tile === Tile.Rock) {
+          if (!nr.resourceId && tile === Tile.Rock) {
             const roll = this.rnd();
             tile = roll < IRON_CHANCE ? Tile.IronOre : roll < IRON_CHANCE + COPPER_CHANCE ? Tile.CopperOre : Tile.Rock;
-          } else if (tile === Tile.CopperOre || tile === Tile.IronOre) {
+          } else if (!nr.resourceId && (tile === Tile.CopperOre || tile === Tile.IronOre)) {
             if (this.rnd() >= 0.25) tile = Tile.Rock;
           }
           inst.tiles[nr.i] = tile;
@@ -1908,7 +1934,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         for (let i = inst.enemyRespawns.length - 1; i >= 0; i--) {
           const er = inst.enemyRespawns[i];
           if (now < er.at) continue;
-          this.spawnEnemy(inst, er.x, er.y, er.kind);
+          this.spawnEnemy(inst, er.x, er.y, er.kind, er.respawnMs);
           inst.enemyRespawns.splice(i, 1);
         }
         // world structures wear out (restoring any floor beneath)
@@ -1919,6 +1945,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
           inst.unders.delete(i);
           inst.tiles[i] = restore;
           this.io?.to(inst.id).emit(EV.tile, { i, tile: restore });
+          this.restorePlayerBlockVisual(inst, i, restore);
         }
         // ground loot top-up
         if (inst.ground.size < 45 && now - inst.lastGroundSpawn > 5000 && inst.lootSpots.length > 0) {
@@ -1927,6 +1954,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
           inst.lastGroundSpawn = now;
         }
       }
+      this.updateDoors(inst);
       this.updateProjectiles(inst, dt, now);
       this.broadcast(inst, now);
     }
@@ -1940,9 +1968,36 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     for (let ty = minY; ty <= maxY; ty++)
       for (let tx = minX; tx <= maxX; tx++) {
         if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) return true;
-        if (blocks[inst.tiles[ty * inst.w + tx]]) return true;
+        const index = ty * inst.w + tx;
+        const openDoor = inst.openDoors.has(index);
+        if (blocks[inst.tiles[index]] && !(openDoor && inst.tiles[index] === Tile.Door)) return true;
+        const block = this.content.block(inst.blockKinds[String(index)]);
+        if (block && !(openDoor && block.playerPlacement?.buildType === 'door') && (blocks === BLOCKS_ENEMY ? block.collision.enemy : block.collision.move)) return true;
+        const terrain = this.content.terrain(inst.terrainKinds[String(index)]);
+        if (terrain && (blocks === BLOCKS_ENEMY ? terrain.collision.enemy : terrain.collision.move)) return true;
       }
     return false;
+  }
+
+  private updateDoors(inst: Instance) {
+    const shouldOpen = new Set<number>();
+    for (const player of this.players.values()) {
+      if (player.instanceId !== inst.id || player.dead || player.loggedOutAt !== null) continue;
+      const centerX = Math.floor(player.x / TILE); const centerY = Math.floor(player.y / TILE);
+      for (let ty = centerY - 1; ty <= centerY + 1; ty++) for (let tx = centerX - 1; tx <= centerX + 1; tx++) {
+        if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) continue;
+        const index = ty * inst.w + tx;
+        const block = this.content.block(inst.blockKinds[String(index)]);
+        const isDoor = inst.tiles[index] === Tile.Door || block?.playerPlacement?.buildType === 'door';
+        if (isDoor && Math.hypot((tx + .5) * TILE - player.x, (ty + .5) * TILE - player.y) < TILE * 1.05) shouldOpen.add(index);
+      }
+    }
+    for (const index of new Set([...inst.openDoors, ...shouldOpen])) {
+      const open = shouldOpen.has(index);
+      if (inst.openDoors.has(index) === open) continue;
+      if (open) inst.openDoors.add(index); else inst.openDoors.delete(index);
+      this.io?.to(inst.id).emit(EV.block, { i: index, blockId: inst.blockKinds[String(index)], rotation: inst.blockRotations[String(index)] ?? 0, open });
+    }
   }
 
   private tileUnder(inst: Instance, x: number, y: number): Tile {
@@ -1952,8 +2007,27 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     return inst.tiles[ty * inst.w + tx] as Tile;
   }
 
+  private elevationUnder(inst: Instance, x: number, y: number): number {
+    const tx = Math.floor(x / TILE);
+    const ty = Math.floor(y / TILE);
+    if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) return 0;
+    return inst.elevations[ty * inst.w + tx] ?? 0;
+  }
+
   private inWater(inst: Instance, p: { x: number; y: number }): boolean {
-    return this.tileUnder(inst, p.x, p.y) === Tile.Water;
+    if (this.tileUnder(inst, p.x, p.y) === Tile.Water) return true;
+    return Boolean(this.terrainUnder(inst, p.x, p.y)?.swimmable);
+  }
+
+  private terrainUnder(inst: Instance, x: number, y: number) {
+    const tx = Math.floor(x / TILE);
+    const ty = Math.floor(y / TILE);
+    if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) return undefined;
+    return this.content.terrain(inst.terrainKinds[String(ty * inst.w + tx)]);
+  }
+
+  private terrainMoveMultiplier(inst: Instance, x: number, y: number): number {
+    return this.terrainUnder(inst, x, y)?.moveMultiplier ?? 1;
   }
 
   private moveEntity(
@@ -1966,9 +2040,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   ): boolean {
     let moved = false;
     const nx = e.x + dx;
-    if (!this.isBlocked(inst, nx, e.y, radius, blocks)) { e.x = nx; moved = true; }
+    if (Math.abs(this.elevationUnder(inst, nx, e.y) - this.elevationUnder(inst, e.x, e.y)) <= 1 && !this.isBlocked(inst, nx, e.y, radius, blocks)) { e.x = nx; moved = true; }
     const ny = e.y + dy;
-    if (!this.isBlocked(inst, e.x, ny, radius, blocks)) { e.y = ny; moved = true; }
+    if (Math.abs(this.elevationUnder(inst, e.x, ny) - this.elevationUnder(inst, e.x, e.y)) <= 1 && !this.isBlocked(inst, e.x, ny, radius, blocks)) { e.y = ny; moved = true; }
     return moved;
   }
 
@@ -2158,41 +2232,58 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const ty = Math.floor(hy / TILE);
       if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) continue;
       const i = ty * inst.w + tx;
-      if (this.damageStructure(inst, i, m.damage)) return; // world-placed structures take melee damage
+      if (this.damageStructure(inst, i, m.damage) || this.damageWorldBlock(inst, i, m.damage)) return; // authored/player structures take melee damage
       const tile = inst.tiles[i] as Tile;
-      const totalHits = NODE_HITS[tile];
+      const resourceId = inst.resourceKinds[String(i)];
+      const resourceDef = this.content.resource(resourceId);
+      const totalHits = resourceDef?.maxHits ?? NODE_HITS[tile];
       if (!totalHits) continue;
 
-      const isTree = tile === Tile.Tree;
-      const skill = isTree ? 'woodcutting' : 'mining';
+      const isTree = resourceDef ? resourceDef.skill === 'woodcutting' : tile === Tile.Tree;
+      const skill = resourceDef?.skill ?? (isTree ? 'woodcutting' : 'mining');
       const bonus = Math.floor((skillLevel(p.skills[skill]) - 1) / 5);
-      const yieldQty = (isTree ? m.wood : m.stone) + bonus;
-      const resource: ItemId = isTree ? 'wood' : 'stone';
       // swinging at a node is hard work — costs stamina and slows you when spent
       p.stamina = Math.max(0, p.stamina - MINE_STAMINA_COST);
       p.lastExertAt = now;
+      if (p.stamina === 0) p.staminaExhausted = true;
       if (p.equipped !== null) this.wearSlot(p, p.equipped); // tools wear from harvesting
       this.addXp(p, skill, 6);
-      const leftover = this.addItem(p.inv, resource, yieldQty);
-      if (leftover >= yieldQty) {
-        this.toast(p.sid, 'Inventory full');
-        return;
-      }
-      // ore-veined rocks give stone AND ore
-      const ore = ORE_YIELD[tile];
-      if (ore && this.addItem(p.inv, ore, 1) === 0) {
-        this.addXp(p, 'mining', 4);
-      }
-      this.hitFx(inst, tx * TILE + TILE / 2, ty * TILE + TILE / 2, yieldQty - leftover, 'node', isTree ? 'wood' : 'stone');
-
       const left = (inst.nodeHits.get(i) ?? totalHits) - 1;
+      let awarded = 0;
+      if (resourceDef) {
+        for (const drop of resourceDef.drops) {
+          if (drop.when !== 'hit' || this.rnd() > drop.chance || !(drop.itemId in ITEMS)) continue;
+          const quantity = drop.min + Math.floor(this.rnd() * (drop.max - drop.min + 1)) + bonus;
+          awarded += quantity - this.addItem(p.inv, drop.itemId as ItemId, quantity);
+        }
+        if (left <= 0) {
+          for (const drop of resourceDef.drops) {
+            if (drop.when !== 'depleted' || this.rnd() > drop.chance || !(drop.itemId in ITEMS)) continue;
+            const quantity = drop.min + Math.floor(this.rnd() * (drop.max - drop.min + 1));
+            awarded += quantity - this.addItem(p.inv, drop.itemId as ItemId, quantity);
+          }
+        }
+      } else {
+        const yieldQty = (isTree ? m.wood : m.stone) + bonus;
+        const item: ItemId = isTree ? 'wood' : 'stone';
+        awarded = yieldQty - this.addItem(p.inv, item, yieldQty);
+        const ore = ORE_YIELD[tile];
+        if (ore && this.addItem(p.inv, ore, 1) === 0) {
+          awarded++;
+          this.addXp(p, 'mining', 4);
+        }
+      }
+      if (awarded === 0) this.toast(p.sid, 'Inventory full or no drop this strike');
+      const soundId = left <= 0 ? resourceDef?.breakSound : resourceDef?.hitSound;
+      this.hitFx(inst, tx * TILE + TILE / 2, ty * TILE + TILE / 2, awarded, 'node', isTree ? 'wood' : 'stone', soundId);
+
       if (left <= 0) {
         inst.nodeHits.delete(i);
-        const depleted = NODE_DEPLETED[tile] ?? Tile.Grass;
+        const depleted = resourceDef?.depletedTile ?? NODE_DEPLETED[tile] ?? Tile.Grass;
         inst.tiles[i] = depleted;
         this.io?.to(inst.id).emit(EV.tile, { i, tile: depleted });
-        inst.nodeRespawns.push({ i, tile, at: now + NODE_RESPAWN_MS });
-        this.toast(p.sid, isTree ? 'Tree felled' : 'Rock broken');
+        inst.nodeRespawns.push({ i, tile, at: now + (resourceDef?.respawnMs ?? NODE_RESPAWN_MS), resourceId });
+        this.toast(p.sid, `${resourceDef?.name ?? (isTree ? 'Tree' : 'Rock')} depleted`);
       } else {
         inst.nodeHits.set(i, left);
       }
@@ -2205,7 +2296,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   private updateEnemies(inst: Instance, dt: number, now: number, night = false) {
     for (const e of inst.enemies.values()) {
-      const def = ENEMY_DEFS[e.kind];
+      const def = this.content.enemy(e.kind);
       // the dark belongs to the dead (and the wolves)
       const hunter = e.kind === 'zombie' || e.kind === 'wolf';
       const aggro = def.aggroRange * (night && hunter ? NIGHT_AGGRO_MULT : 1);
@@ -2297,6 +2388,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             else chase(speed);
           } else if (seen && now >= e.nextAttackAt) {
             e.nextAttackAt = now + def.attackMs;
+            e.lastAttackAt = now;
             this.damagePlayer(target, def.damage, `a ${def.name}`, null, null);
             this.hitFx(inst, target.x, target.y, def.damage, 'player');
           }
@@ -2313,6 +2405,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
           }
           if (e.burstLeft > 0 && now >= e.nextBurstShotAt) {
             e.burstLeft--;
+            e.lastAttackAt = now;
             e.nextBurstShotAt = now + 110;
             const a = e.angle + (this.rnd() - 0.5) * 0.24;
             inst.projectiles.push({
@@ -2363,6 +2456,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   private damageEnemy(inst: Instance, e: Enemy, dmg: number, attacker: ServerPlayer | null, ranged = false) {
     e.hp -= dmg;
+    e.lastHitAt = Date.now();
     this.hitFx(inst, e.x, e.y, dmg, 'enemy');
     if (attacker) {
       e.targetSid = attacker.sid;
@@ -2373,10 +2467,29 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (ranged) this.addXp(attacker, 'shooting', dmg);
     }
     if (e.hp > 0) return;
+    const death = {
+      x: Math.round(e.x),
+      y: Math.round(e.y),
+      target: `mob:${e.kind}`,
+      fallbackRow: e.kind === 'zombie' ? 8
+        : e.kind === 'military' ? 9
+        : e.kind === 'deer' ? 11
+        : e.kind === 'rabbit' ? 12
+        : e.kind === 'boar' ? 13
+        : e.kind === 'wolf' ? 14
+        : 9,
+    };
+    for (const viewer of this.players.values()) {
+      if (viewer.instanceId !== inst.id) continue;
+      const visible = viewer.dead
+        || Math.hypot(e.x - viewer.x, e.y - viewer.y) < GameService.SENSE_RANGE
+        || this.losClear(inst, viewer.x, viewer.y, e.x, e.y);
+      if (visible) this.emitTo(viewer.sid, EV.entityDeath, death);
+    }
     inst.enemies.delete(e.id);
     if (attacker) {
       attacker.kills++;
-      this.toast(attacker.sid, `☠ ${ENEMY_DEFS[e.kind].name} down`);
+      this.toast(attacker.sid, `☠ ${this.content.enemy(e.kind).name} down`);
       // kill-quest progress (locked quests don't tick — take them first)
       for (const def of this.quests) {
         if (def.kind !== 'kill' || def.target !== e.kind || !this.questUnlocked(attacker, def)) continue;
@@ -2389,12 +2502,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       }
       this.pushInventory(attacker);
     }
-    const drops = rollEnemyDrop(this.rnd, e.kind);
+    const drops = rollEnemyDrop(this.rnd, this.content.enemyLootTable(e.kind), this.content.lootTables);
     if (drops.length > 0) {
       const id = `b${this.nextId++}`;
       inst.containers.set(id, { id, x: e.x, y: e.y, kind: 'bag', tier: 'normal', slots: drops, restockAt: null });
     }
-    inst.enemyRespawns.push({ x: e.homeX, y: e.homeY, kind: e.kind, at: Date.now() + ENEMY_RESPAWN_MS + this.rnd() * 30_000 });
+    inst.enemyRespawns.push({ x: e.homeX, y: e.homeY, kind: e.kind, respawnMs: e.respawnMs, at: Date.now() + e.respawnMs + this.rnd() * 30_000 });
   }
 
   /** Straight-line sight check — walls, trees and rock block vision. */
@@ -2405,11 +2518,20 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const sx = (x2 - x1) / steps;
     const sy = (y2 - y1) / steps;
     // skip the endpoints' own tiles so hugging a wall doesn't blind you
-    for (let s = 1; s < steps; s++) {
+    let previousElevation = this.elevationUnder(inst, x1, y1);
+    for (let s = 1; s <= steps; s++) {
       const tx = Math.floor((x1 + sx * s) / TILE);
       const ty = Math.floor((y1 + sy * s) / TILE);
       if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) return false;
-      if (BLOCKS_BULLET[inst.tiles[ty * inst.w + tx]]) return false;
+      const elevation = inst.elevations[ty * inst.w + tx] ?? 0;
+      if (Math.abs(elevation - previousElevation) > 1) return false;
+      const index = ty * inst.w + tx;
+      const block = this.content.block(inst.blockKinds[String(index)]);
+      const openDoor = inst.openDoors.has(index);
+      const tileBlocks = BLOCKS_BULLET[inst.tiles[index]] && !(openDoor && inst.tiles[index] === Tile.Door);
+      const blockBlocks = block?.collision.sight && !(openDoor && block.playerPlacement?.buildType === 'door');
+      if (s < steps && (tileBlocks || blockBlocks || this.content.terrain(inst.terrainKinds[String(index)])?.collision.sight)) return false;
+      previousElevation = elevation;
     }
     return true;
   }
@@ -2426,6 +2548,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const sy = (pr.vy * dt) / steps;
       let alive = true;
       for (let s = 0; s < steps && alive; s++) {
+        const previousElevation = this.elevationUnder(inst, pr.x, pr.y);
         pr.x += sx;
         pr.y += sy;
         pr.traveled += Math.hypot(sx, sy);
@@ -2433,8 +2556,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         const tx = Math.floor(pr.x / TILE);
         const ty = Math.floor(pr.y / TILE);
         if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) { alive = false; break; }
-        if (BLOCKS_BULLET[inst.tiles[ty * inst.w + tx]]) {
-          this.damageStructure(inst, ty * inst.w + tx, pr.damage); // player-built cover soaks bullets
+        if (Math.abs((inst.elevations[ty * inst.w + tx] ?? 0) - previousElevation) > 1) { alive = false; break; }
+        const blockIndex = ty * inst.w + tx;
+        const authoredBlock = this.content.block(inst.blockKinds[String(blockIndex)]);
+        const openDoor = inst.openDoors.has(blockIndex);
+        const tileBlocks = BLOCKS_BULLET[inst.tiles[blockIndex]] && !(openDoor && inst.tiles[blockIndex] === Tile.Door);
+        const blockBlocks = authoredBlock?.collision.bullets && !(openDoor && authoredBlock.playerPlacement?.buildType === 'door');
+        if (tileBlocks || blockBlocks || this.content.terrain(inst.terrainKinds[String(blockIndex)])?.collision.bullets) {
+          if (!this.damageStructure(inst, blockIndex, pr.damage) && authoredBlock?.collision.bullets) this.damageWorldBlock(inst, blockIndex, pr.damage);
           alive = false;
           break;
         }
@@ -2444,7 +2573,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             alive = false;
             if (!this.isSafeAt(inst, target.x, target.y)) {
               const shooter = pr.ownerKind === null ? this.players.get(pr.owner) : undefined;
-              const killerName = pr.ownerKind ? `a ${ENEMY_DEFS[pr.ownerKind].name}` : shooter?.name ?? '?';
+              const killerName = pr.ownerKind ? `a ${this.content.enemy(pr.ownerKind).name}` : shooter?.name ?? '?';
               this.hitFx(inst, pr.x, pr.y, pr.damage, 'player');
               this.damagePlayer(target, pr.damage, killerName, pr.weapon, shooter ?? null);
             }
@@ -2480,6 +2609,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (target.equipment.helmet) this.wearArmor(target, 'helmet');
     if (target.equipment.vest) this.wearArmor(target, 'vest');
     target.hp -= mitigated;
+    target.lastHitAt = Date.now();
     if (target.hp > 0) {
       this.pushInventory(target);
       return;
@@ -2513,9 +2643,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   // ── output ────────────────────────────────────────────────────────────────
 
-  private hitFx(inst: Instance, x: number, y: number, amount: number, kind: HitSnap['kind'], material?: 'wood' | 'stone') {
+  private hitFx(inst: Instance, x: number, y: number, amount: number, kind: HitSnap['kind'], material?: 'wood' | 'stone', soundId?: string) {
     const payload: HitSnap = { x: Math.round(x), y: Math.round(y), amount, kind };
     if (material) payload.material = material;
+    if (soundId) payload.soundId = soundId;
     this.io?.to(inst.id).emit(EV.hit, payload);
   }
 
@@ -2534,6 +2665,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         x: Math.round(p.x * 10) / 10,
         y: Math.round(p.y * 10) / 10,
         angle: Math.round(p.angle * 100) / 100,
+        facing: Math.round(p.facing * 100) / 100,
         hp: p.hp,
         maxHp: PLAYER_MAX_HP,
         weapon: p.equipped !== null && p.inv.slots[p.equipped] ? p.inv.slots[p.equipped]!.id : null,
@@ -2542,7 +2674,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         dead: p.dead,
         moving: p.moving,
         swing: now - p.lastSwingAt < 400 ? p.lastSwingAt : 0,
-        look: p.look,
+        attackAt: now - p.lastAttackAt < 1000 ? p.lastAttackAt : 0,
+        look: p.appearance.outfit,
+        appearance: p.appearance,
+        hitAt: now - p.lastHitAt < 1000 ? p.lastHitAt : 0,
       });
     }
     const allEnemies: StateSnap['enemies'] = [...inst.enemies.values()].map((e) => ({
@@ -2554,6 +2689,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       hp: e.hp,
       maxHp: e.maxHp,
       moving: e.moving,
+      attackAt: now - e.lastAttackAt < 1000 ? e.lastAttackAt : 0,
+      hitAt: now - e.lastHitAt < 1000 ? e.lastHitAt : 0,
     }));
     const base = {
       t: now,
@@ -2611,7 +2748,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       hunger: Math.round(p.hunger),
       thirst: Math.round(p.thirst),
       stamina: Math.round(p.stamina),
-      look: p.look,
+      staminaExhausted: p.staminaExhausted,
+      look: p.appearance.outfit,
+      appearance: p.appearance,
     });
   }
 

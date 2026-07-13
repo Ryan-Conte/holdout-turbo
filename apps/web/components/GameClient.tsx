@@ -7,8 +7,10 @@ import {
   ActionSnap,
   BACKPACKS,
   BUILDABLES,
+  BlockUpdate,
   ChatMsg,
   ContainerContents,
+  EntityDeathSnap,
   EV,
   FLOOR_TILES,
   HitSnap,
@@ -32,13 +34,19 @@ import {
   isNight,
   skillLevel,
   useVerb,
-  xpForLevel,
 } from '@holdout/shared';
 import { DamageFloat, RenderEnemy, RenderPlayer, Renderer } from '@/game/renderer';
 import { Tip, itemTip } from '@/components/Tooltip';
-import { ITEM_INDEX, ITEM_SHEET_ORDER, loadSheets } from '@/game/sprites';
+import { loadSheets } from '@/game/sprites';
 import { initSfx, isMuted, sfx, startAmbient, toggleMute } from '@/game/sfx';
 import { authClient } from '@/lib/auth-client';
+import { CookingPanel } from '@/components/game/CookingPanel';
+import { CraftingPanel } from '@/components/game/CraftingPanel';
+import { ItemIcon } from '@/components/game/ItemIcon';
+import { SkillsPanel } from '@/components/game/SkillsPanel';
+import { FriendContact, SocialPanel } from '@/components/game/SocialPanel';
+import { DeathOverlay, PauseOverlay } from '@/components/game/SystemOverlays';
+import { TradePanel, TradeTab } from '@/components/game/TradePanel';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 /** the server picked in the login-screen server browser (falls back to env) */
@@ -53,11 +61,8 @@ const MINIMAP_SIZE = 168;
 
 interface Toast { id: number; msg: string }
 interface FloatRec { x: number; y: number; amount: number; kind: DamageFloat['kind']; label?: string; at: number }
-interface Friend { id: string; name: string; status: string; incoming: boolean }
-
 const SKILL_ABBR: Record<string, string> = { woodcutting: 'WC', mining: 'MIN', shooting: 'SHT', melee: 'MEL', crafting: 'CRF' };
 // outfit swatch colors — mirror the survivor shirt rows in tools/gen-sprites.mjs
-const LOOK_COLORS = ['#8a3a3a', '#3a5a8a', '#3a7a4a', '#8a6a2a', '#6a4a8a', '#2a7a7a', '#8a4a6a', '#5a6a2a'];
 
 // starter objectives — gives new players a direction (tracked locally, once done stays done)
 const OBJECTIVES: { id: string; label: string }[] = [
@@ -79,34 +84,6 @@ const DEMOLISHABLE = new Set<number>([
 type DragZone = 'inv' | 'cont' | 'helmet' | 'vest' | 'mod' | 'weapon';
 interface DragState { zone: DragZone; index: number; item: ItemId; qty: number }
 interface CtxMenu { x: number; y: number; zone: DragZone; index: number; item: ItemId; qty: number }
-
-export function ItemIcon({ id, size = 28 }: { id: ItemId; size?: number }) {
-  const i = ITEM_INDEX[id] ?? 0;
-  const scale = size / 16;
-  return (
-    <span
-      className="item-icon"
-      style={{
-        width: size,
-        height: size,
-        backgroundImage: 'url(/sprites/items.png)',
-        backgroundPosition: `-${i * 16 * scale}px 0`,
-        backgroundSize: `${ITEM_SHEET_ORDER.length * 16 * scale}px ${16 * scale}px`,
-      }}
-    />
-  );
-}
-
-const CRAFT_TABS: { cat: RecipeCat; label: string }[] = [
-  { cat: 'survival', label: 'SURVIVAL' },
-  { cat: 'medical', label: 'MEDICAL' },
-  { cat: 'gear', label: 'GEAR' },
-  { cat: 'build', label: 'BUILD' },
-  { cat: 'smelt', label: 'SMELT' },
-  { cat: 'forge', label: 'FORGE' },
-];
-
-const STATION_LABEL: Record<string, string> = { workbench: 'workbench', furnace: 'furnace', anvil: 'anvil' };
 
 export default function GameClient() {
   const router = useRouter();
@@ -140,6 +117,7 @@ export default function GameClient() {
   const lastStepAt = useRef(0);
   const lastGroanAt = useRef(0);
   const heldKitRef = useRef<{ slot: number; item: ItemId } | null>(null); // equipped placeable = placement mode
+  const buildRotationRef = useRef(0);
   const chatOpenRef = useRef(false);
   const menuRef = useRef({ gear: false, craft: false, skills: false, social: false });
   const lootContRef = useRef<string | null>(null); // container the loot queue belongs to
@@ -165,7 +143,7 @@ export default function GameClient() {
   const [craftSel, setCraftSel] = useState<string | null>(null);
   const [container, setContainer] = useState<ContainerContents | null>(null);
   const [trade, setTrade] = useState<TradeOpen | null>(null);
-  const [tradeTab, setTradeTab] = useState<'buy' | 'sell' | 'jobs'>('buy');
+  const [tradeTab, setTradeTab] = useState<TradeTab>('buy');
   const [buySel, setBuySel] = useState<ItemId | null>(null);
   const [sellSel, setSellSel] = useState<number | null>(null); // backpack slot index
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -179,7 +157,7 @@ export default function GameClient() {
   const [ownHideout, setOwnHideout] = useState(false);
   const [hurtAt, setHurtAt] = useState(0);
   const [muted, setMuted] = useState(false);
-  const [friends, setFriends] = useState<Friend[]>([]);
+  const [friends, setFriends] = useState<FriendContact[]>([]);
   const [friendUsername, setFriendUsername] = useState('');
   const [friendMsg, setFriendMsg] = useState('');
   const [drag, setDrag] = useState<DragState | null>(null);
@@ -195,6 +173,7 @@ export default function GameClient() {
   const [station, setStation] = useState<'firepit' | null>(null); // open campfire UI
   const [clock, setClock] = useState('');
   const [demolishMode, setDemolishMode] = useState(false); // camp demolish mode (X)
+  const [buildRotation, setBuildRotation] = useState(0);
   const [escMenu, setEscMenu] = useState(false); // pause/system menu (ESC)
   const [objectives, setObjectives] = useState<Record<string, boolean>>(() => {
     try { return JSON.parse(localStorage.getItem('holdout_objectives') ?? '{}'); } catch { return {}; }
@@ -205,6 +184,13 @@ export default function GameClient() {
     const id = Date.now() + Math.random();
     setToasts((t) => [...t.slice(-3), { id, msg }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3000);
+  }, []);
+
+  const rotateBuild = useCallback(() => {
+    if (!heldKitRef.current) return;
+    const next = (buildRotationRef.current + 1) % 4;
+    buildRotationRef.current = next;
+    setBuildRotation(next);
   }, []);
 
   const completeObjective = useCallback((id: string) => {
@@ -226,7 +212,12 @@ export default function GameClient() {
     latestInvRef.current = inv;
     // holding a build kit in hand = placement mode (ghost + click-to-place)
     const s = inv?.equipped !== null && inv?.equipped !== undefined ? inv.inv.slots[inv.equipped] : null;
-    heldKitRef.current = s && ITEMS[s.id].place ? { slot: inv!.equipped!, item: s.id } : null;
+    const next = s && ITEMS[s.id].place ? { slot: inv!.equipped!, item: s.id } : null;
+    if (heldKitRef.current?.item !== next?.item) {
+      buildRotationRef.current = 0;
+      setBuildRotation(0);
+    }
+    heldKitRef.current = next;
   }, [inv]);
   useEffect(() => { demolishRef.current = demolishMode; }, [demolishMode]);
   const escMenuRef = useRef(false);
@@ -413,7 +404,9 @@ export default function GameClient() {
       const data = await res.json();
       setFriends(data.friends ?? []);
       friendNamesRef.current = new Set(
-        (data.friends ?? []).filter((f: Friend) => f.status === 'accepted').map((f: Friend) => f.name),
+        (data.friends ?? [])
+          .filter((friend: FriendContact) => friend.status === 'accepted')
+          .map((friend: FriendContact) => friend.name),
       );
     } catch { /* offline is fine */ }
   }, []);
@@ -447,7 +440,9 @@ export default function GameClient() {
       socket.on(EV.init, (init: WorldInit) => {
         youRef.current = init.you;
         initRef.current = init;
-        rendererRef.current = new Renderer(init.tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {});
+        const visuals = init.visuals ?? { assets: {}, animations: {}, resources: {}, sounds: { presets: {}, actions: {} }, mobSounds: {}, blocks: {}, terrain: {} };
+        sfx.applyContent(visuals.sounds);
+        rendererRef.current = new Renderer(init.tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {}, init.elevations ?? [], visuals, init.terrainKinds ?? {}, init.resourceKinds ?? {}, init.blockKinds ?? {}, init.blockRotations ?? {}, init.openDoors ?? [], (soundId, volume) => sfx.play(soundId, volume));
         displayPos.current.clear();
         seenProjectiles.current.clear();
         snapRef.current = null;
@@ -462,6 +457,8 @@ export default function GameClient() {
         setLocation(init.kind === 'hideout' ? init.name : null);
         locationRef.current = init.kind === 'hideout' ? init.name : null;
       });
+      socket.on(EV.visuals, (visuals) => { sfx.applyContent(visuals.sounds); rendererRef.current?.applyVisuals(visuals); });
+      socket.on(EV.entityDeath, (death: EntityDeathSnap) => rendererRef.current?.entityDeath(death));
       socket.on(EV.state, (s: StateSnap) => {
         snapRef.current = s;
         setOnline(s.players.length);
@@ -590,11 +587,12 @@ export default function GameClient() {
         const you = snapRef.current?.players.find((p) => p.id === youRef.current);
         const d = you ? Math.hypot(h.x - you.x, h.y - you.y) : 9999;
         if (d < 350) {
-          if (h.kind === 'node') sfx.chop(Math.max(0.2, 1 - d / 380));
+          if (h.kind === 'node') h.soundId ? sfx.play(h.soundId, Math.max(0.2, 1 - d / 380)) : sfx.chop(Math.max(0.2, 1 - d / 380));
           else sfx.hit(Math.max(0.2, 1 - d / 380));
         }
       });
       socket.on(EV.tile, (u: TileUpdate) => rendererRef.current?.applyTile(u.i, u.tile, u.under));
+      socket.on(EV.block, (update: BlockUpdate) => rendererRef.current?.applyBlock(update.i, update.blockId, update.rotation, update.open));
       socket.on(EV.action, (a: ActionSnap) => {
         setAction(a.ms > 0 ? { label: a.label, until: Date.now() + a.ms, ms: a.ms, kind: a.kind, container: a.container, slot: a.slot } : null);
       });
@@ -663,7 +661,7 @@ export default function GameClient() {
       if (keyMap[e.code]) { keys.current[keyMap[e.code]] = true; e.preventDefault(); startAmbient(); }
       else if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') sprintRef.current = true;
       else if (e.code === 'KeyE') emit(EV.interact);
-      else if (e.code === 'KeyR') emit(EV.reload);
+      else if (e.code === 'KeyR') { if (heldKitRef.current) rotateBuild(); else emit(EV.reload); }
       else if (e.code === 'Tab' || e.code === 'KeyI') { e.preventDefault(); only(menuRef.current.gear ? null : 'gear'); }
       else if (e.code === 'KeyC') only(menuRef.current.craft ? null : 'craft');
       else if (e.code === 'KeyK') only(menuRef.current.skills ? null : 'skills');
@@ -713,7 +711,7 @@ export default function GameClient() {
         if (you) {
           const wx = you.x + (e.clientX - window.innerWidth / 2) / 2; // zoom = 2
           const wy = you.y + (e.clientY - window.innerHeight / 2) / 2;
-          emit(EV.build, { slot: pl.slot, tx: Math.floor(wx / TILE), ty: Math.floor(wy / TILE) });
+          emit(EV.build, { slot: pl.slot, tx: Math.floor(wx / TILE), ty: Math.floor(wy / TILE), rotation: buildRotationRef.current });
         }
         return;
       }
@@ -768,7 +766,7 @@ export default function GameClient() {
       window.removeEventListener('wheel', onWheel);
       window.removeEventListener('blur', onBlur);
     };
-  }, [emit, quickHeal, toggleDemolish, refreshFriends, pushToast, only, holdKit, useSlot, cycleHotbar]);
+  }, [emit, quickHeal, toggleDemolish, refreshFriends, pushToast, only, holdKit, rotateBuild, useSlot, cycleHotbar]);
 
   // input + footsteps at 20Hz
   useEffect(() => {
@@ -853,7 +851,7 @@ export default function GameClient() {
       const meNow = players.find((p) => p.id === youRef.current);
 
       // build placement ghost — snap the cursor to a tile, mark valid/invalid
-      let ghost: { tile: number; tx: number; ty: number; valid: boolean } | null = null;
+      let ghost: { tile: number; blockId?: string; rotation: number; tx: number; ty: number; valid: boolean } | null = null;
       const pl = heldKitRef.current;
       if (pl && meNow) {
         const wx = meNow.dx + (mouse.current.x - canvas.width / 2) / renderer.zoom;
@@ -867,7 +865,7 @@ export default function GameClient() {
         // floors need grass; everything else can also go on top of flooring
         const isFloorKit = bt === 'wood_floor' || bt === 'stone_floor';
         const groundOk = isFloorKit ? under === Tile.Grass : under === Tile.Grass || !!FLOOR_TILES[under];
-        ghost = { tile, tx, ty, valid: inRange && groundOk };
+        ghost = { tile, blockId: bt ? renderer.playerBlockId(bt) : undefined, rotation: buildRotationRef.current, tx, ty, valid: inRange && groundOk };
       }
 
       // demolish marker — is there a reclaimable piece under the cursor?
@@ -1229,13 +1227,14 @@ export default function GameClient() {
 
       {location && <div className="location-banner" key={location}>{location.toUpperCase()}</div>}
       {inSafe && !inHideout && <div className="safe-chip">SAFE ZONE — ENTER chat · extract to get home</div>}
-      {inHideout && <div className="safe-chip">{ownHideout ? 'HOME BASE — B build · X demolish · walk the mat to deploy' : 'ALLY CAMP — E on the mat to leave'}</div>}
+      {inHideout && <div className="safe-chip">{ownHideout ? 'HOME BASE — B build · R rotate · X demolish · walk the mat to deploy' : 'ALLY CAMP — E on the mat to leave'}</div>}
       {heldKit && !anyPanel && (
         <div className="build-bar">
           <span>HOLDING <b>{ITEMS[heldKit.item].name}</b>{heldKit.qty > 1 ? ` ×${heldKit.qty}` : ''}</span>
           <span className="build-hint">
-            click the ground to place{inHideout ? '' : ' — wears out & is destructible in the world'} · scroll to swap hands
+            R rotate ({buildRotation * 90}°) · click the ground to place{inHideout ? '' : ' — wears out & is destructible in the world'} · scroll to swap hands
           </span>
+          <button onClick={rotateBuild}>ROTATE 90°</button>
           <button onClick={() => emit(EV.invEquip, { slot: heldKit.slot })}>PUT AWAY</button>
         </div>
       )}
@@ -1287,9 +1286,9 @@ export default function GameClient() {
               <div className="label">H2O {inv.thirst}</div>
             </div>
           </div>
-          <div className="bar mini stamina" title="Stamina — hold SHIFT to sprint; mining and chopping cost it">
-            <div className="fill" style={{ width: `${inv.stamina}%`, background: inv.stamina > 25 ? '#5fd0a0' : 'var(--gold)' }} />
-            <div className="label">STAM {inv.stamina}{' · SHIFT run'}</div>
+          <div className={`bar mini stamina${inv.staminaExhausted ? ' exhausted' : ''}`} title="Stamina - reaching zero causes a short exhaustion lockout">
+            <div className="fill" style={{ width: `${inv.stamina}%`, background: inv.staminaExhausted ? '#c85a4a' : inv.stamina > 25 ? '#5fd0a0' : 'var(--gold)' }} />
+            <div className="label">{inv.staminaExhausted ? `EXHAUSTED ${inv.stamina}` : `STAM ${inv.stamina} · SHIFT run`}</div>
           </div>
           <div className="weapon-line">
             {equippedItem
@@ -1452,18 +1451,6 @@ export default function GameClient() {
             </div>
             <div className="quick-label">QUICK SLOTS</div>
             <div className="quick-row">{inv.inv.slots.slice(0, 5).map((s, i) => invSlot(s, i))}</div>
-            <div className="quick-label">APPEARANCE</div>
-            <div className="look-row">
-              {Array.from({ length: 8 }, (_, n) => (
-                <button
-                  key={n}
-                  className={`look-swatch${inv.look === n ? ' active' : ''}`}
-                  style={{ background: LOOK_COLORS[n] }}
-                  onClick={() => emit(EV.look, { look: n })}
-                  title={`Outfit ${n + 1}`}
-                />
-              ))}
-            </div>
           </section>
 
           {container && (
@@ -1550,171 +1537,45 @@ export default function GameClient() {
         </div>
       )}
 
-      {/* Crafting: category tabs → icon grid → detail with craft queue.
-          Station recipes are HIDDEN unless you stand at that station. */}
-      {showCraft && inv && (() => {
-        const hasStation = (st?: string) =>
-          !st || (st === 'workbench' ? inv.nearWorkbench : st === 'furnace' ? inv.nearFurnace : st === 'anvil' ? inv.nearAnvil : true);
-        const canMake = (r: typeof RECIPES[number]) => r.cost.every((c) => countOf(c.id) >= c.qty) && hasStation(r.station);
-        const list = RECIPES.filter((r) => r.cat === craftTab && hasStation(r.station));
-        const hidden = RECIPES.filter((r) => r.cat === craftTab && !hasStation(r.station));
-        const hiddenStations = [...new Set(hidden.map((r) => STATION_LABEL[r.station!]))].join(' / ');
-        const r = list.find((x) => x.id === craftSel) ?? list[0];
-        const queuedOf = (id: string) => craftQueue.filter((q) => q === id).length;
-        const enqueue = (id: string, n = 1) => setCraftQueue((q) => [...q, ...new Array<string>(n).fill(id)]);
-        return (
-          <div className="panel craft-panel">
-            <h3>
-              CRAFTING
-              <span className="sub">
-                {craftQueue.length > 0 ? `⏳ ${craftQueue.length} queued · ` : ''}C to close
-              </span>
-            </h3>
-            <div className="craft-tabs">
-              {CRAFT_TABS.filter((t) => {
-                // a tab whose recipes are ALL behind one station only shows at that station
-                const cats = RECIPES.filter((r) => r.cat === t.cat);
-                const stations = new Set(cats.map((r) => r.station));
-                if (stations.size === 1 && cats[0]?.station) {
-                  const st = cats[0].station;
-                  return st === 'furnace' ? inv.nearFurnace : st === 'anvil' ? inv.nearAnvil : st === 'workbench' ? inv.nearWorkbench : true;
-                }
-                return true;
-              }).map((t) => (
-                <button key={t.cat} className={craftTab === t.cat ? 'active' : ''} onClick={() => { setCraftTab(t.cat); setCraftSel(null); }}>{t.label}</button>
-              ))}
-            </div>
-            <div className="craft-body">
-              <div className="craft-col">
-              <div className="craft-grid">
-                {list.map((rc) => {
-                  const ok = canMake(rc);
-                  const nq = queuedOf(rc.id);
-                  return (
-                    <Tip key={rc.id} tip={itemTip(rc.out.id, rc.out.qty)}>
-                      <button
-                        className={`craft-cell${(r && r.id === rc.id) ? ' active' : ''}${ok ? ' craftable' : ' locked'}`}
-                        onClick={() => setCraftSel(rc.id)}
-                        onDoubleClick={() => ok && enqueue(rc.id)}
-                      >
-                        <ItemIcon id={rc.out.id} size={28} />
-                        {rc.out.qty > 1 && <span className="cc-qty">×{rc.out.qty}</span>}
-                        {rc.station && <span className="cc-station">⚒</span>}
-                        {nq > 0 && <span className="queue-badge">{nq}</span>}
-                      </button>
-                    </Tip>
-                  );
-                })}
-                {list.length === 0 && (
-                  <div className="craft-empty">
-                    Nothing craftable by hand here.
-                  </div>
-                )}
-              </div>
-              {hidden.length > 0 && (
-                <div className="craft-hidden">🔒 {hidden.length} more recipe{hidden.length > 1 ? 's' : ''} at the {hiddenStations}</div>
-              )}
-              </div>
-              <div className="craft-detail">
-                {r && (() => {
-                  const ok = canMake(r);
-                  const nq = queuedOf(r.id);
-                  return (
-                    <>
-                      <div className="cd-head"><ItemIcon id={r.out.id} size={40} /><div><b>{ITEMS[r.out.id].name}</b>{r.out.qty > 1 && <span className="cd-qty"> ×{r.out.qty}</span>}</div></div>
-                      <div className="cd-desc">{ITEMS[r.out.id].desc}</div>
-                      <div className="cd-req">REQUIRES</div>
-                      <div className="cd-costs">
-                        {r.cost.map((c) => (
-                          <div key={c.id} className={countOf(c.id) >= c.qty ? 'have' : 'missing'}>
-                            <ItemIcon id={c.id} size={18} /> {ITEMS[c.id].name}
-                            <span className="cd-count">{countOf(c.id)}/{c.qty}</span>
-                          </div>
-                        ))}
-                      </div>
-                      {r.station && !hasStation(r.station) && (
-                        <div className="cd-warn">Stand next to a {STATION_LABEL[r.station]} (craft & place its kit from BUILD)</div>
-                      )}
-                      <div className="craft-actions">
-                        <button className="btn-primary craft-go" disabled={!ok} onClick={() => enqueue(r.id)}>
-                          {ok ? (nq > 0 ? `CRAFT (+${nq} queued)` : 'CRAFT') : r.station && !hasStation(r.station) ? `NEED ${STATION_LABEL[r.station!].toUpperCase()}` : 'MISSING MATERIALS'}
-                        </button>
-                        <button className="btn-primary craft-go x5" disabled={!ok} onClick={() => enqueue(r.id, 5)}>×5</button>
-                        {craftQueue.length > 0 && (
-                          <button className="craft-clear" title="clear the craft queue" onClick={() => setCraftQueue([])}>✕</button>
-                        )}
-                      </div>
-                    </>
-                  );
-                })()}
-              </div>
-            </div>
-          </div>
-        );
-      })()}
+      {showCraft && inv && (
+        <CraftingPanel
+          inventory={inv}
+          tab={craftTab}
+          selectedRecipeId={craftSel}
+          queue={craftQueue}
+          countItem={countOf}
+          onSelectTab={setCraftTab}
+          onSelectRecipe={setCraftSel}
+          onEnqueue={(id, count = 1) =>
+            setCraftQueue((queued) => [...queued, ...new Array<string>(count).fill(id)])
+          }
+          onClearQueue={() => setCraftQueue([])}
+        />
+      )}
 
-      {/* Campfire: click a row to queue ONE cook; badge shows how many are queued */}
-      {station === 'firepit' && inv && (() => {
-        const rawSlots = inv.inv.slots
-          .map((s, i) => ({ s, i }))
-          .filter((x): x is { s: { id: ItemId; qty: number }; i: number } => !!x.s && !!ITEMS[x.s.id].raw);
-        const cookingSlot = action?.kind === 'cook' ? action.slot : undefined;
-        const queuedOf = (i: number) => cookQueue.filter((q) => q === i).length;
-        return (
-          <div className="panel cook-panel">
-            <h3>CAMPFIRE<span className="sub">click = cook 1 · ESC to close</span></h3>
-            {rawSlots.length === 0 ? (
-              <div className="item-desc">Nothing raw to cook — hunt animals or catch fish, then come back.</div>
-            ) : (
-              <div className="cook-list">
-                {rawSlots.map(({ s, i }) => {
-                  const def = ITEMS[s.id];
-                  const cooking = cookingSlot === i;
-                  const nq = queuedOf(i);
-                  return (
-                    <button
-                      key={i}
-                      className={`cook-row${cooking ? ' cooking' : ''}${nq > 0 ? ' queued' : ''}`}
-                      onClick={() => setCookQueue((q) => (queuedOf(i) + (cooking ? 1 : 0) < s.qty ? [...q, i] : q))}
-                    >
-                      <ItemIcon id={s.id} size={28} />
-                      <span className="cook-name">{def.name} ×{s.qty}</span>
-                      <span className="cook-arrow">→</span>
-                      <ItemIcon id={def.raw!} size={22} />
-                      {cooking && action && (
-                        <span className="cook-prog">
-                          <span key={action.until} style={{ animationDuration: `${action.ms}ms` }} />
-                        </span>
-                      )}
-                      {nq > 0 && <span className="queue-badge">{nq}</span>}
-                      {!cooking && nq === 0 && <span className="cook-hint">COOK +1</span>}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-            <div className="item-actions">
-              {rawSlots.length > 0 && (
-                <button
-                  onClick={() =>
-                    setCookQueue((q) => {
-                      const next = [...q];
-                      for (const { s, i } of rawSlots) {
-                        const already = next.filter((x) => x === i).length + (cookingSlot === i ? 1 : 0);
-                        for (let n = already; n < s.qty; n++) next.push(i);
-                      }
-                      return next;
-                    })
-                  }
-                >
-                  {cookQueue.length > 0 ? `COOKING… (${cookQueue.length} queued)` : 'QUEUE EVERYTHING'}
-                </button>
-              )}
-              <button onClick={() => { setCookQueue([]); setStation(null); }}>CLOSE</button>
-            </div>
-          </div>
-        );
-      })()}
+      {station === 'firepit' && inv && (
+        <CookingPanel
+          inventory={inv}
+          action={action}
+          queue={cookQueue}
+          onQueueSlot={(slot) => setCookQueue((queued) => [...queued, slot])}
+          onQueueAll={(slots) =>
+            setCookQueue((queued) => {
+              const next = [...queued];
+              for (const { slot, quantity } of slots) {
+                const alreadyQueued = next.filter((queuedSlot) => queuedSlot === slot).length;
+                const currentlyCooking = action?.kind === 'cook' && action.slot === slot ? 1 : 0;
+                for (let count = alreadyQueued + currentlyCooking; count < quantity; count++) next.push(slot);
+              }
+              return next;
+            })
+          }
+          onClose={() => {
+            setCookQueue([]);
+            setStation(null);
+          }}
+        />
+      )}
 
       {/* starter objectives checklist */}
       {connected && !dead && !objectives.celebrated && !panelsOpenRef.current && (
@@ -1727,200 +1588,61 @@ export default function GameClient() {
           ))}
         </div>
       )}
+      {showSkills && inv && <SkillsPanel inventory={inv} />}
 
-      {/* Skills */}
-      {showSkills && inv && (
-        <div className="panel skills-panel">
-          <h3>SKILLS<span className="sub">K to close</span></h3>
-          {SKILL_LIST.map((s) => {
-            const xp = inv.skills[s.id] ?? 0;
-            const lvl = skillLevel(xp);
-            const cur = xpForLevel(lvl);
-            const next = xpForLevel(lvl + 1);
-            const pct = lvl >= 50 ? 100 : Math.round(((xp - cur) / (next - cur)) * 100);
-            return (
-              <div className="skill-row" key={s.id}>
-                <div className="sk-head"><b>{s.name}</b><span className="sk-lvl">LV {lvl}</span></div>
-                <div className="sk-bar"><div style={{ width: `${pct}%` }} /></div>
-                <div className="sk-bonus">{s.bonus}</div>
-              </div>
-            );
-          })}
-        </div>
+      {trade && inv && (
+        <TradePanel
+          trade={trade}
+          inventory={inv}
+          tab={tradeTab}
+          selectedBuyId={buySel}
+          selectedSellSlot={sellSel}
+          onSelectTab={setTradeTab}
+          onSelectBuy={setBuySel}
+          onSelectSell={setSellSel}
+          onBuy={(id, quantity) => emit(EV.tradeBuy, { id, qty: quantity })}
+          onSell={(slot, quantity) => emit(EV.tradeSell, { slot, qty: quantity })}
+          onClaimQuest={(id) => emit(EV.questClaim, { id })}
+          onClose={() => setTrade(null)}
+        />
       )}
 
-      {/* Trader: BUY / SELL / JOBS tabs — icon grids + detail, same language as crafting */}
-      {trade && inv && (() => {
-        const buyList = trade.stock.filter((e) => e.buy > 0);
-        const sellable = inv.inv.slots
-          .map((s, i) => ({ s, i, entry: s ? trade.stock.find((e) => e.id === s.id && e.sell > 0) : undefined }))
-          .filter((x): x is { s: { id: ItemId; qty: number }; i: number; entry: { id: ItemId; buy: number; sell: number } } => !!x.s && !!x.entry);
-        const openJobs = trade.quests.filter((q) => !q.claimed).length;
-        const buyEntry = buyList.find((e) => e.id === buySel) ?? buyList[0];
-        const sellRow = sellable.find((x) => x.i === sellSel) ?? sellable[0];
-        return (
-          <div className="panel trade-panel">
-            <h3>{trade.tier === 2 ? '☠ BLACK MARKET' : 'TRADER'}<span className="sub">{trade.money} credits</span></h3>
-            <div className="craft-tabs">
-              <button className={tradeTab === 'buy' ? 'active' : ''} onClick={() => setTradeTab('buy')}>BUY</button>
-              <button className={tradeTab === 'sell' ? 'active' : ''} onClick={() => setTradeTab('sell')}>SELL{sellable.length > 0 ? ` (${sellable.length})` : ''}</button>
-              <button className={tradeTab === 'jobs' ? 'active' : ''} onClick={() => setTradeTab('jobs')}>JOBS{openJobs > 0 ? ` (${openJobs})` : ''}</button>
-            </div>
-
-            {tradeTab === 'buy' && (
-              <div className="craft-body">
-                <div className="craft-grid trade-grid">
-                  {buyList.map((e) => (
-                    <Tip key={e.id} tip={itemTip(e.id)}>
-                      <button
-                        className={`craft-cell${buyEntry?.id === e.id ? ' active' : ''}${inv.money >= e.buy ? ' craftable' : ' locked'}`}
-                        onClick={() => setBuySel(e.id)}
-                        onDoubleClick={() => inv.money >= e.buy && emit(EV.tradeBuy, { id: e.id, qty: 1 })}
-                      >
-                        <ItemIcon id={e.id} size={28} />
-                        <span className="cc-price">{e.buy}</span>
-                      </button>
-                    </Tip>
-                  ))}
-                </div>
-                <div className="craft-detail">
-                  {buyEntry && (
-                    <>
-                      <div className="cd-head"><ItemIcon id={buyEntry.id} size={40} /><div><b>{ITEMS[buyEntry.id].name}</b></div></div>
-                      <div className="cd-desc">{ITEMS[buyEntry.id].desc}</div>
-                      <div className="cd-costs">
-                        <div className={inv.money >= buyEntry.buy ? 'have' : 'missing'}>
-                          PRICE <span className="cd-count">{buyEntry.buy} cr</span>
-                        </div>
-                        <div className="have">YOUR CREDITS <span className="cd-count">{trade.money}</span></div>
-                      </div>
-                      <div className="craft-actions">
-                        <button className="btn-primary craft-go" disabled={inv.money < buyEntry.buy} onClick={() => emit(EV.tradeBuy, { id: buyEntry.id, qty: 1 })}>BUY 1</button>
-                        <button className="btn-primary craft-go x5" disabled={inv.money < buyEntry.buy * 5} onClick={() => emit(EV.tradeBuy, { id: buyEntry.id, qty: 5 })}>×5</button>
-                      </div>
-                    </>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {tradeTab === 'sell' && (
-              <div className="craft-body">
-                <div className="craft-grid trade-grid">
-                  {sellable.map(({ s, i, entry }) => (
-                    <Tip key={i} tip={itemTip(s.id, s.qty)}>
-                      <button
-                        className={`craft-cell craftable${sellRow?.i === i ? ' active' : ''}`}
-                        onClick={() => setSellSel(i)}
-                        onDoubleClick={() => emit(EV.tradeSell, { slot: i, qty: 1 })}
-                      >
-                        <ItemIcon id={s.id} size={28} />
-                        {s.qty > 1 && <span className="cc-qty">×{s.qty}</span>}
-                        <span className="cc-price">{entry.sell}</span>
-                      </button>
-                    </Tip>
-                  ))}
-                  {sellable.length === 0 && <div className="craft-empty">Nothing in your backpack this trader wants.</div>}
-                </div>
-                <div className="craft-detail">
-                  {sellRow && (
-                    <>
-                      <div className="cd-head"><ItemIcon id={sellRow.s.id} size={40} /><div><b>{ITEMS[sellRow.s.id].name}</b><span className="cd-qty"> ×{sellRow.s.qty}</span></div></div>
-                      <div className="cd-desc">{ITEMS[sellRow.s.id].desc}</div>
-                      <div className="cd-costs">
-                        <div className="have">EACH <span className="cd-count">{sellRow.entry.sell} cr</span></div>
-                        <div className="have">WHOLE STACK <span className="cd-count">{sellRow.entry.sell * sellRow.s.qty} cr</span></div>
-                      </div>
-                      <div className="craft-actions">
-                        <button className="btn-primary craft-go" onClick={() => emit(EV.tradeSell, { slot: sellRow.i, qty: 1 })}>SELL 1</button>
-                        <button className="btn-primary craft-go x5" onClick={() => emit(EV.tradeSell, { slot: sellRow.i, qty: sellRow.s.qty })}>ALL</button>
-                      </div>
-                    </>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {tradeTab === 'jobs' && (
-              <div className="jobs">
-                {trade.quests.map((q) => (
-                  <div className="job-row" key={q.def.id}>
-                    <div className="job-body">
-                      <b>{q.def.name}</b>
-                      <div className="job-desc">
-                        {q.def.desc || (q.def.kind === 'kill' ? `Kill ${q.def.count} ${q.def.target}s` : `Bring ${q.def.count} ${ITEMS[q.def.target as ItemId]?.name ?? q.def.target}`)}
-                        {' · '}{q.progress}/{q.def.count}
-                        {' · '}reward {q.def.rewardMoney}cr{q.def.rewardItem ? ` + ${ITEMS[q.def.rewardItem].name}` : ''}
-                      </div>
-                    </div>
-                    {q.claimed ? <span className="job-done">DONE</span> : (
-                      <button disabled={!q.done} onClick={() => emit(EV.questClaim, { id: q.def.id })}>CLAIM</button>
-                    )}
-                  </div>
-                ))}
-                {trade.quests.length === 0 && <div className="craft-empty">No work for you here yet — finish earlier jobs to unlock more.</div>}
-              </div>
-            )}
-
-            <div className="item-actions">
-              <button onClick={() => setTrade(null)}>CLOSE</button>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Social */}
       {showSocial && (
-        <div className="panel social-panel">
-          <h3>CONTACTS<span className="sub">P to close</span></h3>
-          <div className="friend-add">
-            <input placeholder="friend's callsign" value={friendUsername} onChange={(e) => setFriendUsername(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addFriend(); e.stopPropagation(); }} />
-            <button onClick={addFriend}>ADD</button>
-          </div>
-          <div className="friend-msg">{friendMsg}</div>
-          {friends.length === 0 && <div className="item-desc">No contacts yet. Friends show up green on your map.</div>}
-          {friends.map((f) => (
-            <div className="friend-row" key={f.id}>
-              <span className={`f-dot ${f.status}`} />
-              <span className="f-name">{f.name}</span>
-              <span className="f-status">{f.status === 'accepted' ? 'ally' : f.incoming ? 'wants to ally' : 'pending'}</span>
-              {f.status === 'accepted' && (ownHideout || (inSafe && !inHideout)) && (
-                <button onClick={() => { only(null); emit(EV.hideoutEnter, { owner: f.id }); }}>VISIT CAMP</button>
-              )}
-              {f.status !== 'accepted' && f.incoming && <button onClick={() => acceptFriend(f.id)}>ACCEPT</button>}
-              {f.status !== 'accepted' && f.incoming && <button className="f-remove" onClick={() => removeFriend(f.id)}>DECLINE</button>}
-              {f.status !== 'accepted' && !f.incoming && <button className="f-remove" onClick={() => removeFriend(f.id)}>CANCEL</button>}
-              {f.status === 'accepted' && <button className="f-remove" onClick={() => removeFriend(f.id)}>REMOVE</button>}
-            </div>
-          ))}
-        </div>
+        <SocialPanel
+          friends={friends}
+          username={friendUsername}
+          message={friendMsg}
+          canVisitCamps={ownHideout || (inSafe && !inHideout)}
+          onUsernameChange={setFriendUsername}
+          onAddFriend={addFriend}
+          onAcceptFriend={acceptFriend}
+          onRemoveFriend={removeFriend}
+          onVisitCamp={(owner) => {
+            only(null);
+            emit(EV.hideoutEnter, { owner });
+          }}
+        />
       )}
 
-      {/* ESC system menu */}
       {escMenu && !dead && (
-        <div className="death-overlay esc-menu">
-          <h2>PAUSED</h2>
-          <p className="death-stats">The zone keeps moving while you stand still.</p>
-          {!inHideout && !inSafe && (
-            <p className="esc-warn">⚠ You&apos;re out in the open — if you leave now your body stays in the zone for 60s and can be killed and looted. Extract or reach a safe zone first to be safe.</p>
-          )}
-          <button className="btn-primary" onClick={() => setEscMenu(false)}>RESUME</button>
-          <button className="btn-primary secondary" onClick={() => setMuted(toggleMute())}>{muted ? '🔇 SOUND OFF' : '🔊 SOUND ON'}</button>
-          <button className="btn-primary secondary" onClick={returnToMenu}>RETURN TO MENU</button>
-          <button className="btn-primary secondary" onClick={leave}>LOG OUT</button>
-        </div>
+        <PauseOverlay
+          inHideout={inHideout}
+          inSafeZone={inSafe}
+          muted={muted}
+          onResume={() => setEscMenu(false)}
+          onToggleSound={() => setMuted(toggleMute())}
+          onReturnToMenu={returnToMenu}
+          onLogOut={leave}
+        />
       )}
 
-      {/* Death overlay */}
       {dead && (
-        <div className="death-overlay">
-          <h2>YOU DIED</h2>
-          <p>Killed by {dead}. Your gear was dropped where you fell.</p>
-          <p className="death-stats">You respawn with only your fists — stash, credits and skills are safe.</p>
-          {inv && <p className="death-stats">☠ {inv.kills} kills · {inv.deaths} deaths · {inv.money} cr</p>}
-          <button className="btn-primary" onClick={() => emit(EV.respawn)}>RESPAWN</button>
-          <button className="btn-primary secondary" onClick={leave}>LOG OUT</button>
-        </div>
+        <DeathOverlay
+          killer={dead}
+          inventory={inv}
+          onRespawn={() => emit(EV.respawn)}
+          onLogOut={leave}
+        />
       )}
     </div>
   );
