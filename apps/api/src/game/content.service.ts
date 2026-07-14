@@ -24,6 +24,8 @@ import {
 import { DbService } from '../db/db.service';
 
 const POLL_MS = 10_000;
+const CONTENT_KINDS = ['mobs', 'recipes', 'traders', 'loot', 'sprites', 'animations', 'resources', 'sounds', 'blocks', 'terrain'] as const;
+const VISUAL_KINDS = new Set<string>(['mobs', 'sprites', 'animations', 'resources', 'sounds', 'blocks', 'terrain']);
 
 @Injectable()
 export class ContentService implements OnModuleInit, OnModuleDestroy {
@@ -34,13 +36,15 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
   private traderDefs: Record<TraderTier, TradeEntry[]> = TRADER_TIER_STOCK;
   private lootDefs: LootTableRegistry = DEFAULT_LOOT_TABLES;
   private visualDefs: RuntimeVisualContent = { assets: {}, animations: {}, resources: {}, sounds: { presets: {}, actions: {} }, mobSounds: {}, blocks: {}, terrain: {} };
-  private visualKey = '';
   private visualVersion = 0;
+  private publishedDocs: Record<string, unknown> = {};
+  private publishedManifest: Record<string, string> = {};
+  private refreshing = false;
 
   constructor(private readonly db: DbService) {}
 
   async onModuleInit() {
-    await this.refresh();
+    await this.refresh(true);
     this.timer = setInterval(() => void this.refresh(), POLL_MS);
   }
 
@@ -48,13 +52,52 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     clearInterval(this.timer);
   }
 
-  private async refresh() {
-    const docs = await this.db.loadPublishedContent(['mobs', 'recipes', 'traders', 'loot', 'sprites', 'animations', 'resources', 'sounds', 'blocks', 'terrain']);
+  private async refresh(force = false) {
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      const manifest = await this.db.loadPublishedContentManifest([...CONTENT_KINDS]);
+      if (!manifest) {
+        if (force || !Object.keys(this.publishedDocs).length) await this.restoreRuntimeCache();
+        return;
+      }
+      const changedKinds = CONTENT_KINDS.filter((kind) => force || manifest[kind] !== this.publishedManifest[kind]);
+      if (!changedKinds.length) return;
+      const changedDocs = await this.db.loadPublishedContent([...changedKinds]);
+      if (!changedDocs) {
+        if (force || !Object.keys(this.publishedDocs).length) await this.restoreRuntimeCache();
+        return;
+      }
+      for (const kind of changedKinds) {
+        if (Object.prototype.hasOwnProperty.call(changedDocs, kind)) this.publishedDocs[kind] = changedDocs[kind];
+        else delete this.publishedDocs[kind];
+      }
+      this.publishedManifest = manifest;
+      this.applyDocuments(this.publishedDocs, force || changedKinds.some((kind) => VISUAL_KINDS.has(kind)));
+      await this.db.savePublishedContentCache(this.publishedManifest, this.publishedDocs);
+      this.log.log(`Published content cached in memory (${changedKinds.join(', ')})`);
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  private async restoreRuntimeCache() {
+    const cached = await this.db.loadPublishedContentCache();
+    if (!cached) return false;
+    this.publishedManifest = cached.manifest;
+    this.publishedDocs = cached.docs;
+    this.applyDocuments(this.publishedDocs, true);
+    this.log.warn('Published content restored from the socket server runtime cache');
+    return true;
+  }
+
+  private applyDocuments(docs: Record<string, unknown>, rebuildVisuals: boolean) {
     const mobs = docs.mobs && typeof docs.mobs === 'object' && !Array.isArray(docs.mobs)
       ? docs.mobs as Record<string, EngineMobDefinition>
       : {};
     this.mobDefs = { ...ENEMY_DEFS, ...mobs };
 
+    this.recipeDefs = RECIPES;
     if (Array.isArray(docs.recipes)) {
       const valid = (docs.recipes as Recipe[]).filter((recipe) =>
         recipe && typeof recipe.id === 'string' && recipe.out?.id in ITEMS && Array.isArray(recipe.cost) &&
@@ -64,6 +107,7 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     }
 
     const traders = docs.traders as Record<string, { stock?: TradeEntry[] }> | undefined;
+    this.traderDefs = TRADER_TIER_STOCK;
     if (traders && typeof traders === 'object') {
       this.traderDefs = {
         1: this.validStock(traders.outpost?.stock) ?? TRADER_TIER_STOCK[1],
@@ -72,11 +116,10 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     }
 
     const loot = docs.loot as LootTableRegistry | undefined;
+    this.lootDefs = DEFAULT_LOOT_TABLES;
     if (loot && typeof loot === 'object' && Object.keys(loot).length) this.lootDefs = { ...DEFAULT_LOOT_TABLES, ...loot };
 
-    const nextVisualKey = JSON.stringify([docs.sprites ?? null, docs.animations ?? null, docs.resources ?? null, docs.sounds ?? null, docs.mobs ?? null, docs.blocks ?? null, docs.terrain ?? null]);
-    if (nextVisualKey === this.visualKey) return;
-    this.visualKey = nextVisualKey;
+    if (!rebuildVisuals) return;
     const sprites = docs.sprites as SpriteDocument | undefined;
     const animations = docs.animations as AnimationDocument | undefined;
     const resources = docs.resources && typeof docs.resources === 'object' && !Array.isArray(docs.resources)

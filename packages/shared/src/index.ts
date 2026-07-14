@@ -525,6 +525,7 @@ export interface WorldInit {
   width: number;
   height: number;
   tiles: number[];
+  tileRuns?: number[]; // compact [value,count] pairs; used when tiles is empty
   pois: PoiSnap[];
   traders: { x: number; y: number; tier?: TraderTier }[];
   extracts: { x: number; y: number }[]; // extraction beacons — hold E to go home with your loot
@@ -532,7 +533,9 @@ export interface WorldInit {
   ownHideout: boolean; // true when this is YOUR hideout (enables building)
   unders: Record<number, number>; // tile index → floor tile beneath a placed station
   elevations: number[];
+  elevationRuns?: number[]; // compact [value,count] pairs; used when elevations is empty
   terrainKinds: Record<string, string>; // tile index -> published terrain definition
+  terrainRuns?: TerrainRun[]; // compact sparse terrain overrides when terrainKinds is empty
   resourceKinds: Record<string, string>; // tile index -> published resource definition
   blockKinds: Record<string, string>; // tile index -> published world-block definition
   blockRotations: Record<string, number>; // tile index -> clockwise quarter turns (0-3)
@@ -687,13 +690,127 @@ export interface MapObject {
 export interface AuthoredMap {
   w: number;
   h: number;
-  tiles: number[];
+  tiles?: number[]; // legacy dense storage
+  tileRuns?: number[]; // compact [value,count] byte runs
   elevations?: number[];
-  terrain?: Record<string, string>; // tile index -> terrain definition id
+  elevationRuns?: number[]; // compact [value,count] byte runs
+  terrain?: Record<string, string>; // sparse tile index -> terrain definition override
+  terrainRuns?: TerrainRun[]; // compact [start,count,id] override spans
   resources?: Record<string, string>; // tile index -> resource definition id
   blocks?: Record<string, string>; // tile index -> world-block definition id
   blockRotations?: Record<string, number>; // tile index -> clockwise quarter turns (0-3)
   objects: MapObject[];
+}
+
+export const AUTHORED_MAP_MIN_SIZE = 20;
+export const AUTHORED_MAP_MAX_SIZE = 2000;
+export const DEFAULT_TERRAIN_ID_BY_TILE: Partial<Record<Tile, string>> = {
+  [Tile.Grass]: 'grass', [Tile.Water]: 'water', [Tile.Tree]: 'tree', [Tile.Floor]: 'floor',
+  [Tile.Wall]: 'wall', [Tile.Road]: 'road', [Tile.Sand]: 'sand', [Tile.Rock]: 'rock',
+  [Tile.Asphalt]: 'asphalt', [Tile.Bed]: 'bed', [Tile.DoorMat]: 'doormat',
+  [Tile.CopperOre]: 'copper_ore', [Tile.IronOre]: 'iron_ore', [Tile.Cliff]: 'cliff',
+};
+
+export type TerrainRun = [start: number, count: number, terrainId: string];
+
+export function encodeTerrainRuns(terrain: Record<string, string>): TerrainRun[] {
+  const entries = Object.entries(terrain)
+    .map(([rawIndex, id]) => [Number(rawIndex) | 0, id] as const)
+    .filter(([index, id]) => index >= 0 && typeof id === 'string' && Boolean(id))
+    .sort((a, b) => a[0] - b[0]);
+  const runs: TerrainRun[] = [];
+  for (const [index, id] of entries) {
+    const previous = runs[runs.length - 1];
+    if (previous && previous[2] === id && previous[0] + previous[1] === index) previous[1]++;
+    else runs.push([index, 1, id]);
+  }
+  return runs;
+}
+
+export function decodeTerrainRuns(runs: readonly TerrainRun[] | undefined, cellCount: number): Record<string, string> {
+  const terrain: Record<string, string> = {};
+  if (!Array.isArray(runs)) return terrain;
+  for (const run of runs) {
+    if (!Array.isArray(run) || run.length !== 3 || typeof run[2] !== 'string') continue;
+    const start = Math.max(0, Number(run[0]) | 0);
+    const count = Math.max(0, Math.min(cellCount - start, Number(run[1]) | 0));
+    if (!count || start >= cellCount) continue;
+    for (let offset = 0; offset < count; offset++) terrain[String(start + offset)] = run[2];
+  }
+  return terrain;
+}
+
+/** Encode a byte grid as alternating value/count pairs for JSON and socket transport. */
+export function encodeByteRuns(values: ArrayLike<number>): number[] {
+  if (!values.length) return [];
+  const runs: number[] = [];
+  let value = Math.max(0, Math.min(255, Number(values[0]) | 0));
+  let count = 1;
+  for (let index = 1; index < values.length; index++) {
+    const next = Math.max(0, Math.min(255, Number(values[index]) | 0));
+    if (next === value) count++;
+    else {
+      runs.push(value, count);
+      value = next;
+      count = 1;
+    }
+  }
+  runs.push(value, count);
+  return runs;
+}
+
+/** Validate that byte runs are canonical and cover exactly the requested grid. */
+export function isCompleteByteRuns(runs: unknown, expectedLength: number): runs is number[] {
+  if (!Array.isArray(runs) || runs.length === 0 || runs.length % 2 !== 0) return false;
+  const expected = Math.max(0, expectedLength | 0);
+  let length = 0;
+  for (let index = 0; index < runs.length; index += 2) {
+    const value = Number(runs[index]);
+    const count = Number(runs[index + 1]);
+    if (!Number.isInteger(value) || value < 0 || value > 255 || !Number.isInteger(count) || count <= 0) return false;
+    length += count;
+    if (length > expected) return false;
+  }
+  return length === expected;
+}
+
+/** Decode bounded value/count pairs. Missing or malformed tails retain the fallback value. */
+export function decodeByteRuns(runs: readonly number[] | undefined, length: number, fallback = 0): Uint8Array {
+  const size = Math.max(0, length | 0);
+  const output = new Uint8Array(size);
+  if (fallback) output.fill(Math.max(0, Math.min(255, fallback | 0)));
+  if (!Array.isArray(runs) || runs.length % 2 !== 0) return output;
+  let offset = 0;
+  for (let index = 0; index < runs.length && offset < size; index += 2) {
+    const value = Math.max(0, Math.min(255, Number(runs[index]) | 0));
+    const count = Math.max(0, Math.min(size - offset, Number(runs[index + 1]) | 0));
+    if (!count) continue;
+    output.fill(value, offset, offset + count);
+    offset += count;
+  }
+  return output;
+}
+
+export function decodeAuthoredTiles(map: AuthoredMap, fallback = Tile.Grass): Uint8Array {
+  const length = Math.max(0, (map.w | 0) * (map.h | 0));
+  if (Array.isArray(map.tiles) && map.tiles.length === length) {
+    const output = new Uint8Array(length);
+    for (let index = 0; index < length; index++) output[index] = Math.max(0, Math.min(255, Number(map.tiles[index]) | 0));
+    return output;
+  }
+  return decodeByteRuns(map.tileRuns, length, fallback);
+}
+
+export function decodeAuthoredElevations(map: AuthoredMap): Uint8Array {
+  const length = Math.max(0, (map.w | 0) * (map.h | 0));
+  if (Array.isArray(map.elevations) && map.elevations.length === length) {
+    const output = new Uint8Array(length);
+    for (let index = 0; index < length; index++) output[index] = Math.max(0, Math.min(3, Number(map.elevations[index]) | 0));
+    return output;
+  }
+  const output = decodeByteRuns(map.elevationRuns, length, 0);
+  for (let index = 0; index < output.length; index++) output[index] = Math.min(3, output[index]);
+  return output;
 }
 
 // Game-engine persistence types and the shared fallback loot registry.

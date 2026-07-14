@@ -29,6 +29,8 @@ import {
   TileUpdate,
   TradeOpen,
   WorldInit,
+  decodeByteRuns,
+  decodeTerrainRuns,
   invCapacity,
   invWeight,
   isNight,
@@ -47,6 +49,7 @@ import { SkillsPanel } from '@/components/game/SkillsPanel';
 import { FriendContact, SocialPanel } from '@/components/game/SocialPanel';
 import { DeathOverlay, PauseOverlay } from '@/components/game/SystemOverlays';
 import { TradePanel, TradeTab } from '@/components/game/TradePanel';
+import { WORLD_MAP_SIZE, WorldMapIcon, WorldMapOverlay } from '@/components/game/WorldMapOverlay';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 /** the server picked in the login-screen server browser (falls back to env) */
@@ -89,6 +92,7 @@ export default function GameClient() {
   const router = useRouter();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const minimapRef = useRef<HTMLCanvasElement>(null);
+  const worldMapRef = useRef<HTMLCanvasElement>(null);
   const socketRef = useRef<Socket | null>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const snapRef = useRef<StateSnap | null>(null);
@@ -119,7 +123,7 @@ export default function GameClient() {
   const heldKitRef = useRef<{ slot: number; item: ItemId } | null>(null); // equipped placeable = placement mode
   const buildRotationRef = useRef(0);
   const chatOpenRef = useRef(false);
-  const menuRef = useRef({ gear: false, craft: false, skills: false, social: false });
+  const menuRef = useRef({ gear: false, craft: false, skills: false, social: false, map: false });
   const lootContRef = useRef<string | null>(null); // container the loot queue belongs to
   const lootAwaitRef = useRef<{ slot: number; at: number } | null>(null); // fired, waiting on server
   const cookAwaitRef = useRef<{ slot: number; at: number } | null>(null);
@@ -139,6 +143,7 @@ export default function GameClient() {
   const [showCraft, setShowCraft] = useState(false);
   const [showSocial, setShowSocial] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
+  const [showMap, setShowMap] = useState(false);
   const [craftTab, setCraftTab] = useState<RecipeCat>('survival');
   const [craftSel, setCraftSel] = useState<string | null>(null);
   const [container, setContainer] = useState<ContainerContents | null>(null);
@@ -330,16 +335,17 @@ export default function GameClient() {
   }, [inv, craftTab]);
 
   useEffect(() => {
-    menuRef.current = { gear: showGear, craft: showCraft, skills: showSkills, social: showSocial };
-  }, [showGear, showCraft, showSkills, showSocial]);
+    menuRef.current = { gear: showGear, craft: showCraft, skills: showSkills, social: showSocial, map: showMap };
+  }, [showGear, showCraft, showSkills, showSocial, showMap]);
   useEffect(() => { chatOpenRef.current = chatOpen; if (chatOpen) chatInputRef.current?.focus(); }, [chatOpen]);
 
   // exactly one full-screen menu open at a time (no stacking)
-  const only = useCallback((which: 'gear' | 'craft' | 'skills' | 'social' | null) => {
+  const only = useCallback((which: 'gear' | 'craft' | 'skills' | 'social' | 'map' | null) => {
     setShowGear(which === 'gear');
     setShowCraft(which === 'craft');
     setShowSkills(which === 'skills');
     setShowSocial(which === 'social');
+    setShowMap(which === 'map');
     setTrade(null);
     setStation(null);
     if (which !== 'gear') { setContainer(null); socketRef.current?.emit(EV.containerClose); }
@@ -441,8 +447,12 @@ export default function GameClient() {
         youRef.current = init.you;
         initRef.current = init;
         const visuals = init.visuals ?? { assets: {}, animations: {}, resources: {}, sounds: { presets: {}, actions: {} }, mobSounds: {}, blocks: {}, terrain: {} };
+        const cellCount = init.width * init.height;
+        const tiles = init.tiles.length === cellCount ? Uint8Array.from(init.tiles) : decodeByteRuns(init.tileRuns, cellCount, Tile.Grass);
+        const elevations = init.elevations.length === cellCount ? Uint8Array.from(init.elevations) : decodeByteRuns(init.elevationRuns, cellCount, 0);
         sfx.applyContent(visuals.sounds);
-        rendererRef.current = new Renderer(init.tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {}, init.elevations ?? [], visuals, init.terrainKinds ?? {}, init.resourceKinds ?? {}, init.blockKinds ?? {}, init.blockRotations ?? {}, init.openDoors ?? [], (soundId, volume) => sfx.play(soundId, volume));
+        const terrainKinds = { ...decodeTerrainRuns(init.terrainRuns, cellCount), ...(init.terrainKinds ?? {}) };
+        rendererRef.current = new Renderer(tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {}, elevations, visuals, terrainKinds, init.resourceKinds ?? {}, init.blockKinds ?? {}, init.blockRotations ?? {}, init.openDoors ?? [], (soundId, volume) => sfx.play(soundId, volume));
         displayPos.current.clear();
         seenProjectiles.current.clear();
         snapRef.current = null;
@@ -606,6 +616,7 @@ export default function GameClient() {
         setTimeout(() => setFeed((f) => f.filter((x) => x.id !== id)), 7000);
       });
       socket.on(EV.death, (d: { by: string }) => {
+        only(null);
         setDead(d.by);
         setContainer(null);
         setTrade(null);
@@ -621,8 +632,8 @@ export default function GameClient() {
   }, [router, pushToast, only, completeObjective]);
 
   useEffect(() => {
-    panelsOpenRef.current = showGear || showCraft || showSocial || showSkills || !!container || !!trade || chatOpen || !!ctxMenu || !!station || escMenu;
-  }, [showGear, showCraft, showSocial, showSkills, container, trade, chatOpen, ctxMenu, station, escMenu]);
+    panelsOpenRef.current = showGear || showCraft || showSocial || showSkills || showMap || !!container || !!trade || chatOpen || !!ctxMenu || !!station || escMenu;
+  }, [showGear, showCraft, showSocial, showSkills, showMap, container, trade, chatOpen, ctxMenu, station, escMenu]);
 
   // ── actions ─────────────────────────────────────────────────────────────
   const emit = useCallback((ev: string, payload?: unknown) => socketRef.current?.emit(ev, payload), []);
@@ -675,7 +686,7 @@ export default function GameClient() {
         else pushToast('Craft a build kit first (C → BUILD)');
       }
       else if (e.code === 'KeyX') toggleDemolish();
-      else if (e.code === 'KeyM') setMuted(toggleMute());
+      else if (e.code === 'KeyM' && initRef.current) { e.preventDefault(); only(menuRef.current.map ? null : 'map'); }
       else if (e.code === 'Enter' || e.code === 'KeyT') { e.preventDefault(); setChatOpen(true); }
       else if (/^Digit[1-5]$/.test(e.code)) useSlot(Number(e.code.slice(5)) - 1);
       else if (e.code === 'Escape') {
@@ -926,13 +937,18 @@ export default function GameClient() {
 
       const you = meNow;
       const mm = minimapRef.current;
+      const mapView = {
+        pois: init.pois,
+        players,
+        youId: youRef.current,
+        friendNames: friendNamesRef.current,
+      };
       if (mm && you) {
-        renderer.drawMinimap(mm.getContext('2d')!, MINIMAP_SIZE, {
-          pois: init.pois,
-          players,
-          youId: youRef.current,
-          friendNames: friendNamesRef.current,
-        });
+        renderer.drawMinimap(mm.getContext('2d')!, MINIMAP_SIZE, mapView);
+      }
+      const fullMap = worldMapRef.current;
+      if (fullMap && you) {
+        renderer.drawMinimap(fullMap.getContext('2d')!, WORLD_MAP_SIZE, mapView, true);
       }
 
       if (you) {
@@ -1108,7 +1124,7 @@ export default function GameClient() {
   const equippedItem = inv && inv.equipped !== null ? inv.inv.slots[inv.equipped] : null;
   const eqWeapon = equippedItem ? ITEMS[equippedItem.id].weapon : null;
   const heldKit = equippedItem && ITEMS[equippedItem.id].place ? { slot: inv!.equipped!, item: equippedItem.id, qty: equippedItem.qty } : null;
-  const anyPanel = showGear || showCraft || showSkills || showSocial || !!container || !!trade || chatOpen || !!station || !!dead || escMenu;
+  const anyPanel = showGear || showCraft || showSkills || showSocial || showMap || !!container || !!trade || chatOpen || !!station || !!dead || escMenu;
   const ammoReserve = eqWeapon ? countOf(eqWeapon.ammo) : null;
   const weight = inv ? invWeight(inv.inv) : 0;
   const cap = inv ? invCapacity(inv.inv) : BACKPACKS[0];
@@ -1219,10 +1235,21 @@ export default function GameClient() {
       {!connected && <div className="connect-overlay">CONNECTING TO THE ZONE…</div>}
       {hurtAt > 0 && <div className="hurt-flash" key={hurtAt} />}
 
-      {connected && (
+      {connected && !showMap && (
         <div className="minimap-wrap">
           <canvas ref={minimapRef} width={MINIMAP_SIZE} height={MINIMAP_SIZE} />
         </div>
+      )}
+
+      {showMap && initRef.current && (
+        <WorldMapOverlay
+          canvasRef={worldMapRef}
+          name={initRef.current.name}
+          width={initRef.current.width}
+          height={initRef.current.height}
+          location={location}
+          onClose={() => only(null)}
+        />
       )}
 
       {location && <div className="location-banner" key={location}>{location.toUpperCase()}</div>}
@@ -1345,7 +1372,7 @@ export default function GameClient() {
         {clock && <div className="kd-chip dim">{clock}</div>}
         {inv && <div className="kd-chip gold">{inv.money} cr</div>}
         {inv && <div className="kd-chip">☠ {inv.kills} · {inv.deaths}</div>}
-        <div className="kd-chip dim">{muted ? '🔇 M' : '🔊 M'}</div>
+        <div className="kd-chip dim">{muted ? 'SOUND OFF' : 'SOUND ON'}</div>
         <div className="killfeed">
           {feed.map((k) => (
             <div key={k.id}><b>{k.killer}</b> ☠ {k.victim}{k.weapon ? ` (${ITEMS[k.weapon].name})` : ''}</div>
@@ -1371,13 +1398,20 @@ export default function GameClient() {
               ] as [string, string, string, () => void][])
             : []),
           ['💬', '⏎', 'Chat (safe zones)', () => setChatOpen(true)],
-          ['🔊', 'M', 'Sound on/off', () => setMuted(toggleMute())],
         ] as [string, string, string, () => void][]).map(([icon, key, label, fn]) => (
           <button key={key} className="hk" onClick={fn}>
             <span className="hk-icon">{icon}</span>
             <span className="hk-tip">{label} <b>{key}</b></span>
           </button>
         ))}
+        <button className={`hk${showMap ? ' active' : ''}`} disabled={!connected} onClick={() => only(showMap ? null : 'map')} aria-label="Open world map">
+          <span className="hk-icon"><WorldMapIcon /></span>
+          <span className="hk-tip">World map <b>M</b></span>
+        </button>
+        <button className="hk" onClick={() => setMuted(toggleMute())} aria-label={muted ? 'Turn sound on' : 'Turn sound off'}>
+          <span className="hk-icon">{muted ? '🔇' : '🔊'}</span>
+          <span className="hk-tip">Sound {muted ? 'off' : 'on'}</span>
+        </button>
       </div>
 
       <div className="toasts">{toasts.map((t) => <div key={t.id}>{t.msg}</div>)}</div>

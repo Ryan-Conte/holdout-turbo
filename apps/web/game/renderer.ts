@@ -1,5 +1,6 @@
 import {
   BLOCKS_BULLET,
+  DEFAULT_TERRAIN_ID_BY_TILE,
   DEFAULT_CHARACTER_APPEARANCE,
   ContainerSnap,
   EntityDeathSnap,
@@ -138,7 +139,7 @@ const MINI_COLORS: Record<number, string> = {
 };
 
 export class Renderer {
-  private mapCanvas: HTMLCanvasElement;
+  private mapCanvas: HTMLCanvasElement | null;
   private miniCanvas: HTMLCanvasElement;
   zoom = 2;
 
@@ -165,7 +166,7 @@ export class Renderer {
   private openDoors = new Set<number>();
 
   constructor(
-    private tiles: number[],
+    private tiles: Uint8Array,
     private w: number,
     private h: number,
     private sheets: Sheets,
@@ -174,7 +175,7 @@ export class Renderer {
     private exit: { x: number; y: number } | null,
     private extracts: { x: number; y: number }[] = [],
     unders: Record<number, number> = {},
-    private elevations: number[] = [],
+    private elevations: Uint8Array = new Uint8Array(),
     private visuals: RuntimeVisualContent = { assets: {}, animations: {}, resources: {}, sounds: { presets: {}, actions: {} }, mobSounds: {}, blocks: {}, terrain: {} },
     private terrainKinds: Record<string, string> = {},
     private resourceKinds: Record<string, string> = {},
@@ -185,14 +186,16 @@ export class Renderer {
   ) {
     this.openDoors = new Set(initialOpenDoors);
     this.unders = new Map(Object.entries(unders).map(([k, v]) => [Number(k), v]));
-    if (this.elevations.length !== w * h) this.elevations = new Array(w * h).fill(0);
+    if (this.elevations.length !== w * h) this.elevations = new Uint8Array(w * h);
     this.buildVisualFrames();
-    this.mapCanvas = document.createElement("canvas");
-    this.mapCanvas.width = w * TILE;
-    this.mapCanvas.height = h * TILE;
+    this.mapCanvas = w <= 512 && h <= 512 ? document.createElement("canvas") : null;
+    if (this.mapCanvas) {
+      this.mapCanvas.width = w * TILE;
+      this.mapCanvas.height = h * TILE;
+    }
     this.miniCanvas = document.createElement("canvas");
-    this.miniCanvas.width = w;
-    this.miniCanvas.height = h;
+    this.miniCanvas.width = Math.min(512, w);
+    this.miniCanvas.height = Math.min(512, h);
     this.prerender();
   }
 
@@ -228,10 +231,9 @@ export class Renderer {
     const context = this.miniCanvas.getContext('2d');
     if (!context) return;
     const x = index % this.w; const y = Math.floor(index / this.w);
-    const mapContext = this.mapCanvas.getContext('2d');
+    const mapContext = this.mapCanvas?.getContext('2d');
     if (mapContext) { this.drawTerrainCell(mapContext, x, y); this.drawFoundationLayer(mapContext, x, y); }
-    context.fillStyle = blockId ? '#b58b45' : this.terrainAt(x, y)?.minimapColor ?? '#527741';
-    context.fillRect(x, y, 1, 1);
+    this.updateMinimapCell(x, y, blockId ? '#b58b45' : undefined);
   }
 
   playerBlockId(buildType: string): string | undefined {
@@ -333,7 +335,9 @@ export class Renderer {
 
   private terrainAt(x: number, y: number) {
     if (x < 0 || y < 0 || x >= this.w || y >= this.h) return undefined;
-    return this.visuals.terrain?.[this.terrainKinds[String(y * this.w + x)]];
+    const index = y * this.w + x;
+    const id = this.terrainKinds[String(index)] ?? DEFAULT_TERRAIN_ID_BY_TILE[this.tiles[index] as Tile] ?? 'grass';
+    return this.visuals.terrain?.[id];
   }
 
   /** Public read of the live tile map (used by the client for build validity). */
@@ -361,7 +365,7 @@ export class Renderer {
       const openDoor = this.openDoors.has(index);
       const tileBlocks = BLOCKS_BULLET[this.tiles[index]] && !(openDoor && this.tiles[index] === Tile.Door);
       const blockBlocks = block?.collision.sight && !(openDoor && block.playerPlacement?.buildType === 'door');
-      if (s < steps && (tileBlocks || blockBlocks || this.visuals.terrain?.[this.terrainKinds[String(index)]]?.collision.sight)) return false;
+      if (s < steps && (tileBlocks || blockBlocks || this.terrainAt(tx, ty)?.collision.sight)) return false;
       previousElevation = elevation;
     }
     return true;
@@ -439,48 +443,65 @@ export class Renderer {
   // ── static ground prerender (trees/rocks are dynamic entities) ─────────
 
   private prerender() {
-    const ctx = this.mapCanvas.getContext("2d")!;
-    ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, this.mapCanvas.width, this.mapCanvas.height);
-    for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) this.drawTerrainCell(ctx, tx, ty);
-    for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) this.drawFoundationLayer(ctx, tx, ty);
-
-    for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) {
-      const level = this.elevations[ty * this.w + tx] ?? 0;
-      if (!level) continue;
-      const x = tx * TILE; const y = ty * TILE;
-      ctx.fillStyle = `rgba(222,198,132,${level * .035})`; ctx.fillRect(x, y, TILE, TILE);
-      const south = ty + 1 < this.h ? this.elevations[(ty + 1) * this.w + tx] ?? 0 : 0;
-      const east = tx + 1 < this.w ? this.elevations[ty * this.w + tx + 1] ?? 0 : 0;
-      if (level > south) { const depth = Math.min(12, (level - south) * 4); ctx.fillStyle = `rgba(38,31,25,${Math.min(.75, .24 + (level - south) * .18)})`; ctx.fillRect(x, y + TILE - depth, TILE, depth); }
-      if (level > east) { ctx.fillStyle = 'rgba(35,30,24,.3)'; ctx.fillRect(x + TILE - 3, y, 3, TILE); }
-      ctx.fillStyle = 'rgba(242,224,170,.15)'; ctx.fillRect(x, y, TILE, 2);
+    const ctx = this.mapCanvas?.getContext("2d");
+    if (ctx && this.mapCanvas) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.clearRect(0, 0, this.mapCanvas.width, this.mapCanvas.height);
+      for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) this.drawTerrainCell(ctx, tx, ty);
+      for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) this.drawFoundationLayer(ctx, tx, ty);
+      for (let ty = 0; ty < this.h; ty++) for (let tx = 0; tx < this.w; tx++) this.drawElevationCell(ctx, tx, ty);
+      this.drawZoneRings(ctx);
     }
 
-    // safe-zone and hot-zone markers baked into the ground
+    const mctx = this.miniCanvas.getContext("2d")!;
+    for (let my = 0; my < this.miniCanvas.height; my++)
+      for (let mx = 0; mx < this.miniCanvas.width; mx++) {
+        const tx = Math.min(this.w - 1, Math.floor((mx + .5) * this.w / this.miniCanvas.width));
+        const ty = Math.min(this.h - 1, Math.floor((my + .5) * this.h / this.miniCanvas.height));
+        mctx.fillStyle = this.terrainAt(tx, ty)?.minimapColor ?? '#527741';
+        mctx.fillRect(mx, my, 1, 1);
+        if (this.blockKinds[String(ty * this.w + tx)]) { mctx.fillStyle = '#b58b45'; mctx.fillRect(mx, my, 1, 1); }
+        const level = this.elevations[ty * this.w + tx] ?? 0;
+        if (level) { mctx.fillStyle = `rgba(245,220,160,${level * .12})`; mctx.fillRect(mx, my, 1, 1); }
+      }
+  }
+
+  private drawElevationCell(ctx: CanvasRenderingContext2D, tx: number, ty: number) {
+    const level = this.elevations[ty * this.w + tx] ?? 0;
+    if (!level) return;
+    const x = tx * TILE; const y = ty * TILE;
+    ctx.fillStyle = `rgba(222,198,132,${level * .035})`; ctx.fillRect(x, y, TILE, TILE);
+    const south = ty + 1 < this.h ? this.elevations[(ty + 1) * this.w + tx] ?? 0 : 0;
+    const east = tx + 1 < this.w ? this.elevations[ty * this.w + tx + 1] ?? 0 : 0;
+    if (level > south) { const depth = Math.min(12, (level - south) * 4); ctx.fillStyle = `rgba(38,31,25,${Math.min(.75, .24 + (level - south) * .18)})`; ctx.fillRect(x, y + TILE - depth, TILE, depth); }
+    if (level > east) { ctx.fillStyle = 'rgba(35,30,24,.3)'; ctx.fillRect(x + TILE - 3, y, 3, TILE); }
+    ctx.fillStyle = 'rgba(242,224,170,.15)'; ctx.fillRect(x, y, TILE, 2);
+  }
+
+  private drawZoneRings(ctx: CanvasRenderingContext2D) {
     for (const poi of this.pois) {
       if (!poi.safe && !poi.hot) continue;
       ctx.save();
       ctx.strokeStyle = poi.hot ? "rgba(240, 90, 58, 0.4)" : "rgba(150, 200, 130, 0.35)";
-      ctx.lineWidth = 3;
-      ctx.setLineDash([10, 8]);
-      ctx.beginPath();
-      ctx.arc(poi.x, poi.y, poi.r, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
+      ctx.lineWidth = 3; ctx.setLineDash([10, 8]);
+      ctx.beginPath(); ctx.arc(poi.x, poi.y, poi.r, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
     }
+  }
 
-    const mctx = this.miniCanvas.getContext("2d")!;
-    for (let ty = 0; ty < this.h; ty++)
-      for (let tx = 0; tx < this.w; tx++) {
-        mctx.fillStyle = this.terrainAt(tx, ty)?.minimapColor ?? '#527741';
-        mctx.fillRect(tx, ty, 1, 1);
-        const terrain = this.visuals.terrain?.[this.terrainKinds[String(ty * this.w + tx)]];
-        if (terrain) { mctx.fillStyle = terrain.minimapColor; mctx.fillRect(tx, ty, 1, 1); }
-        if (this.blockKinds[String(ty * this.w + tx)]) { mctx.fillStyle = '#b58b45'; mctx.fillRect(tx, ty, 1, 1); }
-        const level = this.elevations[ty * this.w + tx] ?? 0;
-        if (level) { mctx.fillStyle = `rgba(245,220,160,${level * .12})`; mctx.fillRect(tx, ty, 1, 1); }
-      }
+  private drawVisibleGround(ctx: CanvasRenderingContext2D, minX: number, minY: number, maxX: number, maxY: number) {
+    for (let ty = minY; ty <= maxY; ty++) for (let tx = minX; tx <= maxX; tx++) this.drawTerrainCell(ctx, tx, ty);
+    for (let ty = minY; ty <= maxY; ty++) for (let tx = minX; tx <= maxX; tx++) this.drawFoundationLayer(ctx, tx, ty);
+    for (let ty = minY; ty <= maxY; ty++) for (let tx = minX; tx <= maxX; tx++) this.drawElevationCell(ctx, tx, ty);
+    this.drawZoneRings(ctx);
+  }
+
+  private updateMinimapCell(tx: number, ty: number, color?: string) {
+    const context = this.miniCanvas.getContext('2d');
+    if (!context) return;
+    const mx = Math.floor(tx * this.miniCanvas.width / this.w);
+    const my = Math.floor(ty * this.miniCanvas.height / this.h);
+    context.fillStyle = color ?? this.terrainAt(tx, ty)?.minimapColor ?? '#527741';
+    context.fillRect(mx, my, 1, 1);
   }
 
   private drawTerrainCell(ctx: CanvasRenderingContext2D, tx: number, ty: number) {
@@ -642,13 +663,13 @@ export class Renderer {
         70,
       );
     }
-    const ctx = this.mapCanvas.getContext("2d")!;
-    ctx.imageSmoothingEnabled = false;
-    this.drawTerrainCell(ctx, tx, ty);
-    this.drawFoundationLayer(ctx, tx, ty);
-    const mctx = this.miniCanvas.getContext("2d")!;
-    mctx.fillStyle = this.terrainAt(tx, ty)?.minimapColor ?? '#527741';
-    mctx.fillRect(tx, ty, 1, 1);
+    const ctx = this.mapCanvas?.getContext("2d");
+    if (ctx) {
+      ctx.imageSmoothingEnabled = false;
+      this.drawTerrainCell(ctx, tx, ty);
+      this.drawFoundationLayer(ctx, tx, ty);
+    }
+    this.updateMinimapCell(tx, ty);
     this.shakes.delete(i);
   }
 
@@ -720,10 +741,18 @@ export class Renderer {
     const viewH = h / z;
     const sx = Math.max(0, camX - viewW / 2 - TILE);
     const sy = Math.max(0, camY - viewH / 2 - TILE);
-    const sw = Math.min(this.mapCanvas.width - sx, viewW + TILE * 2);
-    const sh = Math.min(this.mapCanvas.height - sy, viewH + TILE * 2);
-    if (sw > 0 && sh > 0)
-      ctx.drawImage(this.mapCanvas, sx, sy, sw, sh, sx, sy, sw, sh);
+    const sw = Math.min(this.w * TILE - sx, viewW + TILE * 2);
+    const sh = Math.min(this.h * TILE - sy, viewH + TILE * 2);
+    if (sw > 0 && sh > 0) {
+      if (this.mapCanvas) ctx.drawImage(this.mapCanvas, sx, sy, sw, sh, sx, sy, sw, sh);
+      else {
+        const minX = Math.max(0, Math.floor(sx / TILE));
+        const minY = Math.max(0, Math.floor(sy / TILE));
+        const maxX = Math.min(this.w - 1, Math.ceil((sx + sw) / TILE));
+        const maxY = Math.min(this.h - 1, Math.ceil((sy + sh) / TILE));
+        this.drawVisibleGround(ctx, minX, minY, maxX, maxY);
+      }
+    }
 
     // muzzle flashes + gunfeel from newly-seen projectiles
     const seen = new Set<number>();
@@ -1136,17 +1165,42 @@ export class Renderer {
       youId: string;
       friendNames: Set<string>;
     },
+    detailed = false,
   ) {
     const s = size / Math.max(this.w, this.h);
+    const mapWidth = this.w * s;
+    const mapHeight = this.h * s;
+    const offsetX = (size - mapWidth) / 2;
+    const offsetY = (size - mapHeight) / 2;
+    const point = (x: number, y: number) => ({ x: offsetX + (x / TILE) * s, y: offsetY + (y / TILE) * s });
+    const markerScale = detailed ? Math.max(1.5, Math.min(2.5, size / 320)) : 1;
     ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0, 0, size, size);
+    ctx.fillStyle = '#080a07';
+    ctx.fillRect(0, 0, size, size);
     ctx.globalAlpha = 0.92;
-    ctx.drawImage(this.miniCanvas, 0, 0, this.w * s, this.h * s);
+    ctx.drawImage(this.miniCanvas, offsetX, offsetY, mapWidth, mapHeight);
     ctx.globalAlpha = 1;
 
+    if (detailed) {
+      ctx.strokeStyle = 'rgba(220, 210, 170, 0.11)';
+      ctx.lineWidth = 1;
+      for (let section = 1; section < 8; section++) {
+        const x = offsetX + mapWidth * (section / 8);
+        const y = offsetY + mapHeight * (section / 8);
+        ctx.beginPath();
+        ctx.moveTo(x, offsetY);
+        ctx.lineTo(x, offsetY + mapHeight);
+        ctx.moveTo(offsetX, y);
+        ctx.lineTo(offsetX + mapWidth, y);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(220, 210, 170, 0.42)';
+      ctx.strokeRect(offsetX + 0.5, offsetY + 0.5, mapWidth - 1, mapHeight - 1);
+    }
+
     for (const poi of view.pois) {
-      const x = (poi.x / TILE) * s;
-      const y = (poi.y / TILE) * s;
+      const { x, y } = point(poi.x, poi.y);
       ctx.strokeStyle = poi.safe
         ? "rgba(140, 210, 130, 0.9)"
         : poi.hot
@@ -1154,50 +1208,63 @@ export class Renderer {
           : poi.kind === "airport"
             ? "rgba(216, 162, 74, 0.8)"
             : "rgba(194, 80, 71, 0.8)";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(x - 3, y - 3, 6, 6);
-      if (poi.hot) {
-        // high-loot zones ring the minimap so the risk/reward reads at a glance
-        ctx.setLineDash([3, 3]);
+      ctx.lineWidth = detailed ? 1.5 : 1;
+      const marker = 3 * markerScale;
+      ctx.strokeRect(x - marker, y - marker, marker * 2, marker * 2);
+      if (poi.hot || (detailed && poi.safe)) {
+        ctx.setLineDash(detailed ? [5, 4] : [3, 3]);
         ctx.beginPath();
         ctx.arc(x, y, (poi.r / TILE) * s, 0, Math.PI * 2);
         ctx.stroke();
         ctx.setLineDash([]);
       }
-      ctx.font = "8px monospace";
+      const fontSize = detailed ? Math.max(10, Math.min(13, Math.round(size / 64))) : 8;
+      ctx.font = `${detailed ? '700 ' : ''}${fontSize}px monospace`;
       ctx.textAlign = "center";
       ctx.fillStyle = poi.hot ? "rgba(255, 170, 150, 0.95)" : "rgba(230, 228, 210, 0.95)";
-      ctx.fillText(poi.hot ? `☠ ${poi.name}` : poi.name, x, y - 6);
+      const label = poi.hot ? `! ${poi.name}` : poi.name;
+      if (detailed) {
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(5, 7, 5, 0.9)';
+        ctx.strokeText(label, x, y - marker - 4);
+      }
+      ctx.fillText(label, x, y - marker - 4);
     }
     for (const tr of this.traders) {
+      const { x, y } = point(tr.x, tr.y);
+      const marker = detailed ? 4 : 1.5;
       ctx.fillStyle = "#d8c26a";
-      ctx.fillRect((tr.x / TILE) * s - 1.5, (tr.y / TILE) * s - 1.5, 3, 3);
+      ctx.fillRect(x - marker, y - marker, marker * 2, marker * 2);
     }
     for (const ex of this.extracts) {
-      const x = (ex.x / TILE) * s;
-      const y = (ex.y / TILE) * s;
+      const { x, y } = point(ex.x, ex.y);
+      const marker = detailed ? 6 : 3;
       ctx.strokeStyle = "#5ff08a";
-      ctx.lineWidth = 1;
+      ctx.lineWidth = detailed ? 2 : 1;
       ctx.beginPath();
-      ctx.moveTo(x, y - 3);
-      ctx.lineTo(x + 3, y);
-      ctx.lineTo(x, y + 3);
-      ctx.lineTo(x - 3, y);
+      ctx.moveTo(x, y - marker);
+      ctx.lineTo(x + marker, y);
+      ctx.lineTo(x, y + marker);
+      ctx.lineTo(x - marker, y);
       ctx.closePath();
       ctx.stroke();
     }
     for (const p of view.players) {
       if (p.dead) continue;
-      const x = (p.dx / TILE) * s;
-      const y = (p.dy / TILE) * s;
+      const { x, y } = point(p.dx, p.dy);
       const isYou = p.id === view.youId;
       const isFriend = view.friendNames.has(p.name);
       ctx.fillStyle = isYou ? "#f0d878" : isFriend ? "#78d878" : "#e8e8e8";
       ctx.beginPath();
-      ctx.arc(x, y, isYou ? 2.5 : 1.8, 0, Math.PI * 2);
+      ctx.arc(x, y, detailed ? (isYou ? 6 : 4) : (isYou ? 2.5 : 1.8), 0, Math.PI * 2);
       ctx.fill();
-      if (isFriend && !isYou) {
-        ctx.strokeStyle = "rgba(120, 216, 120, 0.7)";
+      if (isYou || (isFriend && !isYou)) {
+        ctx.strokeStyle = isYou ? 'rgba(240, 216, 120, 0.55)' : "rgba(120, 216, 120, 0.7)";
+        ctx.lineWidth = detailed ? 2 : 1;
+        if (detailed && isYou) {
+          ctx.beginPath();
+          ctx.arc(x, y, 10, 0, Math.PI * 2);
+        }
         ctx.stroke();
       }
     }
@@ -1402,10 +1469,8 @@ export class Renderer {
       ctx.clip();
       drawFacing(() => {
         const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, p.dx, p.dy);
-        if (!custom) {
-          this.blitChar(ctx, row, fallbackFrame, p.dx - 16, p.dy - 16);
-          drawCharacterAppearance(ctx, appearance, p.dx - 16, p.dy - 16, 2, Boolean(p.helmet));
-        }
+        if (!custom) this.blitChar(ctx, row, fallbackFrame, p.dx - 16, p.dy - 16);
+        drawCharacterAppearance(ctx, appearance, p.dx - 16, p.dy - 16, 2, Boolean(p.helmet));
       });
       ctx.restore();
       // nameplate still renders below
@@ -1417,10 +1482,8 @@ export class Renderer {
       ctx.beginPath(); ctx.ellipse(p.dx, p.dy + 14, 9, 3.5, 0, 0, Math.PI * 2); ctx.fill();
       drawFacing(() => {
         const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, p.dx, p.dy - bob);
-        if (!custom) {
-          this.blitChar(ctx, row, fallbackFrame, p.dx - 16, p.dy - 16 - bob);
-          drawCharacterAppearance(ctx, appearance, p.dx - 16, p.dy - 16 - bob, 2, Boolean(p.helmet));
-        }
+        if (!custom) this.blitChar(ctx, row, fallbackFrame, p.dx - 16, p.dy - 16 - bob);
+        drawCharacterAppearance(ctx, appearance, p.dx - 16, p.dy - 16 - bob, 2, Boolean(p.helmet));
       });
     }
 

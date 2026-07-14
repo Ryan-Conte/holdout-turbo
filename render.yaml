@@ -13,6 +13,8 @@ envVarGroups:
         sync: false
       - key: CORS_ORIGIN
         sync: false
+      - key: RUNTIME_CACHE_DIR
+        value: /tmp/holdout-runtime-cache
 
 services:
   - type: web

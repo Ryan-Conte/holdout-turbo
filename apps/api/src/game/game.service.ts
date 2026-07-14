@@ -83,13 +83,15 @@ import {
   WeaponStats,
   WorldInit,
   armorMultiplier,
+  encodeByteRuns,
+  encodeTerrainRuns,
   invCapacity,
   invWeight,
   skillLevel,
 } from '@holdout/shared';
 import { DbService, QuestProg } from '../db/db.service';
 import { ContentService } from './content.service';
-import { ChestTier, GeneratedMap, fromAuthored, generateMap, mulberry32, resourceKindsFromTiles, terrainKindsFromTiles } from './mapgen';
+import { ChestTier, GeneratedMap, TERRAIN_ID_BY_TILE, fromAuthored, generateMap, mulberry32, resourceKindsFromTiles, terrainKindsFromTiles } from './mapgen';
 import { rollChest, rollEnemyDrop, rollGround, rollNamed } from './loot';
 import type {
   Enemy,
@@ -121,6 +123,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   private questTimer: NodeJS.Timeout;
   private mapTimer: NodeJS.Timeout;
   private activeMapId: number | null = null;
+  private rejectedMapId: number | null = null;
   private lastVisualsVersion = 0;
   private lastTick = Date.now();
   private quests: QuestDef[] = [];
@@ -157,14 +160,23 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async refreshPublishedMap() {
-    const revision = await this.db.loadActiveMapRevision();
-    if (!revision || revision.id === this.activeMapId) return;
+    // Poll only the tiny row ID. The multi-megabyte authored document stays in
+    // this process and is fetched again only after an actual publication.
+    const revisionId = await this.db.loadActiveMapRevisionId();
+    if (revisionId === null || revisionId === this.activeMapId || revisionId === this.rejectedMapId) return;
     const current = this.instances.get(WORLD);
     if (current && current.players > 0) return;
+    const revision = await this.db.loadMapRevision(revisionId);
+    if (!revision) {
+      this.rejectedMapId = revisionId;
+      this.log.error(`Published map #${revisionId} was rejected; retaining map #${this.activeMapId ?? 'procedural'}`);
+      return;
+    }
     const gen = fromAuthored(revision.data);
     const world = this.makeInstance(WORLD, 'world', 'Authored Zone', null, gen);
     this.instances.set(WORLD, world);
     this.activeMapId = revision.id;
+    this.rejectedMapId = null;
     this.log.log(`Published map #${revision.id} loaded (${world.w}x${world.h})`);
   }
 
@@ -429,15 +441,18 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       seed: inst.seed,
       width: inst.w,
       height: inst.h,
-      tiles: Array.from(inst.tiles),
+      tiles: [],
+      tileRuns: encodeByteRuns(inst.tiles),
       pois: inst.pois,
       traders: inst.traders,
       extracts: inst.extracts,
       exit: inst.exit,
       ownHideout: inst.kind === 'hideout' && inst.ownerId === this.players.get(sid)?.userId,
       unders: Object.fromEntries(inst.unders),
-      elevations: Array.from(inst.elevations),
-      terrainKinds: inst.terrainKinds,
+      elevations: [],
+      elevationRuns: encodeByteRuns(inst.elevations),
+      terrainKinds: {},
+      terrainRuns: encodeTerrainRuns(inst.terrainKinds),
       resourceKinds: inst.resourceKinds,
       blockKinds: inst.blockKinds,
       blockRotations: inst.blockRotations,
@@ -484,6 +499,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       existing.sid = sid;
       existing.input = { up: false, down: false, left: false, right: false, angle: existing.angle, shoot: false };
       existing.loggedOutAt = null; // reconnected before the combat-log body expired
+      existing.appearance = await this.db.loadAppearance(userId);
       this.players.set(sid, existing);
       const inst = this.inst(existing);
       void this.io?.sockets.sockets.get(sid)?.join(inst.id);
@@ -1315,7 +1331,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (!p) return;
     p.appearance = { ...p.appearance, outfit: ((look | 0) % 8 + 8) % 8 };
     this.pushInventory(p);
-    void this.saveProfileOf(p);
+    void this.db.saveAppearance(p.userId, p.appearance);
   }
 
   /** Reclaim a piece you built in your own camp — returns the kit item. */
@@ -1973,7 +1989,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         if (blocks[inst.tiles[index]] && !(openDoor && inst.tiles[index] === Tile.Door)) return true;
         const block = this.content.block(inst.blockKinds[String(index)]);
         if (block && !(openDoor && block.playerPlacement?.buildType === 'door') && (blocks === BLOCKS_ENEMY ? block.collision.enemy : block.collision.move)) return true;
-        const terrain = this.content.terrain(inst.terrainKinds[String(index)]);
+        const terrain = this.terrainAtIndex(inst, index);
         if (terrain && (blocks === BLOCKS_ENEMY ? terrain.collision.enemy : terrain.collision.move)) return true;
       }
     return false;
@@ -2023,7 +2039,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const tx = Math.floor(x / TILE);
     const ty = Math.floor(y / TILE);
     if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) return undefined;
-    return this.content.terrain(inst.terrainKinds[String(ty * inst.w + tx)]);
+    return this.terrainAtIndex(inst, ty * inst.w + tx);
+  }
+
+  private terrainAtIndex(inst: Instance, index: number) {
+    const terrainId = inst.terrainKinds[String(index)] ?? TERRAIN_ID_BY_TILE[inst.tiles[index]] ?? 'grass';
+    return this.content.terrain(terrainId);
   }
 
   private terrainMoveMultiplier(inst: Instance, x: number, y: number): number {
@@ -2530,7 +2551,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const openDoor = inst.openDoors.has(index);
       const tileBlocks = BLOCKS_BULLET[inst.tiles[index]] && !(openDoor && inst.tiles[index] === Tile.Door);
       const blockBlocks = block?.collision.sight && !(openDoor && block.playerPlacement?.buildType === 'door');
-      if (s < steps && (tileBlocks || blockBlocks || this.content.terrain(inst.terrainKinds[String(index)])?.collision.sight)) return false;
+      if (s < steps && (tileBlocks || blockBlocks || this.terrainAtIndex(inst, index)?.collision.sight)) return false;
       previousElevation = elevation;
     }
     return true;
@@ -2562,7 +2583,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         const openDoor = inst.openDoors.has(blockIndex);
         const tileBlocks = BLOCKS_BULLET[inst.tiles[blockIndex]] && !(openDoor && inst.tiles[blockIndex] === Tile.Door);
         const blockBlocks = authoredBlock?.collision.bullets && !(openDoor && authoredBlock.playerPlacement?.buildType === 'door');
-        if (tileBlocks || blockBlocks || this.content.terrain(inst.terrainKinds[String(blockIndex)])?.collision.bullets) {
+        if (tileBlocks || blockBlocks || this.terrainAtIndex(inst, blockIndex)?.collision.bullets) {
           if (!this.damageStructure(inst, blockIndex, pr.damage) && authoredBlock?.collision.bullets) this.damageWorldBlock(inst, blockIndex, pr.damage);
           alive = false;
           break;

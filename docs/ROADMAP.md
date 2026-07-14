@@ -13,7 +13,7 @@
 - Survival loop: fists-only start → punch trees/rocks → spear → hatchet/pickaxe → looted guns; armor slots (helmets/vests) with damage mitigation.
 - Enemies: zombies (towns/wilds), military (airport); loot bags; respawns.
 - Sprite-sheet renderer + animation pass (walk frames, melee jabs/swings/thrusts, tree shake + fall, rock crumble, particles, muzzle flashes, corpses, day/night).
-- Admin map editor (`/editor`) → `maps` table → server loads active map.
+- Admin map editor (`/admin/map`; legacy `/editor` redirects) -> `maps` table -> server loads the active published map.
 - Admin engine foundation at `/admin/{slug}`: DB-admin gate, draft/publish maps, content polling, custom spawn/loot placement and browser pixel studio.
 - Friends: requests/accept, minimap markers.
 - Zero Sievert-flavored UI theme (inventory w/ equipment slots, tabbed crafting, trade, social).

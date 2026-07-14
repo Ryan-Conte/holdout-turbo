@@ -1,10 +1,26 @@
-import { AuthoredMap, MapObject, Tile } from '@holdout/shared';
+import {
+  AUTHORED_MAP_MAX_SIZE,
+  AUTHORED_MAP_MIN_SIZE,
+  AuthoredMap,
+  MapObject,
+  Tile,
+  decodeAuthoredElevations,
+  decodeAuthoredTiles,
+  decodeTerrainRuns,
+  encodeByteRuns,
+  encodeTerrainRuns,
+} from '@holdout/shared';
 
-export const MIN_MAP_SIZE = 20;
-export const MAX_MAP_SIZE = 200;
-export const MIN_MAP_ZOOM = 0.1;
+export const MIN_MAP_SIZE = AUTHORED_MAP_MIN_SIZE;
+export const MAX_MAP_SIZE = AUTHORED_MAP_MAX_SIZE;
+export const MIN_MAP_ZOOM = 0.01;
 export const MAX_MAP_ZOOM = 4;
 export const MAP_HISTORY_LIMIT = 40;
+
+export interface EditorMap extends Omit<AuthoredMap, 'tiles' | 'tileRuns' | 'elevations' | 'elevationRuns'> {
+  tiles: Uint8Array;
+  elevations: Uint8Array;
+}
 
 export interface MapCamera { x: number; y: number; zoom: number }
 export interface ViewportSize { width: number; height: number }
@@ -88,18 +104,50 @@ export function coordinateNoise(x: number, y: number): number {
   return ((value ^ (value >>> 16)) >>> 0) / 4294967296;
 }
 
-export function cloneAuthoredMap(map: AuthoredMap): AuthoredMap {
+export function inflateAuthoredMap(map: AuthoredMap): EditorMap {
+  return {
+    w: map.w,
+    h: map.h,
+    tiles: decodeAuthoredTiles(map),
+    elevations: decodeAuthoredElevations(map),
+    terrain: { ...decodeTerrainRuns(map.terrainRuns, map.w * map.h), ...(map.terrain ?? {}) },
+    resources: { ...(map.resources ?? {}) },
+    blocks: { ...(map.blocks ?? {}) },
+    blockRotations: { ...(map.blockRotations ?? {}) },
+    objects: map.objects.map((object) => ({ ...object })),
+  };
+}
+
+export function compactAuthoredMap(map: EditorMap): AuthoredMap {
+  return {
+    w: map.w,
+    h: map.h,
+    tileRuns: encodeByteRuns(map.tiles),
+    elevationRuns: encodeByteRuns(map.elevations),
+    terrainRuns: encodeTerrainRuns(map.terrain ?? {}),
+    resources: { ...(map.resources ?? {}) },
+    blocks: { ...(map.blocks ?? {}) },
+    blockRotations: { ...(map.blockRotations ?? {}) },
+    objects: map.objects.map((object) => ({ ...object })),
+  };
+}
+
+export function cloneAuthoredMap(map: EditorMap): EditorMap {
   return {
     w: map.w,
     h: map.h,
     tiles: map.tiles.slice(),
-    elevations: map.elevations?.slice() ?? new Array(map.w * map.h).fill(0),
+    elevations: map.elevations.slice(),
     terrain: { ...(map.terrain ?? {}) },
     resources: { ...(map.resources ?? {}) },
     blocks: { ...(map.blocks ?? {}) },
     blockRotations: { ...(map.blockRotations ?? {}) },
     objects: map.objects.map((object) => ({ ...object })),
   };
+}
+
+export function historyLimitForMap(map: EditorMap): number {
+  return map.w * map.h > 1_000_000 ? 8 : MAP_HISTORY_LIMIT;
 }
 
 export function clampNumber(value: number, min: number, max: number): number {

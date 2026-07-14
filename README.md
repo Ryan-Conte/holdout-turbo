@@ -40,6 +40,12 @@ After applying the Prisma schema, seed current definitions without overwriting e
 npm run seed:engine
 ```
 
+To install the validated 2000x2000 `Ashfall Basin` starter world as both an editable map draft and the active published map:
+
+```bash
+npm run seed:showcase-map
+```
+
 See `docs/ENGINE.md` for publishing behavior and runtime coverage.
 
 Production deployment is configured for Vercel (`apps/web`) plus independently addressable Render game servers (`apps/api`). See `docs/DEPLOYMENT.md` before applying the Render Blueprint.
@@ -47,7 +53,7 @@ Production deployment is configured for Vercel (`apps/web`) plus independently a
 ## How to play
 
 1. Register / log in, build your survivor on the separate pre-deploy customization screen, choose a server, then deploy to your hideout.
-2. **WASD** move · **SHIFT** sprint · **mouse** aim & attack · **E** interact · **Q** quick-heal · **1-5** hotbar · **TAB** inventory · **C** crafting · **M** mute · **ESC** close panels. Emptying stamina causes a longer regeneration delay and locks sprint until you recover.
+2. **WASD** move · **SHIFT** sprint · **mouse** aim & attack · **E** interact · **Q** quick-heal · **1-5** hotbar · **TAB** inventory · **C** crafting · **M** world map · **ESC** close panels. Emptying stamina causes a longer regeneration delay and locks sprint until you recover.
 3. **Harvesting:** punch trees for wood and rocks for stone with your bare fists (slow), or craft a **hatchet** / **pickaxe** for 3× yield. Nodes break after enough hits and regrow a few minutes later — for everyone, it's one shared world.
 4. **Enemies:** zombies chase and claw; military guards keep their distance and fire rifle bursts (gunfire aggros nearby enemies). Both drop loot bags — military can drop the **Vanguard Rifle**.
 5. Inventory is slot + weight based (kg). Find or craft **backpack upgrades** to carry more (12 slots/20 kg → 16/32 → 20/45).
@@ -55,7 +61,7 @@ Production deployment is configured for Vercel (`apps/web`) plus independently a
 7. Dying drops all your gear into a loot bag at your corpse — anyone can grab it. You respawn with a starter kit.
 8. Inventory, backpack tier and K/D persist to the Neon database per account; chests restock a few minutes after being emptied; a full day/night cycle runs every 10 minutes.
 
-**UI:** minimap with POI labels, hotbar, floating damage/harvest numbers, hit-direction red flash, interaction prompts, location banners when entering a POI, kill feed, synthesized positional sound effects (M to mute).
+**UI:** minimap with POI labels, `M` tactical world map, hotbar, floating damage/harvest numbers, hit-direction red flash, interaction prompts, location banners, kill feed and synthesized positional sound effects. Audio can be toggled from the lower-right speaker button or pause menu.
 
 ## Auth note ("neon-auth")
 
@@ -65,4 +71,4 @@ Auth is a basic email/password API backed by your **Neon** Postgres database (bc
 
 - The server simulates the world at 20 Hz (movement, projectiles with sub-stepped collision, chest restocking, ground-loot respawn) and broadcasts snapshots; the client interpolates.
 - All gameplay actions (looting, crafting, item moves, shooting) are validated server-side — the client is display + intent only.
-- A random map seed is generated on every server boot: buildings with doors and interior chests, lakes with sand shores, roads, tree collision borders.
+- The server loads the active published authored map from Postgres. Procedural generation remains the fallback when no active map exists.

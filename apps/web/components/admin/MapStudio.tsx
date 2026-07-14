@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { AuthoredMap, MapObject, Tile, TILE, type BlockDocument, type EngineBlockDefinition, type ResourceNodeDef, type SpriteDocument, type TerrainDocument } from '@holdout/shared';
 import { CHAR_ROWS, ITEM_INDEX, loadSheets, type Sheets } from '@/game/sprites';
 import {
-  MAP_HISTORY_LIMIT as HISTORY_LIMIT,
   MAP_OBJECT_PALETTE as OBJECTS,
   MAX_MAP_SIZE as MAX_SIZE,
   MAX_MAP_ZOOM as MAX_ZOOM,
@@ -14,11 +13,15 @@ import {
   TERRAIN_PALETTE as TERRAIN,
   TILE_COLORS,
   cloneAuthoredMap as cloneMap,
+  compactAuthoredMap as compactMap,
   clampNumber as clamp,
   coordinateNoise as hash,
+  historyLimitForMap,
+  inflateAuthoredMap as inflateMap,
   mapObjectLabel as objectLabel,
   terrainTileLabel as tileLabel,
   type LootSummary as LootRecord,
+  type EditorMap,
   type MapCamera as Camera,
   type MapEditorTool as EditorTool,
   type MobSummary as MobRecord,
@@ -31,7 +34,7 @@ export function MapStudio() {
   const minimapRef = useRef<HTMLCanvasElement>(null);
   const minimapBaseRef = useRef<HTMLCanvasElement | null>(null);
   const pixelFramesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
-  const mapRef = useRef<AuthoredMap | null>(null);
+  const mapRef = useRef<EditorMap | null>(null);
   const cameraRef = useRef<Camera>({ x: 1600, y: 1600, zoom: 0.5 });
   const spaceHeldRef = useRef(false);
   const interactionRef = useRef<
@@ -39,11 +42,11 @@ export function MapStudio() {
     | { kind: 'paint'; pointerId: number; tileX: number; tileY: number; erase: boolean }
     | null
   >(null);
-  const historyRef = useRef<{ past: AuthoredMap[]; future: AuthoredMap[] }>({ past: [], future: [] });
+  const historyRef = useRef<{ past: EditorMap[]; future: EditorMap[] }>({ past: [], future: [] });
   const fittedRef = useRef(false);
   const inspectorEditingRef = useRef(false);
 
-  const [map, setMap] = useState<AuthoredMap | null>(null);
+  const [map, setMap] = useState<EditorMap | null>(null);
   const [name, setName] = useState('Custom Map');
   const [draftId, setDraftId] = useState<number | null>(null);
   const [publishedId, setPublishedId] = useState<number | null>(null);
@@ -88,12 +91,12 @@ export function MapStudio() {
     if (!current) return;
     const history = historyRef.current;
     history.past.push(cloneMap(current));
-    if (history.past.length > HISTORY_LIMIT) history.past.shift();
+    if (history.past.length > historyLimitForMap(current)) history.past.shift();
     history.future = [];
     setHistoryVersion((version) => version + 1);
   }, []);
 
-  const updateMap = useCallback((updater: (current: AuthoredMap) => AuthoredMap) => {
+  const updateMap = useCallback((updater: (current: EditorMap) => EditorMap) => {
     setMap((current) => {
       if (!current) return current;
       const next = updater(current);
@@ -172,10 +175,9 @@ export function MapStudio() {
     ]).then(([mapData, mobData, lootData, resourceData, blockData, terrainData, spriteData, loadedSheets]) => {
       if (cancelled) return;
       const loaded = mapData.map?.data as AuthoredMap | undefined;
-      const next = loaded && loaded.tiles?.length === loaded.w * loaded.h
-        ? cloneMap(loaded)
-        : { w: 100, h: 100, tiles: new Array(10_000).fill(Tile.Grass), elevations: new Array(10_000).fill(0), terrain: Object.fromEntries(Array.from({ length: 10_000 }, (_, index) => [String(index), 'grass'])), objects: [] };
-      next.terrain = Object.fromEntries(next.tiles.map((tile, index) => [String(index), next.terrain?.[String(index)] ?? TERRAIN_ID_BY_TILE[tile] ?? 'grass']));
+      const next: EditorMap = loaded && loaded.w >= MIN_SIZE && loaded.h >= MIN_SIZE
+        ? inflateMap(loaded)
+        : { w: 100, h: 100, tiles: new Uint8Array(10_000).fill(Tile.Grass), elevations: new Uint8Array(10_000), terrain: {}, objects: [] };
       setMap(next);
       mapRef.current = next;
       setName(mapData.map?.name ?? 'Custom Map');
@@ -366,7 +368,8 @@ export function MapStudio() {
       ctx.scale(currentCamera.zoom, currentCamera.zoom);
       ctx.translate(-currentCamera.x, -currentCamera.y);
       for (let ty = minY; ty <= maxY; ty++) for (let tx = minX; tx <= maxX; tx++) {
-        const terrain = terrainDefs[map.terrain?.[String(ty * map.w + tx)] ?? ''];
+        const index = ty * map.w + tx;
+        const terrain = terrainDefs[map.terrain?.[String(index)] ?? TERRAIN_ID_BY_TILE[map.tiles[index]] ?? 'grass'];
         ctx.fillStyle = terrain?.minimapColor ?? '#527741';
         ctx.globalAlpha = 1;
         ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
@@ -482,14 +485,19 @@ export function MapStudio() {
     const scale = Math.min(width / map.w, height / map.h);
     const ox = (width - map.w * scale) / 2;
     const oy = (height - map.h * scale) / 2;
-    for (let y = 0; y < map.h; y++) {
-      for (let x = 0; x < map.w; x++) {
-        ctx.fillStyle = TILE_COLORS[map.tiles[y * map.w + x]] ?? TILE_COLORS[Tile.Grass];
-        const authoredTerrain = terrainDefs[map.terrain?.[String(y * map.w + x)] ?? ''];
+    const mapWidth = Math.max(1, Math.ceil(map.w * scale));
+    const mapHeight = Math.max(1, Math.ceil(map.h * scale));
+    for (let py = 0; py < mapHeight; py++) {
+      for (let px = 0; px < mapWidth; px++) {
+        const x = Math.min(map.w - 1, Math.floor((px + .5) * map.w / mapWidth));
+        const y = Math.min(map.h - 1, Math.floor((py + .5) * map.h / mapHeight));
+        const index = y * map.w + x;
+        ctx.fillStyle = TILE_COLORS[map.tiles[index]] ?? TILE_COLORS[Tile.Grass];
+        const authoredTerrain = terrainDefs[map.terrain?.[String(index)] ?? TERRAIN_ID_BY_TILE[map.tiles[index]] ?? 'grass'];
         if (authoredTerrain) ctx.fillStyle = authoredTerrain.minimapColor;
-        ctx.fillRect(ox + x * scale, oy + y * scale, Math.max(1, scale), Math.max(1, scale));
-        const level = map.elevations?.[y * map.w + x] ?? 0;
-        if (level) { ctx.fillStyle = `rgba(247,222,162,${level * .13})`; ctx.fillRect(ox + x * scale, oy + y * scale, Math.max(1, scale), Math.max(1, scale)); }
+        ctx.fillRect(Math.floor(ox) + px, Math.floor(oy) + py, 1, 1);
+        const level = map.elevations[index] ?? 0;
+        if (level) { ctx.fillStyle = `rgba(247,222,162,${level * .13})`; ctx.fillRect(Math.floor(ox) + px, Math.floor(oy) + py, 1, 1); }
       }
     }
     for (const object of map.objects) {
@@ -555,12 +563,12 @@ export function MapStudio() {
       points.push({ x: Math.round(fromX + (toX - fromX) * step / steps), y: Math.round(fromY + (toY - fromY) * step / steps) });
     }
     updateMap((source) => {
-      const tiles = source.tiles.slice();
-      const elevations = source.elevations?.slice() ?? new Array(source.w * source.h).fill(0);
-      const terrainKinds = { ...(source.terrain ?? {}) };
-      const resourceKinds = { ...(source.resources ?? {}) };
-      const blockKinds = { ...(source.blocks ?? {}) };
-      const blockRotations = { ...(source.blockRotations ?? {}) };
+      const tiles = source.tiles;
+      const elevations = source.elevations;
+      const terrainKinds = source.terrain ?? {};
+      const resourceKinds = source.resources ?? {};
+      const blockKinds = source.blocks ?? {};
+      const blockRotations = source.blockRotations ?? {};
       let objects = source.objects;
       for (const point of points) {
         if (point.x < 0 || point.y < 0 || point.x >= source.w || point.y >= source.h) continue;
@@ -571,7 +579,7 @@ export function MapStudio() {
             const index = point.y * source.w + point.x;
             if (blockKinds[String(index)]) { delete blockKinds[String(index)]; delete blockRotations[String(index)]; }
             else {
-              terrainKinds[String(index)] = 'grass';
+              delete terrainKinds[String(index)];
               tiles[index] = terrainDefs.grass?.simulationTile ?? Tile.Grass;
               delete resourceKinds[String(index)];
             }
@@ -582,8 +590,10 @@ export function MapStudio() {
             const x = point.x + dx; const y = point.y + dy;
             if (x >= 0 && y >= 0 && x < source.w && y < source.h) {
               const index = y * source.w + x;
-              terrainKinds[String(index)] = tool.id;
-              tiles[index] = terrainDefs[tool.id]?.simulationTile ?? Tile.Grass;
+              const tile = terrainDefs[tool.id]?.simulationTile ?? Tile.Grass;
+              tiles[index] = tile;
+              if (tool.id === (TERRAIN_ID_BY_TILE[tile] ?? 'grass')) delete terrainKinds[String(index)];
+              else terrainKinds[String(index)] = tool.id;
               delete resourceKinds[String(index)];
             }
           }
@@ -725,7 +735,7 @@ export function MapStudio() {
     const response = await fetch('/api/admin/map', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: draftId, name, data: current }),
+      body: JSON.stringify({ id: draftId, name, data: compactMap(current) }),
     });
     const data = await response.json();
     if (!response.ok) { setStatus(`Save failed: ${data.error}`); return null; }
@@ -765,13 +775,13 @@ export function MapStudio() {
     if (width === current.w && height === current.h) return;
     pushHistory();
     updateMap((source) => {
-      const tiles = new Array(width * height).fill(Tile.Grass);
-      const elevations = new Array(width * height).fill(0);
-      const terrainKinds: Record<string, string> = Object.fromEntries(Array.from({ length: width * height }, (_, index) => [String(index), 'grass']));
+      const tiles = new Uint8Array(width * height).fill(Tile.Grass);
+      const elevations = new Uint8Array(width * height);
+      const terrainKinds: Record<string, string> = {};
       const resourceKinds: Record<string, string> = {};
       const blockKinds: Record<string, string> = {};
       const blockRotations: Record<string, number> = {};
-      for (let y = 0; y < Math.min(height, source.h); y++) for (let x = 0; x < Math.min(width, source.w); x++) { tiles[y * width + x] = source.tiles[y * source.w + x]; elevations[y * width + x] = source.elevations?.[y * source.w + x] ?? 0; }
+      for (let y = 0; y < Math.min(height, source.h); y++) for (let x = 0; x < Math.min(width, source.w); x++) { tiles[y * width + x] = source.tiles[y * source.w + x]; elevations[y * width + x] = source.elevations[y * source.w + x] ?? 0; }
       for (const [rawIndex, resourceId] of Object.entries(source.resources ?? {})) {
         const oldIndex = Number(rawIndex); const x = oldIndex % source.w; const y = Math.floor(oldIndex / source.w);
         if (x < width && y < height) resourceKinds[String(y * width + x)] = resourceId;

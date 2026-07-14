@@ -1,5 +1,17 @@
 import { NextResponse } from 'next/server';
-import { AuthoredMap, MapObject, Tile } from '@holdout/shared';
+import {
+  AUTHORED_MAP_MAX_SIZE,
+  AUTHORED_MAP_MIN_SIZE,
+  AuthoredMap,
+  MapObject,
+  Tile,
+  decodeAuthoredElevations,
+  decodeAuthoredTiles,
+  decodeTerrainRuns,
+  encodeByteRuns,
+  encodeTerrainRuns,
+  isCompleteByteRuns,
+} from '@holdout/shared';
 import { requireAdmin } from '@/lib/auth';
 import { prisma } from '@/lib/db';
 
@@ -24,18 +36,20 @@ const TERRAIN_ID_BY_TILE: Record<number, string> = {
 
 function cleanMap(input: unknown, terrainDocument: unknown): AuthoredMap {
   const data = input as Partial<AuthoredMap> | null;
-  if (!data || !Array.isArray(data.tiles) || !Array.isArray(data.objects)) throw new Error('Invalid map data');
+  if (!data || !Array.isArray(data.objects)) throw new Error('Invalid map data');
   const w = Number(data.w) | 0;
   const h = Number(data.h) | 0;
-  if (w < 20 || h < 20 || w > 200 || h > 200 || data.tiles.length !== w * h) throw new Error('Map must be 20-200 tiles per side');
-  if (data.objects.length > 2000) throw new Error('Too many objects');
-  const tiles = data.tiles.map((tile) => {
-    const value = Number(tile) | 0;
-    return AUTHORABLE.has(value) ? value : Tile.Grass;
-  });
-  const elevations = Array.isArray(data.elevations) && data.elevations.length === w * h
-    ? data.elevations.map((level) => Math.max(0, Math.min(3, Number(level) | 0)))
-    : new Array(w * h).fill(0);
+  const cellCount = w * h;
+  const hasTiles = Array.isArray(data.tiles) && data.tiles.length === cellCount;
+  if (w < AUTHORED_MAP_MIN_SIZE || h < AUTHORED_MAP_MIN_SIZE || w > AUTHORED_MAP_MAX_SIZE || h > AUTHORED_MAP_MAX_SIZE || (!hasTiles && !isCompleteByteRuns(data.tileRuns, cellCount))) {
+    throw new Error(`Map must be ${AUTHORED_MAP_MIN_SIZE}-${AUTHORED_MAP_MAX_SIZE} tiles per side with a complete tile grid`);
+  }
+  if (data.objects.length > 10_000) throw new Error('Too many objects');
+  const tiles = decodeAuthoredTiles(data as AuthoredMap);
+  for (let index = 0; index < tiles.length; index++) if (!AUTHORABLE.has(tiles[index])) tiles[index] = Tile.Grass;
+  const elevations = (Array.isArray(data.elevations) && data.elevations.length === cellCount) || isCompleteByteRuns(data.elevationRuns, cellCount)
+    ? decodeAuthoredElevations(data as AuthoredMap)
+    : new Uint8Array(cellCount);
   const objects = data.objects
     .filter((object): object is MapObject => Boolean(object && VALID_OBJECTS.has(object.type) && Number.isFinite(object.x) && Number.isFinite(object.y)))
     .map((object) => ({
@@ -43,7 +57,7 @@ function cleanMap(input: unknown, terrainDocument: unknown): AuthoredMap {
       x: Math.max(0, Math.min(w - 1, Number(object.x) | 0)),
       y: Math.max(0, Math.min(h - 1, Number(object.y) | 0)),
       ...(object.name ? { name: String(object.name).slice(0, 40) } : {}),
-      ...(object.r ? { r: Math.max(2, Math.min(40, Number(object.r) | 0)) } : {}),
+      ...(object.r ? { r: Math.max(2, Math.min(500, Number(object.r) | 0)) } : {}),
       ...(object.contentId ? { contentId: String(object.contentId).replace(/[^a-z0-9_-]/gi, '_').slice(0, 50) } : {}),
       ...(object.lootTable ? { lootTable: String(object.lootTable).replace(/[^a-z0-9_-]/gi, '_').slice(0, 50) } : {}),
       ...(object.respawnMs ? { respawnMs: Math.max(1000, Math.min(86_400_000, Number(object.respawnMs) | 0)) } : {}),
@@ -53,16 +67,21 @@ function cleanMap(input: unknown, terrainDocument: unknown): AuthoredMap {
   const terrainDefs = terrainDocument && typeof terrainDocument === 'object' && !Array.isArray(terrainDocument)
     ? terrainDocument as Record<string, { simulationTile?: number }>
     : {};
-  const terrain: Record<string, string> = Object.fromEntries(tiles.map((tile, index) => [String(index), TERRAIN_ID_BY_TILE[tile] ?? 'grass']));
-  if (data.terrain && typeof data.terrain === 'object') {
-    for (const [rawIndex, rawId] of Object.entries(data.terrain)) {
+  const terrain: Record<string, string> = {};
+  const incomingTerrain = {
+    ...decodeTerrainRuns(data.terrainRuns, cellCount),
+    ...(data.terrain && typeof data.terrain === 'object' ? data.terrain : {}),
+  };
+  if (Object.keys(incomingTerrain).length) {
+    for (const [rawIndex, rawId] of Object.entries(incomingTerrain)) {
       const index = Number(rawIndex) | 0;
       if (index < 0 || index >= w * h || typeof rawId !== 'string') continue;
       const id = rawId.replace(/[^a-z0-9_-]/gi, '_').slice(0, 50);
       if (!id) continue;
       const definition = terrainDefs[id];
       if (Object.keys(terrainDefs).length && !definition) throw new Error(`Unknown terrain definition: ${id}`);
-      terrain[String(index)] = id;
+      if (id !== (TERRAIN_ID_BY_TILE[tiles[index]] ?? 'grass')) terrain[String(index)] = id;
+      else delete terrain[String(index)];
       if (definition && AUTHORABLE.has(Number(definition.simulationTile) | 0)) tiles[index] = Number(definition.simulationTile) | 0;
     }
   }
@@ -90,17 +109,40 @@ function cleanMap(input: unknown, terrainDocument: unknown): AuthoredMap {
       }
     }
   }
-  return { w, h, tiles, elevations, terrain, resources, blocks, blockRotations, objects };
+  return {
+    w,
+    h,
+    tileRuns: encodeByteRuns(tiles),
+    elevationRuns: encodeByteRuns(elevations),
+    terrainRuns: encodeTerrainRuns(terrain),
+    resources,
+    blocks,
+    blockRotations,
+    objects,
+  };
 }
 
 export async function GET() {
   const user = await requireAdmin();
   if (!user) return NextResponse.json({ error: 'Admins only' }, { status: 403 });
   const [draft, published] = await Promise.all([
-    prisma.gameMap.findFirst({ where: { draft: true }, orderBy: { updatedAt: 'desc' } }),
-    prisma.gameMap.findFirst({ where: { active: true, draft: false }, orderBy: { updatedAt: 'desc' } }),
+    prisma.gameMap.findFirst({
+      where: { draft: true },
+      orderBy: { updatedAt: 'desc' },
+      select: { id: true, name: true, data: true, draft: true },
+    }),
+    prisma.gameMap.findFirst({
+      where: { active: true, draft: false },
+      orderBy: { updatedAt: 'desc' },
+      select: { id: true, name: true, updatedAt: true },
+    }),
   ]);
-  const selected = draft ?? published;
+  const selected = draft ?? (published
+    ? await prisma.gameMap.findUnique({
+      where: { id: published.id },
+      select: { id: true, name: true, data: true, draft: true },
+    })
+    : null);
   return NextResponse.json({
     map: selected ? { id: selected.id, name: selected.name, data: selected.data, draft: selected.draft } : null,
     published: published ? { id: published.id, name: published.name, updatedAt: published.updatedAt } : null,
@@ -116,7 +158,7 @@ export async function PUT(req: Request) {
   const terrainContent = await prisma.gameContent.findUnique({ where: { kind: 'terrain' } });
   try { data = cleanMap(body.data, terrainContent?.draft); } catch (error) { return NextResponse.json({ error: (error as Error).message }, { status: 400 }); }
   const name = String(body.name ?? 'Custom Map').trim().slice(0, 60) || 'Custom Map';
-  const existing = body.id ? await prisma.gameMap.findFirst({ where: { id: body.id | 0, draft: true } }) : null;
+  const existing = body.id ? await prisma.gameMap.findFirst({ where: { id: body.id | 0, draft: true }, select: { id: true } }) : null;
   const row = existing
     ? await prisma.gameMap.update({ where: { id: existing.id }, data: { name, data: data as object, updatedAt: new Date() } })
     : await prisma.gameMap.create({ data: { name, data: data as object, active: false, draft: true } });

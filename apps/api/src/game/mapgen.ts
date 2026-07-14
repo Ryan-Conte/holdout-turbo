@@ -1,4 +1,20 @@
-import { AuthoredMap, COPPER_CHANCE, EnemyKind, IRON_CHANCE, MAP_H, MAP_W, PoiSnap, TILE, Tile, TraderTier } from '@holdout/shared';
+import {
+  AUTHORED_MAP_MAX_SIZE,
+  AUTHORED_MAP_MIN_SIZE,
+  AuthoredMap,
+  COPPER_CHANCE,
+  EnemyKind,
+  IRON_CHANCE,
+  MAP_H,
+  MAP_W,
+  PoiSnap,
+  TILE,
+  Tile,
+  TraderTier,
+  decodeAuthoredElevations,
+  decodeAuthoredTiles,
+  decodeTerrainRuns,
+} from '@holdout/shared';
 
 export type ChestTier = 'normal' | 'military' | 'rare';
 
@@ -404,22 +420,20 @@ function placeExtracts(t: Uint8Array, W: number, H: number, pois: PoiSnap[]): { 
 
 /** Convert an editor-authored map into the runtime structure (validating tiles). */
 export function fromAuthored(map: AuthoredMap): GeneratedMap {
-  const W = Math.max(20, Math.min(200, map.w | 0));
-  const H = Math.max(20, Math.min(200, map.h | 0));
+  const W = Math.max(AUTHORED_MAP_MIN_SIZE, Math.min(AUTHORED_MAP_MAX_SIZE, map.w | 0));
+  const H = Math.max(AUTHORED_MAP_MIN_SIZE, Math.min(AUTHORED_MAP_MAX_SIZE, map.h | 0));
   const tiles = new Uint8Array(W * H).fill(Tile.Grass);
-  const elevations = new Uint8Array(W * H);
+  const authoredTiles = decodeAuthoredTiles({ ...map, w: W, h: H });
+  const elevations = decodeAuthoredElevations({ ...map, w: W, h: H });
   // editor may paint terrain + resource nodes; structures/stations stay player-built
   const AUTHORABLE = new Set<number>([
     Tile.Grass, Tile.Water, Tile.Tree, Tile.Floor, Tile.Wall, Tile.Road,
     Tile.Sand, Tile.Rock, Tile.Asphalt, Tile.Bed, Tile.DoorMat,
     Tile.CopperOre, Tile.IronOre, Tile.Cliff,
   ]);
-  for (let i = 0; i < W * H && i < map.tiles.length; i++) {
-    const v = map.tiles[i] | 0;
+  for (let i = 0; i < W * H; i++) {
+    const v = authoredTiles[i] | 0;
     tiles[i] = AUTHORABLE.has(v) ? v : Tile.Grass;
-  }
-  if (Array.isArray(map.elevations) && map.elevations.length === W * H) {
-    for (let i = 0; i < elevations.length; i++) elevations[i] = Math.max(0, Math.min(3, Number(map.elevations[i]) | 0));
   }
 
   const out: GeneratedMap = {
@@ -441,17 +455,14 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
     enemySpawns: [],
   };
 
-  if (map.terrain && typeof map.terrain === 'object') {
-    for (const [rawIndex, terrainId] of Object.entries(map.terrain)) {
+  const authoredTerrain = { ...decodeTerrainRuns(map.terrainRuns, W * H), ...(map.terrain ?? {}) };
+  if (Object.keys(authoredTerrain).length) {
+    for (const [rawIndex, terrainId] of Object.entries(authoredTerrain)) {
       const index = Number(rawIndex) | 0;
       if (index < 0 || index >= W * H || typeof terrainId !== 'string' || !terrainId) continue;
       out.terrainKinds[String(index)] = terrainId.slice(0, 50);
     }
   }
-  for (let index = 0; index < W * H; index++) {
-    if (!out.terrainKinds[String(index)]) out.terrainKinds[String(index)] = TERRAIN_ID_BY_TILE[tiles[index]] ?? 'grass';
-  }
-
   if (map.resources && typeof map.resources === 'object') {
     for (const [rawIndex, resourceId] of Object.entries(map.resources)) {
       const index = Number(rawIndex) | 0;
@@ -460,9 +471,11 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
       out.resourceKinds[String(index)] = resourceId.slice(0, 50);
     }
   }
-  const defaultResources = resourceKindsFromTiles(tiles);
-  for (const [index, resourceId] of Object.entries(defaultResources)) {
-    if (!out.resourceKinds[index]) out.resourceKinds[index] = resourceId;
+  // Legacy authored maps inferred resources from their tile layer. Once a map
+  // has explicit resource IDs, that catalog is authoritative and broad terrain
+  // regions must not silently become thousands of extra harvest nodes.
+  if (Object.keys(out.resourceKinds).length === 0) {
+    out.resourceKinds = resourceKindsFromTiles(tiles);
   }
   if (map.blocks && typeof map.blocks === 'object') {
     for (const [rawIndex, blockId] of Object.entries(map.blocks)) {

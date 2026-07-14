@@ -30,10 +30,10 @@ Content documents live in `game_content`, one row per kind. Rows contain `draft`
 
 1. **Save draft** validates and stores work without changing the game.
 2. **Publish live** validates again and copies the draft to `published`.
-3. Game API instances poll published mobs, recipes, traders and loot every 10 seconds.
+3. Game API instances cache published documents in process memory and poll only `published_revision`/`published_at` metadata every 10 seconds. A publish fetches only the changed document; unchanged sprite pixels and other JSON never cross the database connection again. The last successful bundle is also written atomically to `RUNTIME_CACHE_DIR` so a socket server can restart from local temp storage during a database outage. Failed metadata probes use exponential backoff up to five minutes while the cached world remains online.
 4. Shared TypeScript definitions remain the fallback if a row is missing or invalid.
 
-Maps use rows in `maps`: `draft=true` is private, while one `active=true, draft=false` row is live. Game servers poll the active revision and replace the world only when no players are connected to it, so publishing cannot reset an active raid.
+Maps use rows in `maps`: `draft=true` is private, while one `active=true, draft=false` row is live. Each game server downloads the active authored map once, expands it into its in-memory world, writes a local runtime snapshot, and then polls only the active row ID. Startup prefers current Postgres data but restores that snapshot when Postgres is unavailable. A newly published map document is fetched once and replaces the world only when no players are connected, so publishing cannot reset an active raid.
 
 ## Runtime coverage
 
@@ -59,7 +59,7 @@ This split gives artists and designers a stable DB workflow while preserving the
 
 ## Map workflow
 
-- The editor uses a bounded camera viewport and renders only visible tiles, so 200x200 maps do not create enormous browser canvases.
+- The editor supports authored maps up to 2000x2000 cells. Its bounded camera viewport renders only visible tiles, so massive worlds do not create enormous browser canvases.
 - The preview uses current tile, item and character sheets, animated mob frames, extraction pulses, POI radii and content labels.
 - Mouse wheel zooms around the cursor. Pan with the H tool, middle-drag, Space+drag, Shift+wheel, or by clicking the minimap. `F` fits the world.
 - The navigator caches map terrain and draws the current camera bounds. Grid, labels and zone overlays can be toggled independently.
@@ -67,12 +67,14 @@ This split gives artists and designers a stable DB workflow while preserving the
 - There is no separate Base palette. Every authored cell carries a published terrain ID, and art and behavior remain centrally editable in `/admin/terrain`.
 - The Nodes palette paints a published resource variant onto a compatible tile. Health, drops, respawn, sprite and sounds remain centrally editable in `/admin/resources`.
 - The Blocks palette includes both player-buildable kit pieces and authored-only world blocks. `R` or **Rotate 90°** stores a clockwise quarter-turn per cell; the definition supplies its pixel asset and authoritative behavior.
-- Terrain strokes interpolate between pointer samples, and undo/redo keeps the last 40 map transactions (`Ctrl+Z` / `Ctrl+Y`).
+- Terrain strokes interpolate between pointer samples. Undo/redo keeps the last 40 map transactions on ordinary maps and the last 8 on massive maps (`Ctrl+Z` / `Ctrl+Y`) to keep browser memory bounded.
 - Select a placement with `V` to edit position, POI name/radius, custom mob ID/respawn, or custom chest table in the inspector.
 - **Custom zone** creates a new named POI with editable radius, map class and independent safe-zone/hot-loot flags. These settings become authoritative server POI behavior after publish.
 - **Custom chest** placement selects a published loot-table ID from the content library.
 - **Custom mob / boss** placement selects a published mob record; its respawn can be overridden in the inspector. The mob record carries `boss: true` for design semantics.
 - Right-click or the `E` tool erases. Invalid custom content references block publish. Save a draft before publishing.
+
+Map rows and socket initialization use run-length encoded tile, elevation and terrain-override layers. The editor and authoritative server inflate these into byte arrays only while the map is active; older dense map rows remain readable and are rewritten compactly the next time an admin saves them. The game renderer draws visible large-world cells directly and uses a sampled 512-pixel navigator instead of allocating a full-world canvas. Opening the admin editor loads the editable draft plus live-map metadata, not a second full copy of the published map.
 
 ## Pixel workflow
 
@@ -113,6 +115,26 @@ npm run seed:engine
 ```
 
 `seed:engine` creates missing documents from current items, recipes, mobs, terrain, resources, sounds, loot, traders, blocks and sprite metadata. Current terrain/resource PNG cells are materialized as editable DB RGBA frames, existing authored values are preserved, and older stored maps receive a terrain ID for every cell.
+
+### Showcase base map
+
+`Ashfall Basin - Showcase Base` is a deterministic 2000x2000 authored map that uses the engine's maximum supported dimensions. Its 30 named regions include twelve compact settlements, three farms, Greywing Airfield and Rook Airstrip, two fortified military bases, four safe trading outposts, two risky black-market traders and distinct forest, marsh, quarry, highland and industrial regions. Buildings are deliberately limited to 14x10 cells; the current seed places 337 small houses, shops, hangars and barracks instead of a few oversized compounds.
+
+Regional population and loot are part of the validation contract: infected gather around towns and farms, military guards defend airfields and hot zones, bosses anchor both forts, and wildlife occupies the surrounding biomes. The current seed provides 662 mob spawns across all seven published mob types, 141 loot containers, seven high-loot regions, 48 world spawns and twelve extraction routes. Safe-zone and deployment buffers reject enemy placement, while road loops, local spurs and four river crossings must retain 100% walkable connectivity before the map can publish.
+
+The generator demonstrates every published block, resource, mob and loot table. It also validates catalog references, dimensions, collision, overlapping gameplay objects, critical-route reachability and total walkable connectivity before it can write to the database. Generate a preview and validation report without changing maps:
+
+```bash
+npm run validate:showcase-map
+```
+
+Publish the validated map and create or refresh its editable draft:
+
+```bash
+npm run seed:showcase-map
+```
+
+Publishing deactivates the previous live map but preserves its database row. Re-running the command updates the named draft and creates a new immutable live row. API worlds adopt the new active row when their current world has no connected players.
 
 `ADMIN_EMAILS` only bootstraps `profiles.admin` on first check. The DB flag remains authoritative afterward.
 

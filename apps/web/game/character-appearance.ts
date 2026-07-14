@@ -19,10 +19,17 @@ export function drawCharacterAppearance(
   const hair = CHARACTER_HAIR_COLORS[appearance.hairColor] ?? CHARACTER_HAIR_COLORS[1];
   const outfit = CHARACTER_OUTFIT_COLORS[appearance.outfit] ?? CHARACTER_OUTFIT_COLORS[0];
   const accent = CHARACTER_ACCENT_COLORS[appearance.accent] ?? CHARACTER_ACCENT_COLORS[0];
+  const shade = (color: string, factor: number) => `#${[1, 3, 5].map((offset) => Math.round(parseInt(color.slice(offset, offset + 2), 16) * factor).toString(16).padStart(2, '0')).join('')}`;
   const rect = (x: number, y: number, w: number, h: number, color: string) => {
     ctx.fillStyle = color;
     ctx.fillRect(left + x * scale, top + y * scale, w * scale, h * scale);
   };
+
+  // Repaint the base uniform so DB animation frames do not bake in one outfit.
+  rect(4, 6, 8, 4, outfit);
+  rect(4, 10, 8, 2, shade(outfit, 0.8));
+  rect(3, 7, 1, 4, outfit);
+  rect(12, 7, 1, 4, outfit);
 
   // Body frames retain the shared animation while changing the silhouette.
   if (appearance.body === 1) {

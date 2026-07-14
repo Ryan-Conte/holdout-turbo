@@ -26,13 +26,13 @@ export async function PUT(req: Request) {
   let body: { appearance?: unknown };
   try { body = await req.json(); } catch { return NextResponse.json({ error: 'Invalid body' }, { status: 400 }); }
   const appearance = sanitizeCharacterAppearance(body.appearance);
-  const profile = await prisma.profile.findUnique({ where: { userId: user.id }, select: { data: true } });
-  const existing = (profile?.data ?? {}) as Record<string, unknown>;
-  const data = JSON.parse(JSON.stringify({ ...existing, appearance, look: appearance.outfit }));
-  await prisma.profile.upsert({
-    where: { userId: user.id },
-    create: { userId: user.id, data },
-    update: { data, updatedAt: new Date() },
-  });
+  const patch = JSON.stringify({ appearance, look: appearance.outfit });
+  await prisma.$executeRaw`
+    INSERT INTO "profiles" ("user_id", "data", "updated_at")
+    VALUES (${user.id}, CAST(${patch} AS jsonb), CURRENT_TIMESTAMP)
+    ON CONFLICT ("user_id") DO UPDATE SET
+      "data" = COALESCE("profiles"."data", '{}'::jsonb) || CAST(${patch} AS jsonb),
+      "updated_at" = CURRENT_TIMESTAMP
+  `;
   return NextResponse.json({ ok: true, appearance, configured: true });
 }
