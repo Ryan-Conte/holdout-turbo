@@ -3,6 +3,7 @@
 ## Already enforced (server-authoritative core)
 
 - Clients send **intents only** (movement booleans + aim angle + attack flag). Position, speed, collision, fire-rate, ammo, loot rolls, crafting costs, trade prices, damage — all computed server-side.
+- Local movement prediction is presentation-only. The browser mirrors published collision and speed rules, but never sends its predicted coordinates; each snapshot carries the highest processed input sequence and corrections come from the authoritative server position. Immediate muzzle flashes, recoil, swings and sound do not imply an accepted hit or ammo change.
 - Handshake JWT (10 min TTL) signed by the web app; socket rejected without it. One live player per account (reconnect hands over the live state and kicks the old socket).
 - Guest JWTs require a signed `guest:<uuid>` identity and generated callsign. Guests receive no starting currency/items, persistence or profile lease, and cannot chat, add friends, join clans, enter hideouts or extract; they still consume relay capacity and leave the normal vulnerable combat-log body.
 - Input sanitation: numbers clamped/`Number.isFinite`-checked, slot indices bounds-checked, unknown recipe/item ids ignored.

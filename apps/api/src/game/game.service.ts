@@ -46,6 +46,7 @@ import {
   isNight,
   EnemyKind,
   Equipment,
+  FATIGUE_SPEED_MULT,
   FISTS,
   FLOOR_TILES,
   GroundItemSnap,
@@ -139,7 +140,6 @@ const ENEMY_RADIUS = 12;
 const WORLD = 'world';
 const LOS_MEMORY_MS = 12_000; // how long an enemy keeps hunting a target it can't see
 const LOS_GIVE_UP_MS = 2500; // …but once it reaches your last-seen spot, it gives up fast
-const OVERWEIGHT_SPEED_MULT = 0.45; // hauling too much makes you a slow, juicy target
 const BOT_SYNC_MS = 2000;
 const BOT_SELF_CARE_MS = 700;
 const BOT_BUILD_COOLDOWN_MS = 12_000;
@@ -455,6 +455,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       mags: {},
       reloadUntil: 0,
       reloadTarget: null,
+      lastInputSeq: 0,
       lastAttackAt: 0,
       lastExhaustedAttackToastAt: 0,
       lastHitAt: 0,
@@ -1067,6 +1068,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       mags: {},
       reloadUntil: 0,
       reloadTarget: null,
+      lastInputSeq: 0,
       lastAttackAt: 0,
       lastExhaustedAttackToastAt: 0,
       lastHitAt: 0,
@@ -1214,6 +1216,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       })) as Partial<Record<ItemId, number>>,
       reloadUntil: 0,
       reloadTarget: null,
+      lastInputSeq: 0,
       lastAttackAt: 0,
       lastExhaustedAttackToastAt: 0,
       lastHitAt: 0,
@@ -1885,6 +1888,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       shoot: !!input.shoot,
       sprint: !!input.sprint,
     };
+    const seq = Number(input.seq);
+    if (Number.isSafeInteger(seq) && seq >= 0) p.lastInputSeq = Math.min(seq, 0x7fffffff);
   }
 
   interact(sid: string) {
@@ -3781,7 +3786,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         const speed = PLAYER_SPEED
           * (this.inWater(inst, p) ? SWIM_SPEED_MULT : 1)
           * this.terrainMoveMultiplier(inst, p.x, p.y)
-          * fatigueMoveMultiplier(overweight, p.staminaExhausted, OVERWEIGHT_SPEED_MULT)
+          * fatigueMoveMultiplier(overweight, p.staminaExhausted, FATIGUE_SPEED_MULT)
           * (wantSprint ? SPRINT_SPEED_MULT : 1);
         this.moveEntity(inst, p, dx * speed * dt, dy * speed * dt, PLAYER_RADIUS);
         p.moving = true;
@@ -4625,6 +4630,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         hitAt: now - p.lastHitAt < 1000 ? p.lastHitAt : 0,
         admin: p.admin,
         guest: p.guest,
+        ack: p.lastInputSeq,
       });
     }
     const allEnemies: StateSnap['enemies'] = [...inst.enemies.values()].map((e) => ({
@@ -4656,7 +4662,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     );
     if (inst.kind !== 'world') {
       // your own camp: nothing to hide
-      this.io.to(inst.id).emit(EV.state, {
+      this.io.to(inst.id).volatile.emit(EV.state, {
         ...base, players: allPlayers, mapPlayers: [], enemies: allEnemies,
         projectiles: allProjectiles, containers: allContainers, ground: allGround,
       } satisfies StateSnap);
@@ -4690,7 +4696,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         containers: allContainers.filter((s) => sees(s.x, s.y)),
         ground: allGround.filter((s) => sees(s.x, s.y)),
       };
-      this.emitTo(viewer.sid, EV.state, snap);
+      this.io.to(viewer.sid).volatile.emit(EV.state, snap);
     }
   }
 

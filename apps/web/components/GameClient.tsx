@@ -14,18 +14,24 @@ import {
   ContainerContents,
   EntityDeathSnap,
   EV,
+  FATIGUE_SPEED_MULT,
+  FISTS,
   FLOOR_TILES,
   HitSnap,
   INTERACT_RANGE,
   InventoryUpdate,
+  InputPayload,
   ItemId,
   KillFeedEntry,
   RecipeCat,
   RuntimeGameplayContent,
   SKILL_LIST,
   StateSnap,
+  PLAYER_SPEED,
+  SPRINT_SPEED_MULT,
   StationOpen,
   StationFuelUpdate,
+  SWIM_SPEED_MULT,
   TILE,
   Tile,
   TileUpdate,
@@ -94,6 +100,10 @@ const DEMOLISHABLE = new Set<number>([
 type DragZone = 'inv' | 'cont' | 'helmet' | 'vest' | 'mod' | 'weapon';
 interface DragState { zone: DragZone; index: number; item: ItemId; qty: number }
 interface CtxMenu { x: number; y: number; zone: DragZone; index: number; item: ItemId; qty: number }
+interface PendingPredictedInput { seq: number; at: number }
+
+const MAX_PENDING_INPUTS = 80;
+const HARD_RECONCILE_DISTANCE = TILE * 4;
 
 export default function GameClient() {
   const router = useRouter();
@@ -113,6 +123,17 @@ export default function GameClient() {
   const keys = useRef({ up: false, down: false, left: false, right: false });
   const sprintRef = useRef(false);
   const mouse = useRef({ x: 0, y: 0, down: false });
+  const mouseSeenRef = useRef(false);
+  const sendInputNowRef = useRef<() => void>(() => undefined);
+  const inputSeqRef = useRef(0);
+  const lastInputRef = useRef<InputPayload>({ up: false, down: false, left: false, right: false, angle: 0, shoot: false });
+  const pendingInputsRef = useRef<PendingPredictedInput[]>([]);
+  const predictedPosRef = useRef<{ x: number; y: number } | null>(null);
+  const predictionCorrectionRef = useRef({ x: 0, y: 0 });
+  const latencyRef = useRef<number | null>(null);
+  const lastLatencyUiAtRef = useRef(0);
+  const localAttackFxAtRef = useRef(-Infinity);
+  const pendingLocalShotSoundsRef = useRef<{ angle: number; at: number }[]>([]);
   const panelsOpenRef = useRef(false);
   const floatsRef = useRef<FloatRec[]>([]);
   const bubblesRef = useRef(new Map<string, { text: string; at: number }>());
@@ -173,6 +194,7 @@ export default function GameClient() {
   const [feed, setFeed] = useState<(KillFeedEntry & { id: number })[]>([]);
   const [dead, setDead] = useState<string | null>(null);
   const [online, setOnline] = useState(0);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [location, setLocation] = useState<string | null>(null);
   const [prompt, setPrompt] = useState<string | null>(null);
   const [inSafe, setInSafe] = useState(false);
@@ -485,6 +507,41 @@ export default function GameClient() {
 
   useEffect(() => { refreshCommunity(); }, [refreshCommunity]);
 
+  const predictMovement = useCallback((
+    origin: { x: number; y: number },
+    input: InputPayload,
+    dt: number,
+  ): { x: number; y: number } => {
+    const renderer = rendererRef.current;
+    if (!renderer || dt <= 0) return origin;
+    let dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    let dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+    if (!dx && !dy) return origin;
+    const length = Math.hypot(dx, dy);
+    dx /= length;
+    dy /= length;
+
+    const terrain = renderer.movementAtPublic(origin.x, origin.y);
+    const inventory = latestInvRef.current;
+    const overweight = inventory
+      ? invWeight(inventory.inv, runtimeItems()) > invCapacity(inventory.inv).maxKg
+      : false;
+    const exhausted = inventory?.staminaExhausted === true;
+    const sprinting = Boolean(
+      input.sprint
+      && !terrain.swimmable
+      && !overweight
+      && !exhausted
+      && (inventory?.stamina ?? 1) > 0,
+    );
+    const speed = PLAYER_SPEED
+      * (terrain.swimmable ? SWIM_SPEED_MULT : 1)
+      * terrain.moveMultiplier
+      * (overweight || exhausted ? FATIGUE_SPEED_MULT : 1)
+      * (sprinting ? SPRINT_SPEED_MULT : 1);
+    return renderer.movePredictedPublic(origin.x, origin.y, dx * speed * dt, dy * speed * dt);
+  }, []);
+
   // ── socket lifecycle ────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
@@ -512,6 +569,10 @@ export default function GameClient() {
 
       socket = io(selectedServerUrl, { auth: { token }, transports: ['websocket'] });
       socketRef.current = socket;
+      inputSeqRef.current = 0;
+      pendingInputsRef.current = [];
+      latencyRef.current = null;
+      setLatencyMs(null);
 
       socket.on('connect_error', () => setFailed('Cannot reach the selected game server. Return to deployment to choose another relay, or retry.'));
       socket.on('disconnect', () => setConnected(false));
@@ -538,7 +599,13 @@ export default function GameClient() {
         displayPos.current.clear();
         seenProjectiles.current.clear();
         snapRef.current = null;
+        predictedPosRef.current = null;
+        predictionCorrectionRef.current = { x: 0, y: 0 };
+        pendingInputsRef.current = [];
+        pendingLocalShotSoundsRef.current = [];
         setInHideout(init.kind !== 'world');
+        safeRef.current = init.kind !== 'world';
+        setInSafe(init.kind !== 'world');
         setOwnHideout(init.ownHideout);
         setCanDemolishHideout(init.canDemolish);
         setDemolishMode(false);
@@ -566,15 +633,53 @@ export default function GameClient() {
       });
       socket.on(EV.entityDeath, (death: EntityDeathSnap) => rendererRef.current?.entityDeath(death));
       socket.on(EV.state, (s: StateSnap) => {
+        const receivedAt = performance.now();
         snapRef.current = s;
         setOnline(s.population ?? s.players.length);
         const you = s.players.find((p) => p.id === youRef.current);
+        if (you) {
+          const ack = you.ack ?? 0;
+          const acknowledged = pendingInputsRef.current.filter((entry) => entry.seq <= ack);
+          const newestAcknowledged = acknowledged.at(-1);
+          if (newestAcknowledged) {
+            const sample = Math.max(0, receivedAt - newestAcknowledged.at);
+            latencyRef.current = latencyRef.current === null ? sample : latencyRef.current * 0.8 + sample * 0.2;
+            if (receivedAt - lastLatencyUiAtRef.current > 500) {
+              lastLatencyUiAtRef.current = receivedAt;
+              setLatencyMs(Math.round(latencyRef.current));
+            }
+          }
+          pendingInputsRef.current = pendingInputsRef.current.filter((entry) => entry.seq > ack);
+
+          const leadSeconds = Math.min(0.25, Math.max(0.025, (latencyRef.current ?? 80) / 2000));
+          const expected = predictMovement({ x: you.x, y: you.y }, lastInputRef.current, leadSeconds);
+          const predicted = predictedPosRef.current;
+          if (!predicted || Math.hypot(expected.x - predicted.x, expected.y - predicted.y) > HARD_RECONCILE_DISTANCE) {
+            predictedPosRef.current = expected;
+            predictionCorrectionRef.current = { x: 0, y: 0 };
+          } else {
+            predictionCorrectionRef.current = { x: expected.x - predicted.x, y: expected.y - predicted.y };
+          }
+        }
         const next = new Set<number>();
+        const predictedSoundBursts: number[] = [];
+        pendingLocalShotSoundsRef.current = pendingLocalShotSoundsRef.current.filter((shot) => receivedAt - shot.at < 1200);
         for (const pr of s.projectiles) {
           next.add(pr.id);
           if (you && !seenProjectiles.current.has(pr.id)) {
             const d = Math.hypot(pr.x - you.x, pr.y - you.y);
-            if (d < 420) sfx.shoot(Math.max(0.15, 1 - d / 460));
+            const predictedSoundIndex = d < 120 ? pendingLocalShotSoundsRef.current.findIndex((shot) => {
+              const angleDelta = Math.abs(Math.atan2(Math.sin(pr.angle - shot.angle), Math.cos(pr.angle - shot.angle)));
+              return angleDelta < 0.35;
+            }) : -1;
+            const samePredictedBurst = d < 120 && predictedSoundBursts.some((angle) => {
+              const angleDelta = Math.abs(Math.atan2(Math.sin(pr.angle - angle), Math.cos(pr.angle - angle)));
+              return angleDelta < 0.65;
+            });
+            if (predictedSoundIndex >= 0) {
+              predictedSoundBursts.push(pendingLocalShotSoundsRef.current[predictedSoundIndex].angle);
+              pendingLocalShotSoundsRef.current.splice(predictedSoundIndex, 1);
+            } else if (!samePredictedBurst && d < 420) sfx.shoot(Math.max(0.15, 1 - d / 460));
           }
         }
         seenProjectiles.current = next;
@@ -618,6 +723,7 @@ export default function GameClient() {
         }
       });
       socket.on(EV.inventory, (u: InventoryUpdate) => {
+        latestInvRef.current = u;
         setInv(u);
         if (u.hp < prevHpRef.current) {
           setHurtAt(Date.now());
@@ -743,7 +849,7 @@ export default function GameClient() {
       socket?.disconnect();
       socketRef.current = null;
     };
-  }, [router, pushToast, only, completeObjective, updateWorldMapView, refreshClans]);
+  }, [router, pushToast, only, completeObjective, updateWorldMapView, refreshClans, predictMovement]);
 
   useEffect(() => {
     panelsOpenRef.current = showGear || showCraft || showSocial || showSkills || showMap || showAdmin || !!container || !!trade || chatOpen || !!ctxMenu || !!station || escMenu;
@@ -784,8 +890,21 @@ export default function GameClient() {
       if (chatOpenRef.current) return; // chat input owns the keyboard
       if (e.target instanceof HTMLElement && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
       if (e.repeat && !keyMap[e.code]) return; // held keys must not spam interactions (E after extraction!)
-      if (keyMap[e.code]) { keys.current[keyMap[e.code]] = true; e.preventDefault(); startAmbient(); }
-      else if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') sprintRef.current = true;
+      if (keyMap[e.code]) {
+        const direction = keyMap[e.code];
+        if (!keys.current[direction]) {
+          keys.current[direction] = true;
+          sendInputNowRef.current();
+        }
+        e.preventDefault();
+        startAmbient();
+      }
+      else if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+        if (!sprintRef.current) {
+          sprintRef.current = true;
+          sendInputNowRef.current();
+        }
+      }
       else if (e.code === 'KeyE') emit(EV.interact);
       else if (e.code === 'KeyR') { if (heldKitRef.current) rotateBuild(); else emit(EV.reload); }
       else if (e.code === 'Tab' || e.code === 'KeyI') { e.preventDefault(); only(menuRef.current.gear ? null : 'gear'); }
@@ -818,12 +937,24 @@ export default function GameClient() {
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
-      if (keyMap[e.code]) keys.current[keyMap[e.code]] = false;
-      else if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') sprintRef.current = false;
+      if (keyMap[e.code]) {
+        const direction = keyMap[e.code];
+        if (keys.current[direction]) {
+          keys.current[direction] = false;
+          sendInputNowRef.current();
+        }
+      }
+      else if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+        if (sprintRef.current) {
+          sprintRef.current = false;
+          sendInputNowRef.current();
+        }
+      }
     };
     const onMouseMove = (e: MouseEvent) => {
       mouse.current.x = e.clientX;
       mouse.current.y = e.clientY;
+      mouseSeenRef.current = true;
       if (dragRef.current) setDragPos({ x: e.clientX, y: e.clientY });
     };
     const onMouseDown = (e: MouseEvent) => {
@@ -836,8 +967,9 @@ export default function GameClient() {
       if (pl && snapRef.current) {
         const you = snapRef.current.players.find((p) => p.id === youRef.current);
         if (you) {
-          const wx = you.x + (e.clientX - window.innerWidth / 2) / 2; // zoom = 2
-          const wy = you.y + (e.clientY - window.innerHeight / 2) / 2;
+          const position = predictedPosRef.current ?? you;
+          const wx = position.x + (e.clientX - window.innerWidth / 2) / (rendererRef.current?.zoom ?? 2);
+          const wy = position.y + (e.clientY - window.innerHeight / 2) / (rendererRef.current?.zoom ?? 2);
           emit(EV.build, { slot: pl.slot, tx: Math.floor(wx / TILE), ty: Math.floor(wy / TILE), rotation: buildRotationRef.current });
         }
         return;
@@ -846,17 +978,21 @@ export default function GameClient() {
       if (demolishRef.current && snapRef.current) {
         const you = snapRef.current.players.find((p) => p.id === youRef.current);
         if (you) {
-          const wx = you.x + (e.clientX - window.innerWidth / 2) / 2;
-          const wy = you.y + (e.clientY - window.innerHeight / 2) / 2;
+          const position = predictedPosRef.current ?? you;
+          const wx = position.x + (e.clientX - window.innerWidth / 2) / (rendererRef.current?.zoom ?? 2);
+          const wy = position.y + (e.clientY - window.innerHeight / 2) / (rendererRef.current?.zoom ?? 2);
           emit(EV.demolish, { tx: Math.floor(wx / TILE), ty: Math.floor(wy / TILE) });
         }
         return;
       }
       mouse.current.down = true;
+      sendInputNowRef.current();
       startAmbient();
     };
     const onMouseUp = () => {
+      const wasDown = mouse.current.down;
       mouse.current.down = false;
+      if (wasDown) sendInputNowRef.current();
       // unconsumed drag ending outside slots: drop to ground when it came from the backpack
       if (dragRef.current) {
         const d = dragRef.current;
@@ -871,6 +1007,7 @@ export default function GameClient() {
       keys.current = { up: false, down: false, left: false, right: false };
       sprintRef.current = false;
       mouse.current.down = false;
+      sendInputNowRef.current();
     };
     const onWheel = (e: WheelEvent) => {
       // let panels (crafting grid, stash) scroll normally; only steer the hotbar in-world
@@ -897,7 +1034,7 @@ export default function GameClient() {
 
   // input + footsteps at 20Hz
   useEffect(() => {
-    const timer = setInterval(() => {
+    const sendInput = () => {
       const socket = socketRef.current;
       if (!socket || !socket.connected) return;
       const angle = Math.atan2(mouse.current.y - window.innerHeight / 2, mouse.current.x - window.innerWidth / 2);
@@ -907,19 +1044,64 @@ export default function GameClient() {
         ? { up: false, down: false, left: false, right: false }
         : keys.current;
       const moving = !locked && (keys.current.up || keys.current.down || keys.current.left || keys.current.right);
-      socket.emit(EV.input, {
+      const input: InputPayload = {
         ...dirs,
         angle,
         shoot: mouse.current.down && !locked && !heldKitRef.current && !demolishRef.current,
         sprint: sprintRef.current && !locked,
-      });
+        seq: ++inputSeqRef.current,
+      };
+      lastInputRef.current = input;
+      pendingInputsRef.current.push({ seq: input.seq!, at: performance.now() });
+      if (pendingInputsRef.current.length > MAX_PENDING_INPUTS) {
+        pendingInputsRef.current.splice(0, pendingInputsRef.current.length - MAX_PENDING_INPUTS);
+      }
+      socket.volatile.emit(EV.input, input);
+
       const now = performance.now();
+      if (input.shoot) {
+        const inventory = latestInvRef.current;
+        const slot = inventory?.equipped !== null && inventory?.equipped !== undefined
+          ? inventory.inv.slots[inventory.equipped]
+          : null;
+        const definition = slot ? itemDef(slot.id) : null;
+        const cooldown = definition?.weapon?.fireRateMs ?? definition?.melee?.cooldownMs ?? FISTS.cooldownMs;
+        const position = predictedPosRef.current
+          ?? snapRef.current?.players.find((player) => player.id === youRef.current)
+          ?? null;
+        const swimming = position ? rendererRef.current?.movementAtPublic(position.x, position.y).swimmable === true : false;
+        const blockedKind = definition?.kind === 'placeable' || definition?.kind === 'consumable';
+        const gunReady = !definition?.weapon || Boolean(inventory && inventory.mag > 0 && !inventory.reloading);
+        const fishing = slot?.id === 'fishing_rod' && inventory?.nearWater;
+        if (
+          position
+          && !inventory?.staminaExhausted
+          && !safeRef.current
+          && !swimming
+          && !blockedKind
+          && !fishing
+          && gunReady
+          && now - localAttackFxAtRef.current >= cooldown
+        ) {
+          localAttackFxAtRef.current = now;
+          const kind = rendererRef.current?.previewLocalAttack(position.x, position.y, angle, slot?.id ?? null, now / 1000);
+          if (kind === 'gun') {
+            sfx.shoot(1);
+            pendingLocalShotSoundsRef.current.push({ angle, at: now });
+          }
+        }
+      }
       if (moving && now - lastStepAt.current > 340) {
         sfx.step();
         lastStepAt.current = now;
       }
-    }, 50);
-    return () => clearInterval(timer);
+    };
+    sendInputNowRef.current = sendInput;
+    const timer = setInterval(sendInput, 50);
+    return () => {
+      clearInterval(timer);
+      sendInputNowRef.current = () => undefined;
+    };
   }, []);
 
   // ── render loop ─────────────────────────────────────────────────────────
@@ -960,7 +1142,61 @@ export default function GameClient() {
         d.y += (y - d.y) * f;
         return d;
       };
+      const self = snap.players.find((player) => player.id === youRef.current);
+      if (self) {
+        if (!predictedPosRef.current) predictedPosRef.current = { x: self.x, y: self.y };
+        if (!self.dead) {
+          const locked = panelsOpenRef.current;
+          predictedPosRef.current = predictMovement(predictedPosRef.current, {
+            up: !locked && keys.current.up,
+            down: !locked && keys.current.down,
+            left: !locked && keys.current.left,
+            right: !locked && keys.current.right,
+            angle: lastInputRef.current.angle,
+            shoot: false,
+            sprint: !locked && sprintRef.current,
+          }, dt);
+
+          const correction = predictionCorrectionRef.current;
+          if (Math.hypot(correction.x, correction.y) > 0.01) {
+            const reconcileFactor = 1 - Math.exp(-10 * dt);
+            const before = predictedPosRef.current;
+            const corrected = renderer.movePredictedPublic(
+              before.x,
+              before.y,
+              correction.x * reconcileFactor,
+              correction.y * reconcileFactor,
+            );
+            predictedPosRef.current = corrected;
+            predictionCorrectionRef.current = {
+              x: correction.x - (corrected.x - before.x),
+              y: correction.y - (corrected.y - before.y),
+            };
+          }
+        }
+      }
       const players: RenderPlayer[] = snap.players.map((p) => {
+        if (p.id === youRef.current && predictedPosRef.current) {
+          seen.add(p.id);
+          const locked = panelsOpenRef.current;
+          const localDx = locked ? 0 : (keys.current.right ? 1 : 0) - (keys.current.left ? 1 : 0);
+          const localDy = locked ? 0 : (keys.current.down ? 1 : 0) - (keys.current.up ? 1 : 0);
+          const moving = !p.dead && Boolean(localDx || localDy);
+          const angle = mouseSeenRef.current
+            ? Math.atan2(mouse.current.y - window.innerHeight / 2, mouse.current.x - window.innerWidth / 2)
+            : p.angle;
+          const facing = moving ? Math.atan2(localDy, localDx) : mouse.current.down ? angle : p.facing;
+          return {
+            ...p,
+            x: predictedPosRef.current.x,
+            y: predictedPosRef.current.y,
+            dx: predictedPosRef.current.x,
+            dy: predictedPosRef.current.y,
+            angle,
+            facing,
+            moving,
+          };
+        }
         const d = lerp(p.id, p.x, p.y);
         return { ...p, dx: d.x, dy: d.y };
       });
@@ -1193,7 +1429,7 @@ export default function GameClient() {
       cancelAnimationFrame(raf);
       window.removeEventListener('resize', resize);
     };
-  }, [connected, emit, pushToast]);
+  }, [connected, emit, pushToast, predictMovement]);
 
   // ── drag & drop plumbing ────────────────────────────────────────────────
   const beginDrag = (zone: DragZone, index: number, item: ItemId, qty: number, e: React.MouseEvent) => {
@@ -1576,6 +1812,14 @@ export default function GameClient() {
         {isGuest && <div className="kd-chip guest-self-chip">GUEST · TEMPORARY RAID</div>}
         {isAdmin && <div className="kd-chip admin-self-chip">ADMIN · F10</div>}
         <div className="online-chip">● {online} IN ZONE</div>
+        {latencyMs !== null && (
+          <div
+            className={`kd-chip net-chip ${latencyMs < 90 ? 'good' : latencyMs < 180 ? 'ok' : 'high'}`}
+            title="Measured input round trip. Local prediction is active."
+          >
+            NET {latencyMs} ms
+          </div>
+        )}
         {clock && <div className="kd-chip dim">{clock}</div>}
         {inv && <div className="kd-chip gold">{inv.money} cr</div>}
         {inv && <div className="kd-chip">☠ {inv.kills} · {inv.deaths}</div>}

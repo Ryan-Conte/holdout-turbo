@@ -1,5 +1,6 @@
 import {
   BLOCKS_BULLET,
+  BLOCKS_MOVE,
   DEFAULT_TERRAIN_ID_BY_TILE,
   DEFAULT_CHARACTER_APPEARANCE,
   ContainerSnap,
@@ -11,6 +12,7 @@ import {
   ItemId,
   NAMEPLATE_RANGE,
   PlayerSnap,
+  PLAYER_RADIUS,
   PoiSnap,
   ProjectileSnap,
   RuntimeVisualContent,
@@ -182,6 +184,9 @@ export class Renderer {
   private lastTime = 0;
   private kickUntil = 0;
   private kickAngle = 0;
+  private predictedShots: { angle: number; t0: number }[] = [];
+  private localMeleeAt = -Infinity;
+  private localMeleeSuppressUntil = -Infinity;
 
   private unders: Map<number, number>;
   private visualFrames = new Map<string, HTMLCanvasElement[]>();
@@ -411,6 +416,85 @@ export class Renderer {
   /** Public read of the live tile map (used by the client for build validity). */
   tileAtPublic(x: number, y: number): number {
     return this.tileAt(x, y);
+  }
+
+  /** Terrain facts needed by render-only movement prediction. */
+  movementAtPublic(x: number, y: number): { moveMultiplier: number; swimmable: boolean } {
+    const tx = Math.floor(x / TILE);
+    const ty = Math.floor(y / TILE);
+    const terrain = this.terrainAt(tx, ty);
+    return {
+      moveMultiplier: terrain?.moveMultiplier ?? 1,
+      swimmable: this.tileAt(tx, ty) === Tile.Water || Boolean(terrain?.swimmable),
+    };
+  }
+
+  /** Mirrors authoritative axis collision so prediction stops at walls and cliffs. */
+  movePredictedPublic(x: number, y: number, dx: number, dy: number, radius = PLAYER_RADIUS): { x: number; y: number } {
+    const elevationAt = (px: number, py: number) => {
+      const tx = Math.floor(px / TILE);
+      const ty = Math.floor(py / TILE);
+      return tx < 0 || ty < 0 || tx >= this.w || ty >= this.h ? -99 : (this.elevations[ty * this.w + tx] ?? 0);
+    };
+    const blocked = (px: number, py: number) => {
+      const minX = Math.floor((px - radius) / TILE);
+      const maxX = Math.floor((px + radius) / TILE);
+      const minY = Math.floor((py - radius) / TILE);
+      const maxY = Math.floor((py + radius) / TILE);
+      for (let ty = minY; ty <= maxY; ty++) {
+        for (let tx = minX; tx <= maxX; tx++) {
+          if (tx < 0 || ty < 0 || tx >= this.w || ty >= this.h) return true;
+          const index = ty * this.w + tx;
+          const openDoor = this.openDoors.has(index);
+          const tile = this.tiles[index];
+          if (BLOCKS_MOVE[tile] && !(openDoor && tile === Tile.Door)) return true;
+          const block = this.visuals.blocks?.[this.blockKinds[String(index)]];
+          if (block?.collision.move && !(openDoor && block.playerPlacement?.buildType === 'door')) return true;
+          if (this.terrainAt(tx, ty)?.collision.move) return true;
+        }
+      }
+      return false;
+    };
+    let nextX = x;
+    let nextY = y;
+    const candidateX = x + dx;
+    if (Math.abs(elevationAt(x, y) - elevationAt(candidateX, y)) <= 1 && !blocked(candidateX, y)) nextX = candidateX;
+    const candidateY = y + dy;
+    if (Math.abs(elevationAt(nextX, y) - elevationAt(nextX, candidateY)) <= 1 && !blocked(nextX, candidateY)) nextY = candidateY;
+    return { x: nextX, y: nextY };
+  }
+
+  /** Immediate cosmetic response; the server still decides whether the attack exists. */
+  previewLocalAttack(x: number, y: number, angle: number, weapon: ItemId | null, time: number): 'gun' | 'melee' {
+    const definition = weapon ? this.gameplayItems[weapon] : undefined;
+    if (definition?.weapon) {
+      this.flashes.push({
+        x: x + Math.cos(angle) * (PLAYER_RADIUS + 6),
+        y: y + Math.sin(angle) * (PLAYER_RADIUS + 6),
+        angle,
+        t0: time,
+      });
+      this.kickUntil = time + 0.09;
+      this.kickAngle = angle;
+      const side = angle + Math.PI / 2;
+      this.particles.push({
+        x: x + Math.cos(angle) * 8,
+        y: y + Math.sin(angle) * 8,
+        vx: Math.cos(side) * (40 + Math.random() * 30) - Math.cos(angle) * 15,
+        vy: Math.sin(side) * (40 + Math.random() * 30) - 40,
+        g: 260,
+        life: 0,
+        ttl: 0.5,
+        size: 2,
+        color: '#c8a84a',
+      });
+      this.predictedShots.push({ angle, t0: time });
+      this.predictedShots = this.predictedShots.filter((shot) => time - shot.t0 < 1.2).slice(-12);
+      return 'gun';
+    }
+    this.localMeleeAt = time;
+    this.localMeleeSuppressUntil = time + 0.9;
+    return 'melee';
   }
 
   /** Client-side sightline check — mirrors the server's wall-vision rules. */
@@ -846,11 +930,26 @@ export class Renderer {
 
     // muzzle flashes + gunfeel from newly-seen projectiles
     const seen = new Set<number>();
+    const predictedBursts: number[] = [];
     for (const pr of view.projectiles) {
       seen.add(pr.id);
       if (!this.prevProj.has(pr.id)) {
-        this.flashes.push({ x: pr.x, y: pr.y, angle: pr.angle, t0: view.time });
-        if (you && Math.hypot(pr.x - you.dx, pr.y - you.dy) < 34) {
+        const nearYou = Boolean(you && Math.hypot(pr.x - you.dx, pr.y - you.dy) < 120);
+        const predictedIndex = nearYou ? this.predictedShots.findIndex((shot) => {
+          const angleDelta = Math.abs(Math.atan2(Math.sin(pr.angle - shot.angle), Math.cos(pr.angle - shot.angle)));
+          return view.time - shot.t0 < 1.2 && angleDelta < 0.35;
+        }) : -1;
+        const samePredictedBurst = nearYou && predictedBursts.some((angle) => {
+          const angleDelta = Math.abs(Math.atan2(Math.sin(pr.angle - angle), Math.cos(pr.angle - angle)));
+          return angleDelta < 0.65;
+        });
+        const locallyPreviewed = predictedIndex >= 0 || samePredictedBurst;
+        if (predictedIndex >= 0) {
+          predictedBursts.push(this.predictedShots[predictedIndex].angle);
+          this.predictedShots.splice(predictedIndex, 1);
+        }
+        if (!locallyPreviewed) this.flashes.push({ x: pr.x, y: pr.y, angle: pr.angle, t0: view.time });
+        if (nearYou && !locallyPreviewed && you) {
           // your shot: camera kick + ejected casing
           this.kickUntil = view.time + 0.09;
           this.kickAngle = pr.angle;
@@ -1606,12 +1705,21 @@ export class Renderer {
       outfit: p.look !== undefined ? p.look % CHAR_ROWS.survivorCount : seed % CHAR_ROWS.survivorCount,
     };
     const row = appearance.outfit % CHAR_ROWS.survivorCount;
-    const swingPhase =
+    const serverSwingPhase =
       p.swing > 0 && view.serverNow - p.swing < 400
         ? Math.min(1, (view.serverNow - p.swing) / 400)
         : null;
+    const localMeleeElapsed = view.time - this.localMeleeAt;
+    const localSwingPhase = isYou && localMeleeElapsed >= 0 && localMeleeElapsed < 0.4
+      ? Math.min(1, localMeleeElapsed / 0.4)
+      : null;
+    const swingPhase = isYou && view.time < this.localMeleeSuppressUntil ? localSwingPhase : serverSwingPhase;
     const playerHitElapsed = p.hitAt ? view.serverNow - p.hitAt : Infinity;
-    const playerAttackElapsed = p.attackAt ? view.serverNow - p.attackAt : swingPhase !== null ? view.serverNow - p.swing : Infinity;
+    const playerAttackElapsed = p.attackAt
+      ? view.serverNow - p.attackAt
+      : localSwingPhase !== null
+        ? localMeleeElapsed * 1000
+        : swingPhase !== null ? view.serverNow - p.swing : Infinity;
     const playerState: EntityAnimationState = playerHitElapsed < 300 ? 'hit' : playerAttackElapsed < 700 ? 'attack' : p.moving ? 'walk' : 'idle';
     const playerElapsed = playerState === 'hit' ? playerHitElapsed : playerState === 'attack' ? playerAttackElapsed : view.time * 1000;
     const fallbackFrame = this.animationFrame('player', playerState, playerElapsed, seed, 2);

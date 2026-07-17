@@ -70,6 +70,7 @@ export interface ServerPlayer {
   mags: Partial<Record<ItemId, number>>;
   reloadUntil: number;
   reloadTarget: ItemId | null;
+  lastInputSeq: number;
   lastAttackAt: number;
   lastExhaustedAttackToastAt: number;
   lastHitAt: number;

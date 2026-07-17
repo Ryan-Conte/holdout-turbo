@@ -557,6 +557,8 @@ export interface PlayerSnap {
   admin?: boolean;
   /** Ephemeral trial survivor; never accepted from client state. */
   guest?: boolean;
+  /** Highest client input sequence processed by the authoritative server. */
+  ack?: number;
 }
 
 /** Server-authorized ally positions may bypass LOS for tactical map rendering only. */
@@ -666,6 +668,8 @@ export interface InputPayload {
   angle: number;
   shoot: boolean;
   sprint?: boolean; // hold to run — drains stamina
+  /** Monotonic client sequence used only to reconcile render-side prediction. */
+  seq?: number;
 }
 
 export interface KillFeedEntry { killer: string; victim: string; weapon: ItemId | null }
@@ -979,6 +983,7 @@ export const STATION_FUEL_PER_ACTION = 1;
 // ── stamina — sprinting and heavy actions cost it
 export const STAMINA_MAX = 100;
 export const SPRINT_SPEED_MULT = 1.55;
+export const FATIGUE_SPEED_MULT = 0.45; // overweight and exhausted survivors move at the same penalty
 export const SPRINT_DRAIN_PER_S = 22; // ~4.5s of continuous sprint from full
 export const STAMINA_REGEN_PER_S = 14; // refills while you catch your breath
 export const STAMINA_REGEN_DELAY_MS = 700; // brief pause after exertion before regen

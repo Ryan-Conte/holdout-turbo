@@ -43,6 +43,7 @@ The authoritative server must ensure death, logout, transfer, crafting, fuel, an
 - Foxes and bears expand the wilderness ecology with distinct flee/territorial roles, two-frame engine art, biome-biased map placement, hide/trophy drops and trader value. Bounded night surges create a recurring after-dark event without permanent spawn inflation.
 - Clan contributions and rank-gated withdrawals move profile and treasury credits in one transaction, serialize against profile saves, and write an immutable activity ledger.
 - The isolated websocket harness admitted and deployed 200 real clients against the 500×500 map and 344 live enemies in 5.9 seconds. A 10-second all-moving steady-state run sustained 16.64 snapshots/client/second, 5.38 KB average snapshots, a 120 ms largest measured gap and 298 MB RSS; cleanup left zero benchmark users, profiles, leases or world rows. This is a repeatable local capacity baseline, not a substitute for region-specific soak testing.
+- High-latency relays now feel immediate through collision-aware local movement/aim prediction, acknowledged-input reconciliation, instant cosmetic attack feedback, RTT telemetry, and volatile replaceable input/state delivery. Simulation authority is unchanged: client positions are never accepted and all consequential combat/economy state remains server-owned.
 
 ## Current strengths
 
