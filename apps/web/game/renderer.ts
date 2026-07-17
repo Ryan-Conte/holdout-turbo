@@ -14,12 +14,15 @@ import {
   PoiSnap,
   ProjectileSnap,
   RuntimeVisualContent,
+  RuntimeGameplayContent,
+  RuntimeItemRegistry,
   EntityAnimationState,
   TILE,
   Tile,
 } from "@holdout/shared";
 import { drawCharacterAppearance } from "./character-appearance";
 import { CHAR_ROWS, ITEM_INDEX, Sheets } from "./sprites";
+import { runtimePixelVisible } from "@/lib/runtime-visuals";
 
 const SPR = 16; // art cell size; rendered at 2× (TILE = 32)
 
@@ -77,6 +80,15 @@ export interface WorldView {
   cursor: { x: number; y: number } | null; // world-space aim point — drawn crosshair
 }
 
+export interface MinimapRenderOptions {
+  detailed?: boolean;
+  centerX?: number;
+  centerY?: number;
+  zoom?: number;
+  visibleTiles?: number;
+  clampToMap?: boolean;
+}
+
 interface Particle {
   x: number;
   y: number;
@@ -108,6 +120,18 @@ interface Corpse {
   target?: string;
   t0: number;
 }
+
+interface NightLight {
+  x: number;
+  y: number;
+  radius: number;
+  strength: number;
+  warmth: number;
+  flickerSeed: number;
+}
+
+const TORCH_POST_LIGHT_RADIUS = 190;
+const FIREPIT_LIGHT_RADIUS = 120;
 
 const MINI_COLORS: Record<number, string> = {
   [Tile.Grass]: "#3f6b38",
@@ -141,6 +165,7 @@ const MINI_COLORS: Record<number, string> = {
 export class Renderer {
   private mapCanvas: HTMLCanvasElement | null;
   private miniCanvas: HTMLCanvasElement;
+  private nightCanvas: HTMLCanvasElement;
   zoom = 2;
 
   private particles: Particle[] = [];
@@ -164,6 +189,8 @@ export class Renderer {
   private entitySoundStates = new Map<string, EntityAnimationState>();
   private lastTerrainFootstepAt = 0;
   private openDoors = new Set<number>();
+  private stationFuel: Map<number, number>;
+  private gameplayItems: RuntimeItemRegistry = ITEMS as unknown as RuntimeItemRegistry;
 
   constructor(
     private tiles: Uint8Array,
@@ -182,9 +209,13 @@ export class Renderer {
     private blockKinds: Record<string, string> = {},
     private blockRotations: Record<string, number> = {},
     initialOpenDoors: number[] = [],
+    initialStationFuel: Record<number, number> = {},
+    gameplay?: RuntimeGameplayContent,
     private onSound?: (soundId: string, volume: number) => void,
   ) {
     this.openDoors = new Set(initialOpenDoors);
+    this.stationFuel = new Map(Object.entries(initialStationFuel).map(([key, fuel]) => [Number(key), Math.max(0, Number(fuel) || 0)]));
+    if (gameplay?.items) this.gameplayItems = { ...(ITEMS as unknown as RuntimeItemRegistry), ...gameplay.items };
     this.unders = new Map(Object.entries(unders).map(([k, v]) => [Number(k), v]));
     if (this.elevations.length !== w * h) this.elevations = new Uint8Array(w * h);
     this.buildVisualFrames();
@@ -194,8 +225,10 @@ export class Renderer {
       this.mapCanvas.height = h * TILE;
     }
     this.miniCanvas = document.createElement("canvas");
-    this.miniCanvas.width = Math.min(512, w);
-    this.miniCanvas.height = Math.min(512, h);
+    this.nightCanvas = document.createElement("canvas");
+    const miniScale = Math.min(1, 1024 / Math.max(w, h));
+    this.miniCanvas.width = Math.max(1, Math.round(w * miniScale));
+    this.miniCanvas.height = Math.max(1, Math.round(h * miniScale));
     this.prerender();
   }
 
@@ -203,11 +236,19 @@ export class Renderer {
     this.visualFrames.clear();
     for (const [id, asset] of Object.entries(this.visuals.assets ?? {})) {
       const frames = asset.frames?.length ? asset.frames : asset.pixels?.length ? [asset.pixels] : [];
-      const canvases = frames.filter((frame) => frame.length === asset.width * asset.height).map((frame) => {
+      const validFrames = frames.filter((frame) => frame.length === asset.width * asset.height);
+      // Source-only seed entries have no database pixels yet. Keep their
+      // compatibility renderer available until real engine art is published.
+      if (!validFrames.some((frame) => frame.some(runtimePixelVisible))) continue;
+      const canvases = validFrames.map((frame) => {
         const canvas = document.createElement('canvas');
         canvas.width = asset.width; canvas.height = asset.height;
         const ctx = canvas.getContext('2d')!;
-        frame.forEach((color, index) => { ctx.fillStyle = color; ctx.fillRect(index % asset.width, Math.floor(index / asset.width), 1, 1); });
+        frame.forEach((color, index) => {
+          if (!runtimePixelVisible(color)) return;
+          ctx.fillStyle = color;
+          ctx.fillRect(index % asset.width, Math.floor(index / asset.width), 1, 1);
+        });
         return canvas;
       });
       if (canvases.length) this.visualFrames.set(id, canvases);
@@ -220,6 +261,10 @@ export class Renderer {
     this.prerender();
   }
 
+  applyGameplay(gameplay: RuntimeGameplayContent) {
+    this.gameplayItems = { ...(ITEMS as unknown as RuntimeItemRegistry), ...(gameplay.items ?? {}) };
+  }
+
   applyBlock(index: number, blockId?: string, rotation = 0, open?: boolean) {
     if (blockId) this.blockKinds[String(index)] = blockId;
     else delete this.blockKinds[String(index)];
@@ -228,6 +273,7 @@ export class Renderer {
     else delete this.blockRotations[String(index)];
     if (!blockId || open === false) this.openDoors.delete(index);
     else if (open === true) this.openDoors.add(index);
+    if (!blockId) this.stationFuel.delete(index);
     const context = this.miniCanvas.getContext('2d');
     if (!context) return;
     const x = index % this.w; const y = Math.floor(index / this.w);
@@ -236,8 +282,30 @@ export class Renderer {
     this.updateMinimapCell(x, y, blockId ? '#b58b45' : undefined);
   }
 
+  applyStationFuel(index: number, fuel: number) {
+    if (fuel > 0) this.stationFuel.set(index, fuel);
+    else this.stationFuel.delete(index);
+  }
+
   playerBlockId(buildType: string): string | undefined {
     return Object.values(this.visuals.blocks ?? {}).find((block) => block.playerPlacement?.buildType === buildType)?.id;
+  }
+
+  hasBlockAtPublic(x: number, y: number): boolean {
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h) return false;
+    return Boolean(this.blockKinds[String(y * this.w + x)]);
+  }
+
+  blockBuildTypeAtPublic(x: number, y: number): string | undefined {
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h) return undefined;
+    const block = this.visuals.blocks?.[this.blockKinds[String(y * this.w + x)]];
+    return block?.playerPlacement?.buildType;
+  }
+
+  blockIsFoundationAtPublic(x: number, y: number): boolean {
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h) return false;
+    const block = this.visuals.blocks?.[this.blockKinds[String(y * this.w + x)]];
+    return Boolean(block?.playerPlacement?.foundation);
   }
 
   entityDeath(death: EntityDeathSnap) {
@@ -394,12 +462,30 @@ export class Renderer {
 
   private blitItem(
     ctx: CanvasRenderingContext2D,
-    id: ItemId,
+    id: string,
     dx: number,
     dy: number,
     size = TILE,
   ) {
-    const i = ITEM_INDEX[id] ?? 0;
+    const definition = this.gameplayItems[id];
+    const engineFrame = this.visualFrames.get(definition?.spriteId ?? `item:${id}`)?.[0];
+    if (engineFrame) {
+      ctx.drawImage(engineFrame, dx, dy, size, size);
+      return;
+    }
+    const i = ITEM_INDEX[id as ItemId];
+    if (i === undefined) {
+      ctx.save();
+      ctx.fillStyle = '#302d29';
+      ctx.fillRect(dx + size * .2, dy + size * .2, size * .6, size * .6);
+      ctx.fillStyle = '#d8a94a';
+      ctx.font = `${Math.max(7, Math.round(size * .45))}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('?', dx + size / 2, dy + size / 2);
+      ctx.restore();
+      return;
+    }
     ctx.drawImage(this.sheets.items, i * SPR, 0, SPR, SPR, dx, dy, size, size);
   }
 
@@ -631,16 +717,19 @@ export class Renderer {
     }
   }
 
-  /** Server changed a tile (harvest / regrowth / build). `under` = floor beneath a station. */
-  applyTile(i: number, tile: number, under?: number) {
+  /** Server changed a tile (harvest / regrowth / build), including its rerolled resource variant. */
+  applyTile(i: number, tile: number, under?: number, resourceId?: string | null) {
     const old = this.tiles[i];
     this.tiles[i] = tile;
+    if ((old === Tile.Firepit || old === Tile.Furnace) && tile !== old) this.stationFuel.delete(i);
+    if (resourceId === null) delete this.resourceKinds[String(i)];
+    else if (resourceId !== undefined) this.resourceKinds[String(i)] = resourceId;
     if (under !== undefined) this.unders.set(i, under);
     else this.unders.delete(i);
     this.fogVersion++; // sightlines may have changed
     const tx = i % this.w;
     const ty = Math.floor(i / this.w);
-    if (old === Tile.Tree && tile === Tile.Grass) {
+    if (old === Tile.Tree && (tile === Tile.Stump || tile === Tile.Grass)) {
       this.falling.push({
         tx,
         ty,
@@ -654,7 +743,8 @@ export class Renderer {
         14,
         60,
       );
-    } else if (old === Tile.Rock && tile === Tile.Grass) {
+    } else if ((old === Tile.Rock || old === Tile.CopperOre || old === Tile.IronOre)
+      && (tile === Tile.Rubble || tile === Tile.Grass)) {
       this.burst(
         tx * TILE + 16,
         ty * TILE + 12,
@@ -803,7 +893,7 @@ export class Renderer {
     for (const c of view.containers) this.drawContainer(ctx, c);
 
     // aim line for your own equipped gun (Zero Sievert style)
-    if (you && !you.dead && you.weapon && ITEMS[you.weapon].weapon) {
+    if (you && !you.dead && you.weapon && this.gameplayItems[you.weapon]?.weapon) {
       ctx.save();
       ctx.strokeStyle = "rgba(230, 220, 180, 0.14)";
       ctx.lineWidth = 1;
@@ -845,6 +935,32 @@ export class Renderer {
     const tMaxX = Math.min(this.w - 1, Math.ceil((sx + sw) / TILE));
     const tMinY = Math.max(0, Math.floor(sy / TILE));
     const tMaxY = Math.min(this.h - 1, Math.ceil((sy + sh) / TILE));
+    const nightLights: NightLight[] = [];
+    const lightMargin = Math.ceil(TORCH_POST_LIGHT_RADIUS / TILE);
+    for (let ty = Math.max(0, tMinY - lightMargin); ty <= Math.min(this.h - 1, tMaxY + lightMargin); ty++)
+      for (let tx = Math.max(0, tMinX - lightMargin); tx <= Math.min(this.w - 1, tMaxX + lightMargin); tx++) {
+        const index = ty * this.w + tx;
+        const tile = this.tileAt(tx, ty);
+        const blockType = this.visuals.blocks?.[this.blockKinds[String(index)]]?.playerPlacement?.buildType;
+        if (tile === Tile.Torch || blockType === 'torch') {
+          nightLights.push({ x: (tx + 0.5) * TILE, y: (ty + 0.42) * TILE, radius: TORCH_POST_LIGHT_RADIUS, strength: 0.96, warmth: 1, flickerSeed: index });
+        } else if ((tile === Tile.Firepit || blockType === 'firepit') && (this.stationFuel.get(index) ?? 0) > 0) {
+          nightLights.push({ x: (tx + 0.5) * TILE, y: (ty + 0.55) * TILE, radius: FIREPIT_LIGHT_RADIUS, strength: 0.78, warmth: 0.85, flickerSeed: index });
+        }
+      }
+    for (const player of view.players) {
+      if (player.dead || !player.weapon) continue;
+      const radius = this.gameplayItems[player.weapon]?.lightRadius;
+      if (!radius) continue;
+      nightLights.push({
+        x: player.dx + Math.cos(player.angle) * 12,
+        y: player.dy + Math.sin(player.angle) * 12,
+        radius,
+        strength: 0.84,
+        warmth: 0.9,
+        flickerSeed: hashStr(player.id),
+      });
+    }
     for (let ty = tMinY; ty <= tMaxY; ty++)
       for (let tx = tMinX; tx <= tMaxX; tx++) {
         const t = this.tileAt(tx, ty);
@@ -867,6 +983,7 @@ export class Renderer {
         } else if (t === Tile.Rock || t === Tile.CopperOre || t === Tile.IronOre) {
           const i = ty * this.w + tx;
           const resource = this.visuals.resources?.[this.resourceKinds[String(i)]];
+          const resourceSprite = (t === Tile.CopperOre || t === Tile.IronOre) && resource?.tile === Tile.Rock ? undefined : resource?.spriteId;
           const dx = tx * TILE;
           const dy = ty * TILE;
           const col = t === Tile.Rock ? 12 : t === Tile.CopperOre ? 25 : 26;
@@ -880,7 +997,7 @@ export class Renderer {
           drawables.push({
             y: dy + TILE - 4,
             fn: () => {
-              if (this.drawResourceSprite(ctx, resource?.spriteId, dx + TILE / 2, dy + TILE, shakeX)) return;
+              if (this.drawResourceSprite(ctx, resourceSprite, dx + TILE / 2, dy + TILE, shakeX)) return;
               ctx.drawImage(
                 this.sheets.tiles,
                 col * SPR,
@@ -1058,30 +1175,6 @@ export class Renderer {
       ctx.restore();
     }
 
-    // warm light halos from torches and firepits once it gets dark
-    const darknessNow = (1 - (0.5 - 0.5 * Math.cos(view.day * Math.PI * 2))) * 0.55;
-    if (darknessNow > 0.12) {
-      ctx.save();
-      ctx.globalCompositeOperation = "lighter";
-      for (let ty = tMinY; ty <= tMaxY; ty++)
-        for (let tx = tMinX; tx <= tMaxX; tx++) {
-          const t = this.tileAt(tx, ty);
-          if (t !== Tile.Torch && t !== Tile.Firepit) continue;
-          const cx = tx * TILE + TILE / 2;
-          const cy = ty * TILE + TILE / 2;
-          const flicker = 0.85 + 0.15 * Math.sin(view.time * 9 + tx * 3 + ty * 7);
-          const r = (t === Tile.Firepit ? 120 : 90) * flicker;
-          const g = ctx.createRadialGradient(cx, cy, 4, cx, cy, r);
-          const a = Math.min(0.5, darknessNow) * flicker;
-          g.addColorStop(0, `rgba(255, 180, 80, ${0.5 * a})`);
-          g.addColorStop(0.5, `rgba(255, 140, 50, ${0.22 * a})`);
-          g.addColorStop(1, "rgba(255, 120, 40, 0)");
-          ctx.fillStyle = g;
-          ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
-        }
-      ctx.restore();
-    }
-
     // crosshair at the aim point — the gun barrel sits on this line
     if (view.cursor && you && !you.dead) {
       const c = view.cursor;
@@ -1120,7 +1213,12 @@ export class Renderer {
 
     ctx.restore();
 
-    this.drawNight(ctx, w, h, view.day);
+    this.drawNight(ctx, w, h, view.day, nightLights.map((light) => ({
+      ...light,
+      x: w / 2 + (light.x - camX) * z,
+      y: h / 2 + (light.y - camY) * z,
+      radius: light.radius * z,
+    })), view.time);
   }
 
   private drawNight(
@@ -1128,9 +1226,19 @@ export class Renderer {
     w: number,
     h: number,
     day: number,
+    lights: NightLight[],
+    time: number,
   ) {
     const brightness = 0.5 - 0.5 * Math.cos(day * Math.PI * 2);
-    const darkness = (1 - brightness) * 0.68; // real nights are dark — bring a torch
+    const darkness = (1 - brightness) * 0.88;
+    if (this.nightCanvas.width !== w || this.nightCanvas.height !== h) {
+      this.nightCanvas.width = w;
+      this.nightCanvas.height = h;
+    }
+    const night = this.nightCanvas.getContext('2d');
+    if (!night) return;
+    night.clearRect(0, 0, w, h);
+    night.globalCompositeOperation = 'source-over';
     // golden-hour tint around sunrise (~0.25) and sunset (~0.75)
     const dusk = Math.max(
       0,
@@ -1138,11 +1246,11 @@ export class Renderer {
       1 - Math.abs(day - 0.23) / 0.07,
     );
     if (dusk > 0) {
-      ctx.fillStyle = `rgba(255, 130, 50, ${dusk * 0.1})`;
-      ctx.fillRect(0, 0, w, h);
+      night.fillStyle = `rgba(255, 118, 42, ${dusk * 0.12})`;
+      night.fillRect(0, 0, w, h);
     }
     // Zero Sievert-ish permanent edge vignette + night darkness
-    const grad = ctx.createRadialGradient(
+    const grad = night.createRadialGradient(
       w / 2,
       h / 2,
       80,
@@ -1150,10 +1258,46 @@ export class Renderer {
       h / 2,
       Math.max(w, h) * 0.72,
     );
-    grad.addColorStop(0, `rgba(8, 12, 26, ${Math.max(0.05, darkness * 0.6)})`);
-    grad.addColorStop(1, `rgba(4, 6, 16, ${Math.max(0.28, darkness)})`);
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, w, h);
+    grad.addColorStop(0, `rgba(5, 8, 20, ${Math.max(0.035, darkness * 0.86)})`);
+    grad.addColorStop(1, `rgba(2, 3, 12, ${Math.max(0.24, Math.min(0.94, darkness + 0.06))})`);
+    night.fillStyle = grad;
+    night.fillRect(0, 0, w, h);
+
+    const lightVisibility = Math.max(0, Math.min(1, (darkness - 0.06) / 0.5));
+    if (lightVisibility > 0 && lights.length) {
+      night.globalCompositeOperation = 'destination-out';
+      for (const light of lights) {
+        const flicker = 0.96 + 0.04 * Math.sin(time * 10 + light.flickerSeed * 0.017);
+        const radius = light.radius * flicker;
+        if (light.x + radius < 0 || light.y + radius < 0 || light.x - radius > w || light.y - radius > h) continue;
+        const reveal = light.strength * lightVisibility;
+        const cutout = night.createRadialGradient(light.x, light.y, 2, light.x, light.y, radius);
+        cutout.addColorStop(0, `rgba(0, 0, 0, ${reveal})`);
+        cutout.addColorStop(0.32, `rgba(0, 0, 0, ${reveal * 0.82})`);
+        cutout.addColorStop(0.72, `rgba(0, 0, 0, ${reveal * 0.28})`);
+        cutout.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        night.fillStyle = cutout;
+        night.fillRect(light.x - radius, light.y - radius, radius * 2, radius * 2);
+      }
+    }
+    night.globalCompositeOperation = 'source-over';
+    ctx.drawImage(this.nightCanvas, 0, 0);
+
+    if (lightVisibility > 0 && lights.length) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      for (const light of lights) {
+        const radius = light.radius * 0.7;
+        const warmth = light.warmth * lightVisibility;
+        const glow = ctx.createRadialGradient(light.x, light.y, 2, light.x, light.y, radius);
+        glow.addColorStop(0, `rgba(255, 190, 92, ${0.22 * warmth})`);
+        glow.addColorStop(0.48, `rgba(255, 128, 45, ${0.08 * warmth})`);
+        glow.addColorStop(1, 'rgba(255, 105, 30, 0)');
+        ctx.fillStyle = glow;
+        ctx.fillRect(light.x - radius, light.y - radius, radius * 2, radius * 2);
+      }
+      ctx.restore();
+    }
   }
 
   drawMinimap(
@@ -1161,42 +1305,81 @@ export class Renderer {
     size: number,
     view: {
       pois: PoiSnap[];
-      players: RenderPlayer[];
+      players: { id: string; name: string; dx: number; dy: number; dead: boolean }[];
       youId: string;
       friendNames: Set<string>;
+      clanNames: Set<string>;
     },
-    detailed = false,
+    options: MinimapRenderOptions = {},
   ) {
-    const s = size / Math.max(this.w, this.h);
-    const mapWidth = this.w * s;
-    const mapHeight = this.h * s;
-    const offsetX = (size - mapWidth) / 2;
-    const offsetY = (size - mapHeight) / 2;
-    const point = (x: number, y: number) => ({ x: offsetX + (x / TILE) * s, y: offsetY + (y / TILE) * s });
+    const detailed = options.detailed ?? false;
+    const maxDimension = Math.max(this.w, this.h);
+    const requestedSpan = options.visibleTiles ?? maxDimension / Math.max(1, options.zoom ?? 1);
+    const span = Math.max(4, Math.min(maxDimension, requestedSpan));
+    const clampAxis = (center: number, length: number) => span >= length
+      ? length / 2
+      : Math.max(span / 2, Math.min(length - span / 2, center));
+    let centerX = options.centerX ?? this.w / 2;
+    let centerY = options.centerY ?? this.h / 2;
+    if (options.clampToMap !== false) {
+      centerX = clampAxis(centerX, this.w);
+      centerY = clampAxis(centerY, this.h);
+    }
+    const left = centerX - span / 2;
+    const top = centerY - span / 2;
+    const pixelsPerTile = size / span;
+    const point = (x: number, y: number) => ({
+      x: (x / TILE - left) * pixelsPerTile,
+      y: (y / TILE - top) * pixelsPerTile,
+    });
     const markerScale = detailed ? Math.max(1.5, Math.min(2.5, size / 320)) : 1;
     ctx.imageSmoothingEnabled = false;
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([]);
     ctx.clearRect(0, 0, size, size);
     ctx.fillStyle = '#080a07';
     ctx.fillRect(0, 0, size, size);
-    ctx.globalAlpha = 0.92;
-    ctx.drawImage(this.miniCanvas, offsetX, offsetY, mapWidth, mapHeight);
-    ctx.globalAlpha = 1;
+
+    const sourceLeft = Math.max(0, left);
+    const sourceTop = Math.max(0, top);
+    const sourceRight = Math.min(this.w, left + span);
+    const sourceBottom = Math.min(this.h, top + span);
+    if (sourceRight > sourceLeft && sourceBottom > sourceTop) {
+      ctx.globalAlpha = 0.92;
+      ctx.drawImage(
+        this.miniCanvas,
+        sourceLeft * this.miniCanvas.width / this.w,
+        sourceTop * this.miniCanvas.height / this.h,
+        (sourceRight - sourceLeft) * this.miniCanvas.width / this.w,
+        (sourceBottom - sourceTop) * this.miniCanvas.height / this.h,
+        (sourceLeft - left) * pixelsPerTile,
+        (sourceTop - top) * pixelsPerTile,
+        (sourceRight - sourceLeft) * pixelsPerTile,
+        (sourceBottom - sourceTop) * pixelsPerTile,
+      );
+      ctx.globalAlpha = 1;
+    }
 
     if (detailed) {
       ctx.strokeStyle = 'rgba(220, 210, 170, 0.11)';
       ctx.lineWidth = 1;
       for (let section = 1; section < 8; section++) {
-        const x = offsetX + mapWidth * (section / 8);
-        const y = offsetY + mapHeight * (section / 8);
+        const x = size * (section / 8);
+        const y = size * (section / 8);
         ctx.beginPath();
-        ctx.moveTo(x, offsetY);
-        ctx.lineTo(x, offsetY + mapHeight);
-        ctx.moveTo(offsetX, y);
-        ctx.lineTo(offsetX + mapWidth, y);
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, size);
+        ctx.moveTo(0, y);
+        ctx.lineTo(size, y);
         ctx.stroke();
       }
       ctx.strokeStyle = 'rgba(220, 210, 170, 0.42)';
-      ctx.strokeRect(offsetX + 0.5, offsetY + 0.5, mapWidth - 1, mapHeight - 1);
+      ctx.strokeRect(
+        (0 - left) * pixelsPerTile + 0.5,
+        (0 - top) * pixelsPerTile + 0.5,
+        this.w * pixelsPerTile - 1,
+        this.h * pixelsPerTile - 1,
+      );
     }
 
     for (const poi of view.pois) {
@@ -1214,7 +1397,7 @@ export class Renderer {
       if (poi.hot || (detailed && poi.safe)) {
         ctx.setLineDash(detailed ? [5, 4] : [3, 3]);
         ctx.beginPath();
-        ctx.arc(x, y, (poi.r / TILE) * s, 0, Math.PI * 2);
+        ctx.arc(x, y, (poi.r / TILE) * pixelsPerTile, 0, Math.PI * 2);
         ctx.stroke();
         ctx.setLineDash([]);
       }
@@ -1254,17 +1437,16 @@ export class Renderer {
       const { x, y } = point(p.dx, p.dy);
       const isYou = p.id === view.youId;
       const isFriend = view.friendNames.has(p.name);
-      ctx.fillStyle = isYou ? "#f0d878" : isFriend ? "#78d878" : "#e8e8e8";
+      const isClan = view.clanNames.has(p.name);
+      ctx.fillStyle = isYou ? "#f0d878" : isClan ? "#68bfe8" : isFriend ? "#78d878" : "#e8e8e8";
       ctx.beginPath();
       ctx.arc(x, y, detailed ? (isYou ? 6 : 4) : (isYou ? 2.5 : 1.8), 0, Math.PI * 2);
       ctx.fill();
-      if (isYou || (isFriend && !isYou)) {
-        ctx.strokeStyle = isYou ? 'rgba(240, 216, 120, 0.55)' : "rgba(120, 216, 120, 0.7)";
+      if (isYou || isFriend || isClan) {
+        ctx.strokeStyle = isYou ? 'rgba(240, 216, 120, 0.55)' : isClan ? 'rgba(104, 191, 232, 0.75)' : "rgba(120, 216, 120, 0.7)";
         ctx.lineWidth = detailed ? 2 : 1;
-        if (detailed && isYou) {
-          ctx.beginPath();
-          ctx.arc(x, y, 10, 0, Math.PI * 2);
-        }
+        ctx.beginPath();
+        ctx.arc(x, y, detailed && isYou ? 10 : detailed ? 6 : isYou ? 4 : 3, 0, Math.PI * 2);
         ctx.stroke();
       }
     }
@@ -1356,7 +1538,7 @@ export class Renderer {
     swingPhase: number | null,
     recoil = 0,
   ) {
-    const def = ITEMS[weapon];
+    const def = this.gameplayItems[weapon] ?? ITEMS[weapon];
     const isGun = !!def.weapon;
     ctx.save();
     ctx.translate(x, y + 2);
@@ -1519,11 +1701,12 @@ export class Renderer {
     if (isYou || isFriend || distToYou < NAMEPLATE_RANGE) {
       ctx.font = "7px monospace";
       ctx.textAlign = "center";
-      ctx.fillStyle = isYou ? "#f0dfa0" : isFriend ? "#a8e0a0" : "#dcd8c8";
+      const nameplate = p.admin ? `[ADMIN] ${p.name}` : p.name;
+      ctx.fillStyle = p.admin ? "#68d5f0" : isYou ? "#f0dfa0" : isFriend ? "#a8e0a0" : "#dcd8c8";
       ctx.strokeStyle = "rgba(0,0,0,0.7)";
       ctx.lineWidth = 2;
-      ctx.strokeText(p.name, p.dx, p.dy - 22);
-      ctx.fillText(p.name, p.dx, p.dy - 22);
+      ctx.strokeText(nameplate, p.dx, p.dy - 22);
+      ctx.fillText(nameplate, p.dx, p.dy - 22);
 
       const hpw = 20;
       ctx.fillStyle = "rgba(0,0,0,0.5)";
@@ -1557,6 +1740,8 @@ export class Renderer {
       rabbit: CHAR_ROWS.rabbit,
       boar: CHAR_ROWS.boar,
       wolf: CHAR_ROWS.wolf,
+      fox: CHAR_ROWS.fox,
+      bear: CHAR_ROWS.bear,
     };
     const animalRow = ANIMAL_ROWS[e.kind];
     if (!custom && animalRow !== undefined) {
@@ -1566,7 +1751,7 @@ export class Renderer {
       if (Math.cos(e.angle) < 0) ctx.scale(-1, 1);
       ctx.fillStyle = "rgba(0,0,0,0.25)";
       ctx.beginPath();
-      ctx.ellipse(0, 13, e.kind === "rabbit" ? 6 : 10, 3, 0, 0, Math.PI * 2);
+      ctx.ellipse(0, 13, e.kind === "rabbit" ? 6 : e.kind === "bear" ? 12 : 10, 3, 0, 0, Math.PI * 2);
       ctx.fill();
       const frame = this.animationFrame(`mob:${e.kind}`, state, elapsed, seed, 2);
       this.blitChar(ctx, animalRow, frame, -16, -16);
@@ -1592,7 +1777,7 @@ export class Renderer {
       ctx.fillRect(e.dx - hpw / 2, e.dy - 21, hpw, 2.5);
       ctx.fillStyle =
         e.kind === "zombie" ? "#7fa062"
-        : e.kind === "wolf" ? "#a04040"
+        : e.kind === "wolf" || e.kind === "bear" ? "#a04040"
         : animalRow !== undefined ? "#c8a878"
         : "#c07a4a";
       ctx.fillRect(e.dx - hpw / 2, e.dy - 21, (hpw * e.hp) / e.maxHp, 2.5);

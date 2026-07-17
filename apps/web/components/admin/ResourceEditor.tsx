@@ -2,10 +2,11 @@
 
 import { useEffect, useState } from 'react';
 import { ITEMS, Tile, type ResourceNodeDef, type SoundDocument, type SpriteDocument } from '@holdout/shared';
+import { normalizeResourceDocument } from '@/lib/game-content';
 
 const NEW_RESOURCE: ResourceNodeDef = {
   id: 'new_tree', name: 'New tree', tile: Tile.Tree, depletedTile: Tile.Stump,
-  maxHits: 8, respawnMs: 240_000, skill: 'woodcutting', spriteId: 'resource:ironwood',
+  maxHits: 8, respawnMs: 240_000, skill: 'woodcutting', respawnFamily: 'tree', respawnWeight: 1, spriteId: 'resource:ironwood',
   hitSound: 'chop', breakSound: 'tree_fall', drops: [{ itemId: 'wood', min: 2, max: 4, chance: 1, when: 'hit' }],
 };
 
@@ -21,7 +22,7 @@ export function ResourceEditor() {
   useEffect(() => {
     void Promise.all(['resources', 'sprites', 'sounds'].map((kind) => fetch(`/api/admin/content/${kind}`, { cache: 'no-store' }).then((response) => response.json())))
       .then(([resourceData, spriteData, soundData]) => {
-        const records = resourceData.draft ?? {};
+        const records = normalizeResourceDocument((resourceData.draft ?? {}) as Record<string, ResourceNodeDef>);
         setResources(records); setSprites(spriteData.draft ?? { palette: [], assets: [] }); setSounds(soundData.draft ?? { presets: {}, actions: {} });
         setSelected(Object.keys(records)[0] ?? '');
         setMeta({ revision: resourceData.revision, publishedRevision: resourceData.publishedRevision });
@@ -63,15 +64,16 @@ export function ResourceEditor() {
   };
 
   return <section className="engine-editor">
-    <header className="engine-editor-head"><div><div className="engine-kicker">WORLD RESOURCE SYSTEM</div><h1>Resource nodes</h1><p>Create tree, rock and ore variants with authoritative durability, respawn, art, sounds and weighted drops. Paint published variants from the map Nodes tab.</p></div><div className="engine-revisions"><span className={meta.revision !== meta.publishedRevision ? 'dirty' : 'clean'}>{meta.revision !== meta.publishedRevision ? 'UNPUBLISHED CHANGES' : 'LIVE'}</span><small>draft r{meta.revision} / live r{meta.publishedRevision}</small></div></header>
+    <header className="engine-editor-head"><div><div className="engine-kicker">WORLD RESOURCE SYSTEM</div><h1>Resource nodes</h1><p>Create tree and rock variants with authoritative durability, respawn, art, sounds and weighted drops. Copper and iron remain ore-veined rock tiles, not separate node families.</p></div><div className="engine-revisions"><span className={meta.revision !== meta.publishedRevision ? 'dirty' : 'clean'}>{meta.revision !== meta.publishedRevision ? 'UNPUBLISHED CHANGES' : 'LIVE'}</span><small>draft r{meta.revision} / live r{meta.publishedRevision}</small></div></header>
     <div className="resource-workbench">
       <aside className="engine-records"><div className="engine-record-toolbar"><b>{Object.keys(resources).length} NODES</b><button onClick={add}>+ NEW</button></div>{Object.entries(resources).map(([id, entry]) => <button key={id} className={selected === id ? 'active' : ''} onClick={() => setSelected(id)}><span>{entry.name}</span><small>{entry.skill} / {entry.maxHits} hits</small></button>)}</aside>
       {resource ? <div className="resource-form"><div className="mob-form-head"><div><span>RESOURCE ID</span><b>{selected}</b></div><button onClick={remove}>DELETE</button></div>
         <div className="resource-form-grid">
           <label>DISPLAY NAME<input value={resource.name} onChange={(event) => patch({ name: event.target.value })} /></label>
-          <label>NODE TYPE<select value={resource.tile} onChange={(event) => { const tile = Number(event.target.value); patch({ tile, depletedTile: tile === Tile.Tree ? Tile.Stump : Tile.Rubble, skill: tile === Tile.Tree ? 'woodcutting' : 'mining' }); }}><option value={Tile.Tree}>TREE</option><option value={Tile.Rock}>ROCK</option><option value={Tile.CopperOre}>COPPER VEIN</option><option value={Tile.IronOre}>IRON VEIN</option></select></label>
+          <label>NODE FAMILY<select value={resource.tile} onChange={(event) => { const tile = Number(event.target.value); patch({ tile, depletedTile: tile === Tile.Tree ? Tile.Stump : Tile.Rubble, skill: tile === Tile.Tree ? 'woodcutting' : 'mining', respawnFamily: tile === Tile.Tree ? 'tree' : 'rock' }); }}><option value={Tile.Tree}>TREE</option><option value={Tile.Rock}>ROCK</option></select></label>
           <label>HITS TO DEPLETE<input type="number" min={1} max={100000} value={resource.maxHits} onChange={(event) => patch({ maxHits: Number(event.target.value) })} /></label>
           <label>RESPAWN SECONDS<input type="number" min={1} max={86400} value={resource.respawnMs / 1000} onChange={(event) => patch({ respawnMs: Number(event.target.value) * 1000 })} /></label>
+          <label>RESPAWN WEIGHT<input type="number" min={0} max={1000000} step="0.1" value={resource.respawnWeight ?? 1} onChange={(event) => patch({ respawnWeight: Number(event.target.value) })} /></label>
           <label>SPRITE ASSET<select value={resource.spriteId ?? ''} onChange={(event) => patch({ spriteId: event.target.value })}><option value="">Built-in tile sprite</option>{sprites.assets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name} / {asset.id}</option>)}</select></label>
           <label>HIT SOUND<select value={resource.hitSound ?? ''} onChange={(event) => patch({ hitSound: event.target.value })}><option value="">Default</option>{Object.entries(sounds.presets).map(([id, sound]) => <option key={id} value={id}>{sound.name}</option>)}</select></label>
           <label>BREAK SOUND<select value={resource.breakSound ?? ''} onChange={(event) => patch({ breakSound: event.target.value })}><option value="">Default</option>{Object.entries(sounds.presets).map(([id, sound]) => <option key={id} value={id}>{sound.name}</option>)}</select></label>

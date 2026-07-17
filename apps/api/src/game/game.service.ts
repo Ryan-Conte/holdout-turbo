@@ -2,11 +2,23 @@ import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/commo
 import { Server } from 'socket.io';
 import {
   ActionSnap,
+  AdminActionPayload,
+  AdminPanelState,
   BACKPACKS,
   BLOCKS_ENEMY,
   BUILDABLES,
   BuildType,
+  CHARACTER_ACCENT_COLORS,
+  CHARACTER_BODY_NAMES,
+  CHARACTER_HAIR_COLORS,
+  CHARACTER_HAIR_NAMES,
+  CHARACTER_OUTFIT_COLORS,
+  CHARACTER_SKIN_COLORS,
+  CharacterAppearance,
   COOK_TIME_MS,
+  CLAN_HOLDOUT_H,
+  CLAN_HOLDOUT_STORAGE_SLOTS,
+  CLAN_HOLDOUT_W,
   CRAFT_TIME_MS,
   DRINK_TIME_MS,
   FISH_TIME_MS,
@@ -43,7 +55,6 @@ import {
   HitSnap,
   MOD_SPREAD_MULT,
   INTERACT_RANGE,
-  ITEMS,
   InputPayload,
   InstanceKind,
   InvSlot,
@@ -59,7 +70,8 @@ import {
   PoiSnap,
   QuestDef,
   QuestStatus,
-  RECIPES,
+  RuntimeRecipe,
+  RuntimeWeaponStats,
   repairInfo,
   REGEN_HP_PER_S,
   REGEN_THRESHOLD,
@@ -71,6 +83,9 @@ import {
   STAMINA_MAX,
   STAMINA_REGEN_DELAY_MS,
   STAMINA_REGEN_PER_S,
+  STATION_FUEL_MAX,
+  STATION_FUEL_PER_ACTION,
+  STATION_FUEL_PER_WOOD,
   MINE_STAMINA_COST,
   SUPPRESSED_AGGRO_RANGE,
   Skills,
@@ -80,7 +95,6 @@ import {
   TILE,
   TraderTier,
   Tile,
-  WeaponStats,
   WorldInit,
   armorMultiplier,
   encodeByteRuns,
@@ -89,16 +103,35 @@ import {
   invWeight,
   skillLevel,
 } from '@holdout/shared';
-import { DbService, QuestProg } from '../db/db.service';
+import { DbService, PersistedWorldState, QuestProg } from '../db/db.service';
 import { ContentService } from './content.service';
 import { ChestTier, GeneratedMap, TERRAIN_ID_BY_TILE, fromAuthored, generateMap, mulberry32, resourceKindsFromTiles, terrainKindsFromTiles } from './mapgen';
 import { rollChest, rollEnemyDrop, rollGround, rollNamed } from './loot';
+import { addInventoryItem, canPayRecipe, collectCarriedDrops, countInventoryItem, removeInventoryItem } from './rules/inventory.rules';
+import {
+  actionInterruptedByDamage,
+  actionInterruptedByMovement,
+  clanHideoutExitTarget,
+  combatAttackAllowed,
+  elevationStepAllowed,
+  fatigueMoveMultiplier,
+  questCanClaim,
+  questUnlocked as questRuleUnlocked,
+  restoredStructureTile,
+} from './rules/simulation.rules';
+import { consumeFuel, planFuelAddition } from './rules/station.rules';
+import { canBuildClanHideout, canDemolishClanHideout } from './rules/clan.rules';
+import { adminItemQuantity, adminSanctionMinutes, adminText, adminTileCoordinate } from './rules/admin.rules';
+import { TelemetryService } from './telemetry.service';
 import type {
   Enemy,
   GameContainer as Container,
   GameInstance as Instance,
   GroundItem,
+  NodeRespawnState,
   Projectile,
+  ResourceFamily,
+  ServerBotState,
   ServerPlayer,
 } from './game.types';
 
@@ -107,6 +140,21 @@ const WORLD = 'world';
 const LOS_MEMORY_MS = 12_000; // how long an enemy keeps hunting a target it can't see
 const LOS_GIVE_UP_MS = 2500; // …but once it reaches your last-seen spot, it gives up fast
 const OVERWEIGHT_SPEED_MULT = 0.45; // hauling too much makes you a slow, juicy target
+const BOT_SYNC_MS = 2000;
+const BOT_SELF_CARE_MS = 700;
+const BOT_BUILD_COOLDOWN_MS = 12_000;
+const BOT_TRADE_COOLDOWN_MS = 1800;
+const SNAPSHOT_VIEW_RANGE = 1100;
+const PLAYER_LEASE_TTL_SECONDS = 45;
+const PLAYER_LEASE_HEARTBEAT_MS = 15_000;
+const CHEST_RESTOCK_MS = 20 * 60_000;
+const configuredPlayerCapacity = Number(process.env.MAX_PLAYERS_PER_SERVER ?? 200);
+const MAX_PLAYERS_PER_SERVER = Number.isFinite(configuredPlayerCapacity)
+  ? Math.max(10, Math.min(500, Math.floor(configuredPlayerCapacity)))
+  : 200;
+type CraftingStation = 'workbench' | 'firepit' | 'furnace' | 'anvil';
+const BOT_NAME_PREFIXES = ['Ash', 'Badger', 'Brick', 'Copper', 'Crow', 'Dust', 'Echo', 'Flint', 'Ghost', 'Hollow', 'Kodiak', 'Mako', 'Nova', 'Rook', 'Sable', 'Slate', 'Vandal', 'Warden'];
+const BOT_NAME_SUFFIXES = ['Bandit', 'Coyote', 'Drifter', 'Fox', 'Hawk', 'Jackal', 'Nomad', 'Otter', 'Pioneer', 'Ranger', 'Runner', 'Scout', 'Shade', 'Stalker', 'Viper', 'Walker', 'Wolf'];
 
 @Injectable()
 export class GameService implements OnModuleInit, OnModuleDestroy {
@@ -122,97 +170,393 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   private saveTimer: NodeJS.Timeout;
   private questTimer: NodeJS.Timeout;
   private mapTimer: NodeJS.Timeout;
+  private socialTimer: NodeJS.Timeout;
+  private playerLeaseTimer: NodeJS.Timeout;
   private activeMapId: number | null = null;
-  private rejectedMapId: number | null = null;
+  private activeMapVersion = '';
+  private rejectedMapVersion = '';
   private lastVisualsVersion = 0;
+  private lastGameplayVersion = 0;
   private lastTick = Date.now();
   private quests: QuestDef[] = [];
+  private nextBotSyncAt = 0;
+  private worldSave = Promise.resolve();
+  private exitingPlayers = new Set<string>();
+  private playerExitPromises = new Map<string, Promise<void>>();
+  private profileSaveQueues = new Map<string, Promise<void>>();
+  private guestBans = new Map<string, number>();
+  private lastNightHordeCycle = -1;
+  private nightHordeIds = new Set<string>();
+  private wasNight = isNight((Date.now() % DAY_LENGTH_MS) / DAY_LENGTH_MS);
 
-  constructor(private readonly db: DbService, private readonly content: ContentService) {}
+  constructor(
+    private readonly db: DbService,
+    private readonly content: ContentService,
+    private readonly telemetry: TelemetryService,
+  ) {}
 
   async onModuleInit() {
     this.quests = await this.db.loadQuests().catch(() => []);
     // hot-reload quests so admin edits apply without a restart
     this.questTimer = setInterval(() => {
-      void this.db.loadQuests().then((q) => (this.quests = q)).catch(() => undefined);
+      void this.db.loadQuests().then((quests) => {
+        this.quests = quests;
+        for (const player of this.players.values()) if (!this.isBot(player)) this.pushInventory(player);
+      }).catch(() => undefined);
     }, 60_000);
     const mapRevision = await this.db.loadActiveMapRevision().catch(() => null);
     const authored = mapRevision?.data ?? null;
     this.activeMapId = mapRevision?.id ?? null;
-    const gen = authored ? fromAuthored(authored) : generateMap();
+    this.activeMapVersion = this.activeMapId === null ? '' : String(this.activeMapId);
+    const savedWorld = this.db.stagingContent ? null : await this.db.loadWorldState(this.activeMapId).catch(() => null);
+    const gen = authored ? fromAuthored(authored) : generateMap(savedWorld?.seed);
     const world = this.makeInstance(WORLD, 'world', authored ? 'Authored Zone' : 'The Exclusion Zone', null, gen);
+    this.restoreWorldState(world, savedWorld);
     this.instances.set(WORLD, world);
+    await this.persistWorldState(world);
+    this.syncBotPopulation();
+    this.nextBotSyncAt = Date.now() + BOT_SYNC_MS;
     this.tickTimer = setInterval(() => this.tick(), TICK_MS);
-    this.saveTimer = setInterval(() => this.saveAll(), 30_000);
+    this.saveTimer = setInterval(() => this.saveAll(), 10_000);
+    this.playerLeaseTimer = setInterval(() => void this.renewPlayerLeases(), PLAYER_LEASE_HEARTBEAT_MS);
+    this.socialTimer = setInterval(() => {
+      for (const player of this.players.values()) if (!this.isBot(player) && !player.guest) void this.refreshSocial(player.sid);
+    }, 30_000);
     this.lastVisualsVersion = this.content.visualsVersion;
-    this.mapTimer = setInterval(() => { void this.refreshPublishedMap(); this.refreshPublishedVisuals(); }, 10_000);
+    this.lastGameplayVersion = this.content.gameplayVersionNumber;
+    this.mapTimer = setInterval(() => { void this.refreshPublishedMap(); this.refreshPublishedContent(); }, 10_000);
     this.log.log(
       `World ready (${authored ? 'authored map' : `procedural seed ${gen.seed}`}) — ${world.containers.size} containers, ${world.enemies.size} enemies, POIs: ${gen.pois.map((p) => p.name).join(', ') || 'none'}`,
     );
   }
 
-  onModuleDestroy() {
+  async onModuleDestroy() {
     clearInterval(this.tickTimer);
     clearInterval(this.saveTimer);
     clearInterval(this.questTimer);
     clearInterval(this.mapTimer);
-    return this.saveAll();
+    clearInterval(this.socialTimer);
+    clearInterval(this.playerLeaseTimer);
+    await this.saveAll();
+    await Promise.all([...this.players.values()].flatMap((player) => this.isBot(player) || player.guest ? [] : [this.db.releasePlayerWorldLease(player.userId, player.sid)]));
+    await Promise.all([...this.instances.values()].flatMap((instance) => instance.clanId ? [this.db.releaseClanHideoutLease(instance.clanId)] : []));
   }
 
   private async refreshPublishedMap() {
     // Poll only the tiny row ID. The multi-megabyte authored document stays in
     // this process and is fetched again only after an actual publication.
-    const revisionId = await this.db.loadActiveMapRevisionId();
-    if (revisionId === null || revisionId === this.activeMapId || revisionId === this.rejectedMapId) return;
+    const marker = await this.db.loadActiveMapRevisionId();
+    if (marker === null || marker.version === this.activeMapVersion || marker.version === this.rejectedMapVersion) return;
+    const revisionId = marker.id;
     const current = this.instances.get(WORLD);
     if (current && current.players > 0) return;
     const revision = await this.db.loadMapRevision(revisionId);
     if (!revision) {
-      this.rejectedMapId = revisionId;
+      this.rejectedMapVersion = marker.version;
       this.log.error(`Published map #${revisionId} was rejected; retaining map #${this.activeMapId ?? 'procedural'}`);
       return;
     }
     const gen = fromAuthored(revision.data);
     const world = this.makeInstance(WORLD, 'world', 'Authored Zone', null, gen);
+    const savedWorld = this.db.stagingContent ? null : await this.db.loadWorldState(revision.id).catch(() => null);
+    this.restoreWorldState(world, savedWorld);
     this.instances.set(WORLD, world);
+    for (const player of this.players.values()) if (this.isBot(player)) this.resetBotWorldPosition(player, world);
     this.activeMapId = revision.id;
-    this.rejectedMapId = null;
+    this.activeMapVersion = marker.version;
+    void this.persistWorldState(world);
+    this.rejectedMapVersion = '';
     this.log.log(`Published map #${revision.id} loaded (${world.w}x${world.h})`);
   }
 
-  private refreshPublishedVisuals() {
-    if (!this.io || this.content.visualsVersion === this.lastVisualsVersion) return;
-    this.lastVisualsVersion = this.content.visualsVersion;
-    this.io.emit(EV.visuals, this.content.visuals);
-    this.log.log(`Published visuals r${this.lastVisualsVersion} pushed to connected clients`);
+  private refreshPublishedContent() {
+    if (!this.io) return;
+    if (this.content.visualsVersion !== this.lastVisualsVersion) {
+      this.lastVisualsVersion = this.content.visualsVersion;
+      this.io.emit(EV.visuals, this.content.visuals);
+      this.log.log(`Published visuals r${this.lastVisualsVersion} pushed to connected clients`);
+    }
+    if (this.content.gameplayVersionNumber !== this.lastGameplayVersion) {
+      this.lastGameplayVersion = this.content.gameplayVersionNumber;
+      this.io.emit(EV.gameplay, this.content.gameplay);
+      this.log.log(`Published gameplay catalog r${this.lastGameplayVersion} pushed to connected clients`);
+    }
   }
 
-  private saveProfileOf(p: ServerPlayer) {
-    return this.db.saveProfile(
-      p.userId, p.inv, p.equipment, p.skills, p.quests, p.money, p.kills, p.deaths,
-      Math.round(p.hunger), Math.round(p.thirst), p.armorDur, p.appearance,
+  private enqueueProfileWork<T>(userId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.profileSaveQueues.get(userId) ?? Promise.resolve();
+    const task = previous.then(work);
+    const barrier = task.then(() => undefined, () => undefined);
+    this.profileSaveQueues.set(userId, barrier);
+    void barrier.finally(() => {
+      if (this.profileSaveQueues.get(userId) === barrier) this.profileSaveQueues.delete(userId);
+    });
+    return task;
+  }
+
+  private async persistProfileOf(p: ServerPlayer, connectionId: string): Promise<boolean> {
+    if (p.guest) return true;
+    const saved = await this.db.saveProfile(
+      p.userId, connectionId, p.inv, p.equipment, p.skills, p.quests, p.money, p.kills, p.deaths,
+      Math.round(p.hunger), Math.round(p.thirst), p.armorDur, p.appearance, p.mags,
     );
+    if (!saved) this.telemetry.record({ kind: 'profile_save_failed', userId: p.userId, source: 'game_service' });
+    return saved;
+  }
+
+  private saveProfileOf(p: ServerPlayer, connectionId = p.sid): Promise<void> {
+    if (this.isBot(p) || p.guest) return Promise.resolve();
+    return this.enqueueProfileWork(p.userId, async () => { await this.persistProfileOf(p, connectionId); });
+  }
+
+  private inventoryValue(inv: Inventory): number {
+    return inv.slots.reduce((value, slot) => value + (slot ? this.content.estimatedItemValue(slot.id) * slot.qty : 0), 0);
   }
 
   private addXp(p: ServerPlayer, skill: keyof Skills, amount: number) {
     p.skills[skill] = (p.skills[skill] ?? 0) + Math.max(0, Math.round(amount));
   }
 
+  private isBot(p: ServerPlayer | undefined | null): p is ServerPlayer & { bot: ServerBotState } {
+    return Boolean(p?.bot);
+  }
+
+  private choose<T>(values: readonly T[]): T {
+    return values[Math.floor(this.rnd() * values.length)]!;
+  }
+
+  private randomAppearance(): CharacterAppearance {
+    return {
+      body: Math.floor(this.rnd() * CHARACTER_BODY_NAMES.length),
+      skinTone: Math.floor(this.rnd() * CHARACTER_SKIN_COLORS.length),
+      hairStyle: Math.floor(this.rnd() * CHARACTER_HAIR_NAMES.length),
+      hairColor: Math.floor(this.rnd() * CHARACTER_HAIR_COLORS.length),
+      outfit: Math.floor(this.rnd() * CHARACTER_OUTFIT_COLORS.length),
+      accent: Math.floor(this.rnd() * CHARACTER_ACCENT_COLORS.length),
+      cosmetics: { head: null, face: null, back: null, badge: null },
+    };
+  }
+
+  private findClearPointNear(inst: Instance, x: number, y: number, radiusTiles = 8): { x: number; y: number } {
+    const baseTx = Math.max(1, Math.min(inst.w - 2, Math.floor(x / TILE)));
+    const baseTy = Math.max(1, Math.min(inst.h - 2, Math.floor(y / TILE)));
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const tx = Math.max(1, Math.min(inst.w - 2, baseTx + Math.floor((this.rnd() * 2 - 1) * radiusTiles)));
+      const ty = Math.max(1, Math.min(inst.h - 2, baseTy + Math.floor((this.rnd() * 2 - 1) * radiusTiles)));
+      const px = (tx + 0.5) * TILE;
+      const py = (ty + 0.5) * TILE;
+      if (this.isSafeAt(inst, px, py)) continue;
+      if (this.isBlocked(inst, px, py, PLAYER_RADIUS)) continue;
+      return { x: px, y: py };
+    }
+    return { x: (baseTx + 0.5) * TILE, y: (baseTy + 0.5) * TILE };
+  }
+
+  private nextBotName(): string {
+    const taken = new Set(
+      [...this.players.values()]
+        .filter((player) => this.isBot(player))
+        .map((player) => player.name.toLowerCase()),
+    );
+    for (const rawName of this.content.settings.bots.names) {
+      const name = rawName.trim();
+      if (name && !taken.has(name.toLowerCase())) return name;
+    }
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const prefix = this.choose(BOT_NAME_PREFIXES);
+      const suffix = this.choose(BOT_NAME_SUFFIXES);
+      const numeric = this.rnd() < 0.25 ? String(10 + Math.floor(this.rnd() * 90)) : '';
+      const name = `${prefix}${suffix}${numeric}`;
+      if (!taken.has(name.toLowerCase())) return name;
+    }
+    return `Ranger${this.nextId}`;
+  }
+
+  private botStarterInventory(): Inventory {
+    const inv = this.starterInventory();
+    const bagTier = this.rnd() < 0.2 ? 2 : this.rnd() < 0.45 ? 1 : 0;
+    inv.backpack = bagTier;
+    while (inv.slots.length < BACKPACKS[bagTier].slots) inv.slots.push(null);
+    inv.slots.length = BACKPACKS[bagTier].slots;
+
+    const loadout = this.rnd();
+    if (loadout < 0.2) this.addItem(inv, 'axe', 1);
+    else if (loadout < 0.4) this.addItem(inv, 'pickaxe', 1);
+    else if (loadout < 0.58) this.addItem(inv, 'spear', 1);
+    else if (loadout < 0.74) {
+      this.addItem(inv, 'bow', 1);
+      this.addItem(inv, 'arrow', 12 + Math.floor(this.rnd() * 18));
+    } else if (loadout < 0.87) {
+      this.addItem(inv, 'pistol', 1);
+      this.addItem(inv, 'ammo_9mm', 18 + Math.floor(this.rnd() * 28));
+    } else {
+      this.addItem(inv, 'revolver', 1);
+      this.addItem(inv, 'ammo_44', 10 + Math.floor(this.rnd() * 12));
+    }
+
+    if (this.rnd() < 0.55) this.addItem(inv, 'bandage', 1 + Math.floor(this.rnd() * 2));
+    if (this.rnd() < 0.3) this.addItem(inv, 'medkit', 1);
+    if (this.rnd() < 0.75) this.addItem(inv, this.rnd() < 0.5 ? 'cooked_meat' : 'cooked_fish', 1 + Math.floor(this.rnd() * 2));
+    if (this.rnd() < 0.55) this.addItem(inv, 'canteen_full', 1);
+    if (this.rnd() < 0.45) this.addItem(inv, 'cloth', 2 + Math.floor(this.rnd() * 3));
+    if (this.rnd() < 0.5) this.addItem(inv, 'scrap', 2 + Math.floor(this.rnd() * 4));
+    if (this.rnd() < 0.35) this.addItem(inv, 'wood', 4 + Math.floor(this.rnd() * 6));
+    if (this.rnd() < 0.35) this.addItem(inv, 'stone', 3 + Math.floor(this.rnd() * 5));
+    return inv;
+  }
+
+  private spawnBot(world = this.instances.get(WORLD)!): ServerPlayer | null {
+    if (!world || world.spawns.length === 0) return null;
+    const spawn = world.spawns[Math.floor(this.rnd() * world.spawns.length)];
+    const start = this.findClearPointNear(world, spawn.x, spawn.y, 10);
+    const camp = this.findClearPointNear(world, start.x, start.y, 6);
+    const sid = `bot:${this.nextId++}`;
+    const inv = this.botStarterInventory();
+    const helmet = this.rnd() < 0.18 ? 'helmet_scrap' : null;
+    const vest = this.rnd() < 0.12 ? 'vest_light' : null;
+    const p: ServerPlayer = {
+      sid,
+      userId: sid,
+      name: this.nextBotName(),
+      guest: false,
+      instanceId: world.id,
+      x: start.x,
+      y: start.y,
+      angle: 0,
+      facing: 0,
+      hp: PLAYER_MAX_HP,
+      dead: false,
+      moving: false,
+      input: { up: false, down: false, left: false, right: false, angle: 0, shoot: false, sprint: false },
+      inv,
+      equipment: { helmet, vest, mod: null },
+      equipped: this.firstWeaponSlot(inv),
+      money: 30 + Math.floor(this.rnd() * 180),
+      skills: {
+        woodcutting: Math.floor(this.rnd() * 220),
+        mining: Math.floor(this.rnd() * 220),
+        shooting: Math.floor(this.rnd() * 220),
+        melee: Math.floor(this.rnd() * 220),
+        crafting: Math.floor(this.rnd() * 220),
+      },
+      quests: {},
+      hunger: 70 + Math.floor(this.rnd() * 30),
+      thirst: 70 + Math.floor(this.rnd() * 30),
+      stamina: STAMINA_MAX,
+      staminaExhausted: false,
+      lastExertAt: 0,
+      starveAcc: 0,
+      regenAcc: 0,
+      lastPushedSurvival: -1,
+      lastStaminaBucket: -1,
+      lastPushedStaminaExhausted: false,
+      action: null,
+      actionStart: { x: start.x, y: start.y },
+      mags: {},
+      reloadUntil: 0,
+      reloadTarget: null,
+      lastAttackAt: 0,
+      lastExhaustedAttackToastAt: 0,
+      lastHitAt: 0,
+      lastSwingAt: 0,
+      kills: 0,
+      deaths: 0,
+      openContainer: null,
+      returnPos: null,
+      ignoreInteractUntil: 0,
+      loggedOutAt: null,
+      lastStationMask: -1,
+      armorDur: {},
+      appearance: this.randomAppearance(),
+      friendUserIds: new Set(),
+      clanId: null,
+      clanName: null,
+      clanTag: null,
+      clanRank: null,
+      clanMateIds: new Set(),
+      admin: false,
+      adminMode: false,
+      mutedUntil: 0,
+      bot: {
+        id: sid,
+        aggression: Math.max(0.08, Math.min(0.95, this.content.settings.bots.playerAggroChance + (this.rnd() * 0.5 - 0.25))),
+        buildDrive: Math.max(0.05, Math.min(0.95, this.content.settings.bots.buildChance + (this.rnd() * 0.5 - 0.25))),
+        greed: 0.2 + this.rnd() * 0.7,
+        campX: camp.x,
+        campY: camp.y,
+        roamX: camp.x,
+        roamY: camp.y,
+        roamUntil: 0,
+        respawnAt: 0,
+        nextUtilityAt: 0,
+        nextBuildAt: 0,
+        nextTradeAt: 0,
+      },
+    };
+    this.players.set(sid, p);
+    const botValue = this.inventoryValue(inv)
+      + (helmet ? this.content.estimatedItemValue(helmet) : 0)
+      + (vest ? this.content.estimatedItemValue(vest) : 0);
+    this.telemetry.record({ kind: 'bot_contribution', value: botValue, credits: p.money, source: 'bot_spawn', metadata: { bot: p.name } });
+    return p;
+  }
+
+  private despawnBot(p: ServerPlayer) {
+    if (!this.isBot(p)) return;
+    this.players.delete(p.sid);
+    for (const inst of this.instances.values())
+      for (const enemy of inst.enemies.values()) if (enemy.targetSid === p.sid) enemy.targetSid = null;
+  }
+
+  private resetBotWorldPosition(p: ServerPlayer, world = this.instances.get(WORLD)!) {
+    if (!this.isBot(p) || !world || world.spawns.length === 0) return;
+    const spawn = world.spawns[Math.floor(this.rnd() * world.spawns.length)];
+    const start = this.findClearPointNear(world, spawn.x, spawn.y, 10);
+    const camp = this.findClearPointNear(world, start.x, start.y, 6);
+    p.instanceId = world.id;
+    p.x = start.x;
+    p.y = start.y;
+    p.angle = 0;
+    p.facing = 0;
+    p.input = { up: false, down: false, left: false, right: false, angle: 0, shoot: false, sprint: false };
+    p.action = null;
+    p.actionStart = { x: start.x, y: start.y };
+    p.openContainer = null;
+    p.ignoreInteractUntil = 0;
+    p.bot.campX = camp.x;
+    p.bot.campY = camp.y;
+    p.bot.roamX = camp.x;
+    p.bot.roamY = camp.y;
+    p.bot.roamUntil = 0;
+  }
+
+  private syncBotPopulation() {
+    const desired = Math.max(0, this.content.settings.bots.count | 0);
+    const bots = [...this.players.values()].filter((player) => this.isBot(player));
+    if (bots.length < desired) {
+      for (let i = bots.length; i < desired; i++) this.spawnBot();
+      return;
+    }
+    if (bots.length > desired) {
+      for (const bot of bots.slice(desired)) this.despawnBot(bot);
+    }
+  }
+
   /** Wear down an inventory slot; break it (destroy) at 0. Returns true if it broke. */
   private wearSlot(p: ServerPlayer, slot: number, amount = 1): boolean {
     const item = p.inv.slots[slot];
     if (!item) return false;
-    const max = ITEMS[item.id].durability;
+    const max = this.content.item(item.id).durability;
     if (max === undefined) return false;
     const dur = (item.dur ?? max) - amount;
     if (dur <= 0) {
-      this.toast(p.sid, `Your ${ITEMS[item.id].name} broke!`);
+      this.toast(p.sid, `Your ${this.content.item(item.id).name} broke!`);
       p.inv.slots[slot] = null;
       if (p.equipped === slot) p.equipped = null;
       return true;
     }
     item.dur = dur;
-    if (dur === Math.ceil(max * 0.2)) this.toast(p.sid, `${ITEMS[item.id].name} is badly worn — repair it at a ${repairInfo(ITEMS[item.id])?.station}`);
+    if (dur === Math.ceil(max * 0.2)) this.toast(p.sid, `${this.content.item(item.id).name} is badly worn — repair it at a ${repairInfo(this.content.item(item.id))?.station}`);
     return false;
   }
 
@@ -220,12 +564,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   private wearArmor(p: ServerPlayer, piece: 'helmet' | 'vest'): void {
     const id = p.equipment[piece];
     if (!id) return;
-    const max = ITEMS[id].durability;
+    const max = this.content.item(id).durability;
     if (max === undefined) return;
     const cur = p.armorDur[piece] ?? max;
     const dur = cur - 1;
     if (dur <= 0) {
-      this.toast(p.sid, `Your ${ITEMS[id].name} was destroyed!`);
+      this.toast(p.sid, `Your ${this.content.item(id).name} was destroyed!`);
       p.equipment[piece] = null;
       delete p.armorDur[piece];
     } else {
@@ -255,6 +599,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       blockKinds: gen.blockKinds,
       blockRotations: gen.blockRotations,
       openDoors: new Set(),
+      stationFuel: new Map(),
       pois: gen.pois,
       traders: gen.traders,
       extracts: gen.extracts,
@@ -267,6 +612,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       unders: new Map(),
       projectiles: [],
       nodeHits: new Map(),
+      nodeVariants: new Map(),
       blockHp: new Map(),
       nodeRespawns: [],
       enemyRespawns: [],
@@ -298,31 +644,118 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     return inst;
   }
 
-  /** Hideout v2: a flat grass camp ringed by trees — bed + one chest to start, buildable. */
-  private async hideoutInstance(ownerId: string): Promise<Instance> {
-    const id = `h:${ownerId}`;
-    const existing = this.instances.get(id);
-    if (existing) return existing;
+  /** Reapply sparse node mutations only when their authored/procedural base still matches. */
+  private restoreWorldState(inst: Instance, saved: PersistedWorldState | null) {
+    if (!saved) return;
+    let restoredVariants = 0;
+    for (const variant of saved.nodeVariants) {
+      if (variant.i < 0 || variant.i >= inst.tiles.length) continue;
+      const baseResourceId = inst.resourceKinds[String(variant.i)] ?? '';
+      if (inst.tiles[variant.i] !== variant.baseTile || baseResourceId !== variant.baseResourceId) continue;
+      inst.tiles[variant.i] = variant.tile;
+      inst.resourceKinds[String(variant.i)] = variant.resourceId;
+      inst.nodeVariants.set(variant.i, variant);
+      restoredVariants++;
+    }
+    for (const [i, left] of saved.nodeHits) {
+      if (i < 0 || i >= inst.tiles.length) continue;
+      const resource = this.content.resource(inst.resourceKinds[String(i)]);
+      const total = resource?.maxHits ?? NODE_HITS[inst.tiles[i] as Tile];
+      if (total && left > 0) inst.nodeHits.set(i, Math.min(left, total));
+    }
+    let restoredCooldowns = 0;
+    const seen = new Set<number>();
+    for (const respawn of saved.nodeRespawns) {
+      if (respawn.i < 0 || respawn.i >= inst.tiles.length || seen.has(respawn.i)) continue;
+      const variant = inst.nodeVariants.get(respawn.i);
+      const baseTile = variant?.baseTile ?? inst.tiles[respawn.i];
+      const baseResourceId = variant?.baseResourceId ?? inst.resourceKinds[String(respawn.i)] ?? '';
+      const resource = this.content.resource(inst.resourceKinds[String(respawn.i)]);
+      const family = this.content.resourceFamily(resource, inst.tiles[respawn.i]);
+      if (baseTile !== respawn.baseTile || baseResourceId !== respawn.baseResourceId || family !== respawn.family) continue;
+      inst.tiles[respawn.i] = respawn.depletedTile;
+      inst.nodeHits.delete(respawn.i);
+      inst.nodeRespawns.push(respawn);
+      seen.add(respawn.i);
+      restoredCooldowns++;
+    }
+    if (restoredVariants || restoredCooldowns || inst.nodeHits.size) {
+      this.log.log(`Restored ${restoredCooldowns} depleted nodes, ${restoredVariants} node variants and ${inst.nodeHits.size} damaged nodes`);
+    }
+  }
 
-    const W = HIDEOUT_W;
-    const H = HIDEOUT_H;
+  private snapshotWorldState(inst: Instance): PersistedWorldState {
+    return {
+      mapId: this.activeMapId,
+      seed: inst.seed,
+      nodeHits: [...inst.nodeHits.entries()],
+      nodeRespawns: inst.nodeRespawns.map((node) => ({ ...node })),
+      nodeVariants: [...inst.nodeVariants.values()].map((node) => ({ ...node })),
+    };
+  }
+
+  private persistWorldState(inst: Instance) {
+    const snapshot = this.snapshotWorldState(inst);
+    this.worldSave = this.worldSave.catch(() => undefined).then(() => this.db.saveWorldState(snapshot));
+    return this.worldSave;
+  }
+
+  private rollResourceVariant(family: ResourceFamily) {
+    const variants = this.content.resourceVariants(family);
+    const total = variants.reduce((sum, variant) => sum + variant.weight, 0);
+    if (total <= 0) return undefined;
+    let roll = this.rnd() * total;
+    for (const variant of variants) {
+      roll -= variant.weight;
+      if (roll <= 0) return variant.resource;
+    }
+    return variants[variants.length - 1]?.resource;
+  }
+
+  private regrowResourceNode(inst: Instance, node: NodeRespawnState) {
+    const resourceDef = this.rollResourceVariant(node.family);
+    const resourceId = resourceDef?.id ?? (node.family === 'tree' ? 'tree' : 'rock');
+    let tile = resourceDef?.tile ?? (node.family === 'tree' ? Tile.Tree : Tile.Rock);
+    if (node.family === 'rock') {
+      const roll = this.rnd();
+      tile = roll < IRON_CHANCE ? Tile.IronOre : roll < IRON_CHANCE + COPPER_CHANCE ? Tile.CopperOre : Tile.Rock;
+    }
+    inst.tiles[node.i] = tile;
+    inst.resourceKinds[String(node.i)] = resourceId;
+    if (tile === node.baseTile && resourceId === node.baseResourceId) inst.nodeVariants.delete(node.i);
+    else inst.nodeVariants.set(node.i, { i: node.i, tile, resourceId, baseTile: node.baseTile, baseResourceId: node.baseResourceId });
+    this.io?.to(inst.id).emit(EV.tile, { i: node.i, tile, resourceId });
+  }
+
+  private createHideoutInstance(
+    id: string,
+    kind: 'hideout' | 'clan_hideout',
+    name: string,
+    ownerId: string | null,
+    clanId: string | undefined,
+    width: number,
+    height: number,
+    storageSlots: number,
+    hideout: Awaited<ReturnType<DbService['loadHideout']>>,
+  ): Instance {
+    const W = width;
+    const H = height;
+    while (hideout.storage.length < storageSlots) hideout.storage.push(null);
+    hideout.storage.length = storageSlots;
+    if (!hideout.objects.some((object) => object.type === 'bed')) hideout.objects.unshift({ type: 'bed', tx: 3, ty: 3 });
+
     const tiles = new Uint8Array(W * H).fill(Tile.Grass);
     for (let x = 0; x < W; x++) { tiles[x] = Tile.Cliff; tiles[(H - 1) * W + x] = Tile.Cliff; }
     for (let y = 0; y < H; y++) { tiles[y * W] = Tile.Cliff; tiles[y * W + W - 1] = Tile.Cliff; }
     const exitTx = Math.floor(W / 2);
     tiles[(H - 2) * W + exitTx] = Tile.DoorMat;
 
-    const hideout = await this.db.loadHideout(ownerId);
-    while (hideout.storage.length < HIDEOUT_STORAGE_SLOTS) hideout.storage.push(null);
-    hideout.storage.length = HIDEOUT_STORAGE_SLOTS;
-    // the bed is a movable object now — seed one for camps that predate this
-    if (!hideout.objects.some((o) => o.type === 'bed')) hideout.objects.unshift({ type: 'bed', tx: 3, ty: 3 });
-
     const inst: Instance = {
       id,
-      kind: 'hideout',
-      name: 'Home Base',
+      kind,
+      name,
       ownerId,
+      ...(clanId ? { clanId } : {}),
       seed: 0,
       w: W,
       h: H,
@@ -333,11 +766,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       blockKinds: {},
       blockRotations: {},
       openDoors: new Set(),
+      stationFuel: new Map(),
       pois: [],
       traders: [],
       extracts: [],
       exit: { x: (exitTx + 0.5) * TILE, y: (H - 2 + 0.5) * TILE },
-      spawns: [{ x: 4.5 * TILE, y: 4.5 * TILE }], // repositioned next to the bed below
+      spawns: [{ x: 4.5 * TILE, y: 4.5 * TILE }],
       lootSpots: [],
       containers: new Map(),
       ground: new Map(),
@@ -345,6 +779,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       unders: new Map(),
       projectiles: [],
       nodeHits: new Map(),
+      nodeVariants: new Map(),
       blockHp: new Map(),
       nodeRespawns: [],
       enemyRespawns: [],
@@ -353,9 +788,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       hideout,
       structures: new Map(),
     };
-    // starter chest
-    inst.containers.set(`hs:${ownerId}`, {
-      id: `hs:${ownerId}`,
+    inst.containers.set(`hs:${id}`, {
+      id: `hs:${id}`,
       x: 5.5 * TILE,
       y: 3.5 * TILE,
       kind: 'storage',
@@ -363,21 +797,22 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       slots: hideout.storage,
       restockAt: null,
     });
-    // player-built tiles + chests (objects apply in build order: floors first,
-    // stations later — a station over a floor records it as its under-tile)
-    for (const o of hideout.objects) {
-      if (o.tx < 1 || o.ty < 1 || o.tx >= W - 1 || o.ty >= H - 1) continue;
-      const b = BUILDABLES[o.type];
-      const i = o.ty * W + o.tx;
-      const engineBlock = this.content.playerBlock(o.type);
+    for (const object of hideout.objects) {
+      if (object.tx < 1 || object.ty < 1 || object.tx >= W - 1 || object.ty >= H - 1) continue;
+      const buildable = BUILDABLES[object.type];
+      const index = object.ty * W + object.tx;
+      const engineBlock = this.content.playerBlock(object.type);
       if (engineBlock) {
-        inst.blockKinds[String(i)] = engineBlock.id;
-        const rotation = ((Number(o.rotation) | 0) % 4 + 4) % 4;
-        if (rotation) inst.blockRotations[String(i)] = rotation;
+        inst.blockKinds[String(index)] = engineBlock.id;
+        const rotation = ((Number(object.rotation) | 0) % 4 + 4) % 4;
+        if (rotation) inst.blockRotations[String(index)] = rotation;
       }
-      if (b?.tile) {
-        if (FLOOR_TILES[tiles[i]]) inst.unders.set(i, tiles[i]);
-        tiles[i] = b.tile;
+      if (buildable?.tile) {
+        if (FLOOR_TILES[tiles[index]]) inst.unders.set(index, tiles[index]);
+        tiles[index] = buildable.tile;
+      }
+      if ((object.type === 'firepit' || object.type === 'furnace') && Number.isFinite(object.fuel) && Number(object.fuel) > 0) {
+        inst.stationFuel.set(index, Math.min(STATION_FUEL_MAX, Math.max(0, Math.floor(Number(object.fuel)))));
       }
     }
     this.syncHideoutContainers(inst);
@@ -386,9 +821,36 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     return inst;
   }
 
+  /** Personal hideout: a private grass camp with permanent construction. */
+  private async hideoutInstance(ownerId: string): Promise<Instance> {
+    const id = `h:${ownerId}`;
+    const existing = this.instances.get(id);
+    if (existing) return existing;
+    const hideout = await this.db.loadHideout(ownerId);
+    return this.createHideoutInstance(id, 'hideout', 'Home Base', ownerId, undefined, HIDEOUT_W, HIDEOUT_H, HIDEOUT_STORAGE_SLOTS, hideout);
+  }
+
+  private async clanHideoutInstance(clan: { id: string; name: string; tag: string }): Promise<Instance> {
+    const id = `clan:${clan.id}`;
+    const existing = this.instances.get(id);
+    if (existing) return existing;
+    const hideout = await this.db.loadClanHideout(clan.id);
+    return this.createHideoutInstance(
+      id,
+      'clan_hideout',
+      `[${clan.tag}] ${clan.name} Holdout`,
+      null,
+      clan.id,
+      CLAN_HOLDOUT_W,
+      CLAN_HOLDOUT_H,
+      CLAN_HOLDOUT_STORAGE_SLOTS,
+      hideout,
+    );
+  }
+
   /** Home spawn = a walkable tile next to your bed (the bed is movable). */
   private syncHideoutSpawn(inst: Instance) {
-    if (inst.kind !== 'hideout' || !inst.hideout) return;
+    if (inst.kind === 'world' || !inst.hideout) return;
     const bed = inst.hideout.objects.find((o) => o.type === 'bed');
     if (!bed) return; // no bed? keep the previous spawn
     for (const [dx, dy] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1]]) {
@@ -404,7 +866,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   /** Rebuild the hideout's built-chest containers from hideout.objects (slot arrays shared by reference). */
   private syncHideoutContainers(inst: Instance) {
-    if (!inst.ownerId || !inst.hideout) return;
+    if (!inst.hideout) return;
     for (const id of [...inst.containers.keys()]) if (id.startsWith('hc:')) inst.containers.delete(id);
     inst.hideout.objects.forEach((o, i) => {
       if (o.type !== 'chest') return;
@@ -412,8 +874,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       while (slots.length < HIDEOUT_STORAGE_SLOTS) slots.push(null);
       slots.length = HIDEOUT_STORAGE_SLOTS;
       o.slots = slots;
-      inst.containers.set(`hc:${inst.ownerId}:${i}`, {
-        id: `hc:${inst.ownerId}:${i}`,
+      inst.containers.set(`hc:${inst.id}:${i}`, {
+        id: `hc:${inst.id}:${i}`,
         x: (o.tx + 0.5) * TILE,
         y: (o.ty + 0.5) * TILE,
         kind: 'storage',
@@ -425,9 +887,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   }
 
   private persistHideout(inst: Instance) {
-    if (inst.kind !== 'hideout' || !inst.ownerId || !inst.hideout) return;
+    if (inst.kind === 'world' || !inst.hideout) return;
     // chest slot arrays are shared by reference with containers — just save
-    void this.db.saveHideout(inst.ownerId, inst.hideout);
+    if (inst.clanId) void this.db.saveClanHideout(inst.clanId, inst.hideout);
+    else if (inst.ownerId) {
+      const owner = [...this.players.values()].find((player) => !this.isBot(player) && player.userId === inst.ownerId);
+      if (owner) void this.db.saveHideout(inst.ownerId, owner.sid, inst.hideout);
+    }
   }
 
   private inst(p: ServerPlayer): Instance {
@@ -435,6 +901,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   }
 
   private initFor(inst: Instance, sid: string): WorldInit {
+    const player = this.players.get(sid);
+    const canBuild = inst.kind === 'hideout'
+      ? inst.ownerId === player?.userId
+      : inst.kind === 'clan_hideout' && Boolean(inst.clanId && inst.clanId === player?.clanId && canBuildClanHideout(player?.clanRank));
+    const canDemolish = inst.kind === 'hideout'
+      ? inst.ownerId === player?.userId
+      : inst.kind === 'clan_hideout' && inst.clanId === player?.clanId && canDemolishClanHideout(player?.clanRank);
     return {
       kind: inst.kind,
       name: inst.name,
@@ -447,7 +920,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       traders: inst.traders,
       extracts: inst.extracts,
       exit: inst.exit,
-      ownHideout: inst.kind === 'hideout' && inst.ownerId === this.players.get(sid)?.userId,
+      ownHideout: canBuild,
+      canDemolish,
       unders: Object.fromEntries(inst.unders),
       elevations: [],
       elevationRuns: encodeByteRuns(inst.elevations),
@@ -457,8 +931,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       blockKinds: inst.blockKinds,
       blockRotations: inst.blockRotations,
       openDoors: [...inst.openDoors],
+      stationFuel: Object.fromEntries(inst.stationFuel),
+      gameplay: this.content.gameplay,
       visuals: this.content.visuals,
       you: sid,
+      guest: player?.guest === true,
+      admin: player?.admin === true,
     };
   }
 
@@ -479,17 +957,169 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.emitTo(p.sid, EV.init, this.initFor(inst, p.sid));
     this.pushInventory(p);
     // hideout GC: drop empty hideout instances (storage already persisted)
-    if (old && old.kind === 'hideout' && old.players === 0) this.instances.delete(old.id);
+    if (old && old.kind !== 'world' && old.players === 0) {
+      this.instances.delete(old.id);
+      if (old.clanId) void this.db.releaseClanHideoutLease(old.clanId);
+    }
   }
 
   private isSafeAt(inst: Instance, x: number, y: number): boolean {
-    if (inst.kind === 'hideout') return true;
+    if (inst.kind !== 'world') return true;
     return inst.pois.some((p) => p.safe && Math.hypot(p.x - x, p.y - y) < p.r);
+  }
+
+  private async refreshPlayerSocial(player: ServerPlayer) {
+    if (this.isBot(player) || player.guest) return;
+    const social = await this.db.loadPlayerSocialAccess(player.userId);
+    player.friendUserIds = new Set(social.friendIds);
+    player.clanId = social.clan?.id ?? null;
+    player.clanName = social.clan?.name ?? null;
+    player.clanTag = social.clan?.tag ?? null;
+    player.clanRank = social.clan?.rank ?? null;
+    player.clanMateIds = new Set(social.clanMateIds);
+  }
+
+  async refreshSocial(sid: string) {
+    const player = this.players.get(sid);
+    if (!player || this.isBot(player)) return;
+    if (player.guest) {
+      this.toast(sid, 'Community features require a registered survivor');
+      return;
+    }
+    const previousClanId = player.clanId;
+    const previousRank = player.clanRank;
+    await this.refreshPlayerSocial(player);
+    const current = this.inst(player);
+    if (current.kind === 'clan_hideout' && current.clanId !== player.clanId) {
+      const home = await this.hideoutInstance(player.userId);
+      this.switchInstance(player, home, home.spawns[0].x, home.spawns[0].y);
+      this.toast(sid, 'Your clan access changed — returned home');
+    } else if (current.kind === 'clan_hideout' && (previousClanId !== player.clanId || previousRank !== player.clanRank)) {
+      this.emitTo(sid, EV.init, this.initFor(current, sid));
+    }
   }
 
   // ── join / leave ──────────────────────────────────────────────────────────
 
-  async addPlayer(sid: string, userId: string, name: string): Promise<WorldInit> {
+  private async addGuestPlayer(sid: string, userId: string, name: string): Promise<WorldInit> {
+    const bannedUntil = this.guestBans.get(userId) ?? 0;
+    if (bannedUntil > Date.now()) throw new Error('PLAYER_BANNED');
+    if (bannedUntil) this.guestBans.delete(userId);
+
+    const existingEntry = [...this.players.entries()].find(([, player]) => player.guest && player.userId === userId);
+    const humanPlayers = [...this.players.values()].filter((player) => !this.isBot(player)).length;
+    if (!existingEntry && humanPlayers >= MAX_PLAYERS_PER_SERVER) throw new Error('WORLD_FULL');
+
+    if (existingEntry) {
+      const [oldSid, existing] = existingEntry;
+      this.players.delete(oldSid);
+      for (const instance of this.instances.values()) {
+        for (const enemy of instance.enemies.values()) if (enemy.targetSid === oldSid) enemy.targetSid = sid;
+      }
+      existing.sid = sid;
+      existing.input = { up: false, down: false, left: false, right: false, angle: existing.angle, shoot: false };
+      existing.loggedOutAt = null;
+      this.players.set(sid, existing);
+      const instance = this.inst(existing);
+      void this.io?.sockets.sockets.get(sid)?.join(instance.id);
+      this.io?.sockets.sockets.get(oldSid)?.disconnect(true);
+      this.pushInventory(existing);
+      this.toast(sid, 'Guest raid restored — progress remains temporary');
+      return this.initFor(instance, sid);
+    }
+
+    const world = this.instances.get(WORLD)!;
+    const origin = this.choose(world.spawns);
+    const spawn = this.findClearPointNear(world, origin.x, origin.y, 10);
+    const inv = this.starterInventory();
+    const player: ServerPlayer = {
+      sid,
+      userId,
+      name,
+      guest: true,
+      instanceId: world.id,
+      x: spawn.x,
+      y: spawn.y,
+      angle: 0,
+      facing: 0,
+      hp: PLAYER_MAX_HP,
+      dead: false,
+      moving: false,
+      input: { up: false, down: false, left: false, right: false, angle: 0, shoot: false },
+      inv,
+      equipment: { helmet: null, vest: null, mod: null },
+      equipped: null,
+      money: 0,
+      skills: { ...EMPTY_SKILLS },
+      quests: {},
+      hunger: 100,
+      thirst: 100,
+      stamina: STAMINA_MAX,
+      staminaExhausted: false,
+      lastExertAt: 0,
+      starveAcc: 0,
+      regenAcc: 0,
+      lastPushedSurvival: -1,
+      lastStaminaBucket: -1,
+      lastPushedStaminaExhausted: false,
+      action: null,
+      actionStart: { x: spawn.x, y: spawn.y },
+      mags: {},
+      reloadUntil: 0,
+      reloadTarget: null,
+      lastAttackAt: 0,
+      lastExhaustedAttackToastAt: 0,
+      lastHitAt: 0,
+      lastSwingAt: 0,
+      kills: 0,
+      deaths: 0,
+      openContainer: null,
+      returnPos: null,
+      ignoreInteractUntil: Date.now() + 900,
+      loggedOutAt: null,
+      lastStationMask: -1,
+      armorDur: {},
+      appearance: this.randomAppearance(),
+      friendUserIds: new Set(),
+      clanId: null,
+      clanName: null,
+      clanTag: null,
+      clanRank: null,
+      clanMateIds: new Set(),
+      admin: false,
+      adminMode: false,
+      mutedUntil: 0,
+    };
+    this.players.set(sid, player);
+    world.players++;
+    void this.io?.sockets.sockets.get(sid)?.join(world.id);
+    this.pushInventory(player);
+    this.toast(sid, 'Guest raid — progress is temporary; community, chat and extraction are locked');
+    this.log.log(`${name} joined as guest (${this.players.size} online)`);
+    return this.initFor(world, sid);
+  }
+
+  async addPlayer(sid: string, userId: string, name: string, guest = false): Promise<WorldInit> {
+    if (guest) return this.addGuestPlayer(sid, userId, name);
+    // A clean disconnect saves before releasing ownership. Let that short
+    // critical section finish so a rapid reconnect cannot load the prior row
+    // or be removed by the older socket's finalizer.
+    await this.playerExitPromises.get(userId);
+    const access = await this.db.loadPlayerAccess(userId);
+    if (access.bannedUntil > Date.now()) throw new Error('PLAYER_BANNED');
+    const reconnecting = [...this.players.values()].some((player) => !this.isBot(player) && player.userId === userId);
+    const humanPlayers = [...this.players.values()].filter((player) => !this.isBot(player)).length;
+    if (!reconnecting && humanPlayers >= MAX_PLAYERS_PER_SERVER) throw new Error('WORLD_FULL');
+    const ownsProfile = await this.db.acquirePlayerWorldLease(userId, sid, PLAYER_LEASE_TTL_SECONDS);
+    if (!ownsProfile) {
+      this.telemetry.record({
+        kind: 'profile_lease_conflict',
+        userId,
+        source: 'socket_admission',
+        metadata: { serverKey: this.db.serverStateKey },
+      });
+      throw new Error('PROFILE_LEASE_CONFLICT');
+    }
     // reconnect handover: keep live state, kick the old socket
     for (const [oldSid, existing] of this.players) {
       if (existing.userId !== userId) continue;
@@ -499,7 +1129,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       existing.sid = sid;
       existing.input = { up: false, down: false, left: false, right: false, angle: existing.angle, shoot: false };
       existing.loggedOutAt = null; // reconnected before the combat-log body expired
-      existing.appearance = await this.db.loadAppearance(userId);
+      existing.appearance = await this.db.loadAppearance(userId).catch(() => existing.appearance);
+      existing.admin = access.admin;
+      existing.mutedUntil = access.mutedUntil;
+      if (!existing.admin) existing.adminMode = false;
+      await this.refreshPlayerSocial(existing).catch(() => undefined);
       this.players.set(sid, existing);
       const inst = this.inst(existing);
       void this.io?.sockets.sockets.get(sid)?.join(inst.id);
@@ -508,9 +1142,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       return this.initFor(inst, sid);
     }
 
-    const [row, appearance] = await Promise.all([
+    const [row, appearance, social] = await Promise.all([
       this.db.loadProfile(userId),
       this.db.loadAppearance(userId),
+      this.db.loadPlayerSocialAccess(userId),
     ]);
     let inv: Inventory;
     let equipment: Equipment = { helmet: null, vest: null, mod: null };
@@ -545,6 +1180,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       sid,
       userId,
       name,
+      guest: false,
       instanceId: home.id,
       x: spawn.x,
       y: spawn.y,
@@ -572,10 +1208,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       lastPushedStaminaExhausted: false,
       action: null,
       actionStart: { x: spawn.x, y: spawn.y },
-      mags: {},
+      mags: Object.fromEntries(Object.entries(row?.mags ?? {}).flatMap(([id, rounds]) => {
+        const weapon = this.content.item(id).weapon;
+        return weapon && Number.isFinite(rounds) ? [[id, Math.max(0, Math.min(weapon.magSize, Math.floor(rounds!)))]] : [];
+      })) as Partial<Record<ItemId, number>>,
       reloadUntil: 0,
       reloadTarget: null,
       lastAttackAt: 0,
+      lastExhaustedAttackToastAt: 0,
       lastHitAt: 0,
       lastSwingAt: 0,
       kills,
@@ -587,12 +1227,22 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       lastStationMask: -1,
       armorDur: (row?.armorDur as ServerPlayer['armorDur']) ?? {},
       appearance: row?.appearance ?? appearance,
+      friendUserIds: new Set(social.friendIds),
+      clanId: social.clan?.id ?? null,
+      clanName: social.clan?.name ?? null,
+      clanTag: social.clan?.tag ?? null,
+      clanRank: social.clan?.rank ?? null,
+      clanMateIds: new Set(social.clanMateIds),
+      admin: access.admin,
+      adminMode: false,
+      mutedUntil: access.mutedUntil,
     };
     this.players.set(sid, p);
+    if (!row && money > 0) this.telemetry.record({ kind: 'currency_spawned', userId, credits: money, source: 'starter_profile' });
     home.players++;
     void this.io?.sockets.sockets.get(sid)?.join(home.id);
     this.pushInventory(p);
-    this.toast(sid, 'Welcome home — step on the mat to deploy into the zone');
+    this.toast(sid, 'Welcome home — press E at the door mat when you are ready to deploy');
     this.log.log(`${name} joined (${this.players.size} online)`);
     return this.initFor(home, sid);
   }
@@ -612,18 +1262,73 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       await this.saveProfileOf(p);
       return; // stays in this.players; the tick finalizes it later
     }
-    this.finalizePlayerExit(p);
-    await this.saveProfileOf(p);
+    p.input = { up: false, down: false, left: false, right: false, angle: p.angle, shoot: false };
+    p.action = null;
+    await this.finalizePlayerExitWithLease(p);
   }
 
-  /** Fully remove a player from the sim (safe exit, or after the combat-log timer). */
+  /** Release a lease claimed during admission if loading the player failed. */
+  async abandonPlayerAdmission(userId: string, sid: string, guest = false) {
+    if (!guest && !this.players.has(sid)) await this.db.releasePlayerWorldLease(userId, sid);
+  }
+
+  private async finalizePlayerExitWithLease(p: ServerPlayer) {
+    if (this.isBot(p) || p.guest) {
+      this.finalizePlayerExit(p);
+      return;
+    }
+    const pending = this.playerExitPromises.get(p.userId);
+    if (pending) return pending;
+    const connectionId = p.sid;
+    this.exitingPlayers.add(connectionId);
+    const exit = (async () => {
+      try {
+        await this.saveProfileOf(p, connectionId);
+        await this.evictPersonalHideoutVisitors(p.userId);
+        this.finalizePlayerExit(p);
+        await this.db.releasePlayerWorldLease(p.userId, connectionId);
+      } finally {
+        this.exitingPlayers.delete(connectionId);
+      }
+    })();
+    this.playerExitPromises.set(p.userId, exit);
+    try {
+      await exit;
+    } finally {
+      if (this.playerExitPromises.get(p.userId) === exit) this.playerExitPromises.delete(p.userId);
+    }
+  }
+
+  private async evictPersonalHideoutVisitors(ownerId: string) {
+    const hideoutId = `h:${ownerId}`;
+    const visitors = [...this.players.values()].filter((visitor) =>
+      !this.isBot(visitor) && visitor.userId !== ownerId && visitor.instanceId === hideoutId,
+    );
+    for (const visitor of visitors) {
+      if (visitor.returnPos) {
+        const world = this.instances.get(WORLD)!;
+        const position = visitor.returnPos;
+        visitor.returnPos = null;
+        this.switchInstance(visitor, world, position.x, position.y);
+      } else {
+        const home = await this.hideoutInstance(visitor.userId);
+        this.switchInstance(visitor, home, home.spawns[0].x, home.spawns[0].y);
+      }
+      this.toast(visitor.sid, 'Camp visit ended because the owner went offline');
+    }
+  }
+
+  /** Fully remove a player from the sim after a safe exit or body resolution. */
   private finalizePlayerExit(p: ServerPlayer) {
     if (!this.players.has(p.sid)) return;
     this.players.delete(p.sid);
     const inst = this.instances.get(p.instanceId);
     if (inst) {
       inst.players = Math.max(0, inst.players - 1);
-      if (inst.kind === 'hideout' && inst.players === 0) this.instances.delete(inst.id);
+      if (inst.kind !== 'world' && inst.players === 0) {
+        this.instances.delete(inst.id);
+        if (inst.clanId) void this.db.releaseClanHideoutLease(inst.clanId);
+      }
       for (const e of inst.enemies.values()) if (e.targetSid === p.sid) e.targetSid = null;
     }
     this.log.log(`${p.name} left (${this.players.size} online)`);
@@ -635,8 +1340,534 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   }
 
   private firstWeaponSlot(inv: Inventory): number | null {
-    const i = inv.slots.findIndex((s) => s && (ITEMS[s.id].kind === 'weapon' || ITEMS[s.id].kind === 'tool'));
+    const i = inv.slots.findIndex((s) => s && (this.content.item(s.id).kind === 'weapon' || this.content.item(s.id).kind === 'tool'));
     return i >= 0 ? i : null;
+  }
+
+  private botHasCampBuild(inst: Instance, bot: ServerBotState, type: BuildType, radiusTiles = 4): boolean {
+    const centerX = Math.floor(bot.campX / TILE);
+    const centerY = Math.floor(bot.campY / TILE);
+    const targetTile = BUILDABLES[type]?.tile ?? null;
+    const targetBlockId = this.content.playerBlock(type)?.id;
+    for (let ty = centerY - radiusTiles; ty <= centerY + radiusTiles; ty++)
+      for (let tx = centerX - radiusTiles; tx <= centerX + radiusTiles; tx++) {
+        if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) continue;
+        const index = ty * inst.w + tx;
+        if (targetTile !== null && inst.tiles[index] === targetTile) return true;
+        if (targetBlockId && inst.blockKinds[String(index)] === targetBlockId) return true;
+      }
+    return false;
+  }
+
+  private botFindBuildTile(inst: Instance, bot: ServerBotState, type: BuildType): { tx: number; ty: number } | null {
+    const centerX = Math.floor(bot.campX / TILE);
+    const centerY = Math.floor(bot.campY / TILE);
+    const offsets: readonly [number, number][] =
+      type === 'workbench' ? [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1]]
+      : type === 'firepit' ? [[1, 1], [-1, 1], [1, -1], [-1, -1], [2, 0], [0, 2], [-2, 0], [0, -2]]
+      : [[2, 0], [-2, 0], [0, 2], [0, -2], [2, 1], [-2, -1], [1, 2], [-1, -2], [2, 2], [-2, 2], [2, -2], [-2, -2]];
+    for (const [dx, dy] of offsets) {
+      const tx = centerX + dx;
+      const ty = centerY + dy;
+      if (tx < 1 || ty < 1 || tx >= inst.w - 1 || ty >= inst.h - 1) continue;
+      const index = ty * inst.w + tx;
+      const tile = inst.tiles[index];
+      if (tile !== Tile.Grass && !FLOOR_TILES[tile]) continue;
+      if (this.isSafeAt(inst, (tx + 0.5) * TILE, (ty + 0.5) * TILE)) continue;
+      let occupied = false;
+      for (const container of inst.containers.values()) {
+        if (Math.floor(container.x / TILE) === tx && Math.floor(container.y / TILE) === ty) { occupied = true; break; }
+      }
+      if (occupied) continue;
+      return { tx, ty };
+    }
+    return null;
+  }
+
+  private botInventoryCount(p: ServerPlayer, id: string): number {
+    return this.countItem(p.inv, id);
+  }
+
+  private botFindSlot(p: ServerPlayer, predicate: (slot: NonNullable<InvSlot>, index: number) => boolean): number {
+    for (let index = 0; index < p.inv.slots.length; index++) {
+      const slot = p.inv.slots[index];
+      if (slot && predicate(slot, index)) return index;
+    }
+    return -1;
+  }
+
+  private botHasRangedAmmo(p: ServerPlayer, weaponId: ItemId): boolean {
+    const def = this.content.item(weaponId);
+    if (!def.weapon) return false;
+    return (p.mags[weaponId] ?? 0) > 0 || this.countItem(p.inv, def.weapon.ammo) > 0;
+  }
+
+  private botBestCombatSlot(p: ServerPlayer, dist: number): number | null {
+    let bestRanged: { slot: number; score: number } | null = null;
+    let bestMelee: { slot: number; score: number } | null = null;
+    for (let index = 0; index < p.inv.slots.length; index++) {
+      const slot = p.inv.slots[index];
+      if (!slot) continue;
+      const def = this.content.item(slot.id);
+      if (def.weapon && this.botHasRangedAmmo(p, slot.id)) {
+        const score = def.weapon.damage * Math.max(1, def.weapon.pellets) + def.weapon.range / 18;
+        if (!bestRanged || score > bestRanged.score) bestRanged = { slot: index, score };
+      }
+      if (def.melee) {
+        const score = def.melee.damage * 2 + def.melee.range + def.melee.wood + def.melee.stone;
+        if (!bestMelee || score > bestMelee.score) bestMelee = { slot: index, score };
+      }
+    }
+    if (dist > 92) return bestRanged?.slot ?? bestMelee?.slot ?? null;
+    if (bestMelee && (!bestRanged || bestMelee.score >= bestRanged.score * 0.7)) return bestMelee.slot;
+    return bestRanged?.slot ?? bestMelee?.slot ?? null;
+  }
+
+  private botBestHarvestSlot(p: ServerPlayer, skill: 'woodcutting' | 'mining'): number | null {
+    let best: { slot: number; score: number } | null = null;
+    for (let index = 0; index < p.inv.slots.length; index++) {
+      const slot = p.inv.slots[index];
+      if (!slot) continue;
+      const melee = this.content.item(slot.id).melee;
+      if (!melee) continue;
+      const score = skill === 'woodcutting' ? melee.wood : melee.stone;
+      if (score <= 0) continue;
+      if (!best || score > best.score) best = { slot: index, score };
+    }
+    return best?.slot ?? null;
+  }
+
+  private botStop(p: ServerPlayer) {
+    p.input = { up: false, down: false, left: false, right: false, angle: p.angle, shoot: false, sprint: false };
+  }
+
+  private botMoveToward(p: ServerPlayer, x: number, y: number, sprint = true) {
+    const dx = x - p.x;
+    const dy = y - p.y;
+    const dist = Math.hypot(dx, dy);
+    const angle = Math.atan2(dy, dx);
+    if (dist < 10) {
+      this.botStop(p);
+      p.input.angle = angle;
+      return;
+    }
+    p.input = {
+      up: dy < -6,
+      down: dy > 6,
+      left: dx < -6,
+      right: dx > 6,
+      angle,
+      shoot: false,
+      sprint: sprint && dist > 220 && p.stamina > 35,
+    };
+  }
+
+  private botMoveAway(p: ServerPlayer, x: number, y: number) {
+    const away = Math.atan2(p.y - y, p.x - x);
+    p.input = {
+      up: Math.sin(away) < -0.2,
+      down: Math.sin(away) > 0.2,
+      left: Math.cos(away) < -0.2,
+      right: Math.cos(away) > 0.2,
+      angle: Math.atan2(y - p.y, x - p.x),
+      shoot: false,
+      sprint: p.stamina > 20,
+    };
+  }
+
+  private botPickupGround(p: ServerPlayer, inst: Instance, ground: GroundItem): boolean {
+    const leftover = this.addItem(p.inv, ground.item, ground.qty, ground.dur);
+    if (leftover === ground.qty) return false;
+    if (leftover > 0) ground.qty = leftover;
+    else inst.ground.delete(ground.id);
+    this.pushInventory(p);
+    return true;
+  }
+
+  private botManageEquipment(p: ServerPlayer) {
+    const backpackSlot = this.botFindSlot(p, (slot) => this.content.item(slot.id).kind === 'backpack' && (this.content.item(slot.id).backpackTier ?? -1) > p.inv.backpack);
+    if (backpackSlot >= 0) {
+      this.invUse(p.sid, backpackSlot);
+      return;
+    }
+    for (const piece of ['helmet', 'vest'] as const) {
+      const current = p.equipment[piece] ? this.content.item(p.equipment[piece]!).armor?.reduction ?? 0 : 0;
+      const slot = this.botFindSlot(
+        p,
+        (entry) => Boolean(this.content.item(entry.id).armor && this.content.item(entry.id).armor!.piece === piece && (this.content.item(entry.id).armor!.reduction > current)),
+      );
+      if (slot >= 0) {
+        this.invUse(p.sid, slot);
+        return;
+      }
+    }
+    if (!p.equipment.mod) {
+      const slot = this.botFindSlot(p, (entry) => entry.id === 'attach_reddot' || entry.id === 'attach_suppressor');
+      if (slot >= 0) this.invUse(p.sid, slot);
+    }
+  }
+
+  private botTrySelfCare(p: ServerPlayer, inst: Instance, now: number): boolean {
+    if (!this.isBot(p) || now < p.bot.nextUtilityAt) return false;
+    this.botManageEquipment(p);
+    const healSlot = this.botFindSlot(p, (slot) => Boolean(this.content.item(slot.id).heal));
+    if (p.hp <= 55 && healSlot >= 0) {
+      this.invUse(p.sid, healSlot);
+      p.bot.nextUtilityAt = now + BOT_SELF_CARE_MS;
+      return true;
+    }
+    const thirstSlot = this.botFindSlot(p, (slot) => Boolean(this.content.item(slot.id).drink));
+    if (p.thirst <= 45 && thirstSlot >= 0) {
+      this.invUse(p.sid, thirstSlot);
+      p.bot.nextUtilityAt = now + BOT_SELF_CARE_MS;
+      return true;
+    }
+    const foodSlot = this.botFindSlot(p, (slot) => Boolean(this.content.item(slot.id).food) && !this.content.item(slot.id).raw);
+    if (p.hunger <= 55 && foodSlot >= 0) {
+      this.invUse(p.sid, foodSlot);
+      p.bot.nextUtilityAt = now + BOT_SELF_CARE_MS;
+      return true;
+    }
+    const cookSlot = this.botFindSlot(p, (slot) => Boolean(this.content.item(slot.id).raw));
+    if (cookSlot >= 0 && p.hunger <= 80) {
+      const firepit = this.nearestStationIndex(p, 'firepit');
+      if (firepit !== null) {
+        if ((inst.stationFuel.get(firepit) ?? 0) < STATION_FUEL_PER_ACTION && this.botInventoryCount(p, 'wood') > 0) {
+          this.addStationFuel(p.sid, firepit, 1);
+        }
+        if ((inst.stationFuel.get(firepit) ?? 0) >= STATION_FUEL_PER_ACTION) this.invUse(p.sid, cookSlot);
+        p.bot.nextUtilityAt = now + BOT_SELF_CARE_MS;
+        return true;
+      }
+    }
+    if (p.thirst <= 38 && this.nearTile(p, Tile.Water, 2) && !p.action) {
+      this.startAction(p, 'drink', 'Drinking…', DRINK_TIME_MS);
+      p.bot.nextUtilityAt = now + BOT_SELF_CARE_MS;
+      return true;
+    }
+    return false;
+  }
+
+  private botTryTrade(p: ServerPlayer, now: number): boolean {
+    if (!this.isBot(p) || now < p.bot.nextTradeAt) return false;
+    const trader = this.traderAt(p);
+    if (!trader) return false;
+    const stock = this.content.traderStock(trader.tier ?? 1);
+    const sellSlot = this.botFindSlot(p, (slot) => {
+      const entry = stock.find((row) => row.id === slot.id && row.sell > 0);
+      if (!entry) return false;
+      return ['gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact'].includes(slot.id) || slot.qty >= Math.max(4, Math.ceil((this.content.item(slot.id).stack ?? 1) * 0.5));
+    });
+    if (sellSlot >= 0) {
+      const stack = p.inv.slots[sellSlot];
+      if (stack) this.tradeSell(p.sid, sellSlot, stack.qty);
+      p.bot.nextTradeAt = now + BOT_TRADE_COOLDOWN_MS;
+      return true;
+    }
+    if (this.botInventoryCount(p, 'bandage') === 0 && p.money >= 15 && stock.some((row) => row.id === 'bandage' && row.buy > 0)) {
+      this.tradeBuy(p.sid, 'bandage', 1);
+      p.bot.nextTradeAt = now + BOT_TRADE_COOLDOWN_MS;
+      return true;
+    }
+    const equipped = p.equipped !== null ? p.inv.slots[p.equipped] : null;
+    const ammo = equipped?.id && this.content.item(equipped.id).weapon ? this.content.item(equipped.id).weapon!.ammo : null;
+    if (ammo && this.botInventoryCount(p, ammo) < 18) {
+      const ammoEntry = stock.find((row) => row.id === ammo && row.buy > 0);
+      if (ammoEntry && p.money >= ammoEntry.buy * 6) {
+        this.tradeBuy(p.sid, ammo, 6);
+        p.bot.nextTradeAt = now + BOT_TRADE_COOLDOWN_MS;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private botTryCraft(p: ServerPlayer, inst: Instance, now: number): boolean {
+    if (!this.isBot(p) || p.action) return false;
+    const weaponSlot = this.botFindSlot(p, (slot) => this.content.item(slot.id).kind === 'weapon' || this.content.item(slot.id).kind === 'tool');
+    const hasWorkbench = this.botHasCampBuild(inst, p.bot, 'workbench');
+    const hasFirepit = this.botHasCampBuild(inst, p.bot, 'firepit');
+    const craftIfPossible = (recipeId: string) => {
+      this.craft(p.sid, recipeId);
+      p.bot.nextUtilityAt = now + BOT_SELF_CARE_MS;
+    };
+
+    if (this.botInventoryCount(p, 'bandage') === 0 && this.botInventoryCount(p, 'cloth') >= 2) {
+      craftIfPossible('craft_bandage');
+      return true;
+    }
+    if (weaponSlot < 0 && this.botInventoryCount(p, 'wood') >= 4 && this.botInventoryCount(p, 'stone') >= 1) {
+      craftIfPossible('craft_spear');
+      return true;
+    }
+    if (!hasWorkbench && this.botInventoryCount(p, 'kit_workbench') === 0 && this.botInventoryCount(p, 'wood') >= 8 && this.botInventoryCount(p, 'scrap') >= 4) {
+      craftIfPossible('craft_workbench');
+      return true;
+    }
+    if (!hasFirepit && this.botInventoryCount(p, 'kit_firepit') === 0 && this.botInventoryCount(p, 'wood') >= 6 && this.botInventoryCount(p, 'stone') >= 4) {
+      craftIfPossible('craft_firepit');
+      return true;
+    }
+    if (this.nearStation(p, 'workbench')) {
+      if (this.botFindSlot(p, (slot) => slot.id === 'axe' || slot.id === 'steel_axe') < 0 && this.botInventoryCount(p, 'wood') >= 5 && this.botInventoryCount(p, 'stone') >= 3) {
+        craftIfPossible('craft_axe');
+        return true;
+      }
+      if (this.botFindSlot(p, (slot) => slot.id === 'pickaxe' || slot.id === 'steel_pickaxe') < 0 && this.botInventoryCount(p, 'wood') >= 5 && this.botInventoryCount(p, 'stone') >= 3) {
+        craftIfPossible('craft_pickaxe');
+        return true;
+      }
+    }
+    if (p.bot.buildDrive > 0.45 && now >= p.bot.nextBuildAt) {
+      if (this.botInventoryCount(p, 'kit_fence') < 2 && this.botInventoryCount(p, 'wood') >= 6) {
+        craftIfPossible('craft_fence');
+        return true;
+      }
+      if (this.botInventoryCount(p, 'kit_torch') === 0 && this.botInventoryCount(p, 'wood') >= 2 && this.botInventoryCount(p, 'cloth') >= 1) {
+        craftIfPossible('craft_torch');
+        return true;
+      }
+      if (this.botInventoryCount(p, 'kit_wall') === 0 && this.botInventoryCount(p, 'wood') >= 6 && this.botInventoryCount(p, 'stone') >= 2) {
+        craftIfPossible('craft_wall');
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private botTryBuild(p: ServerPlayer, inst: Instance, now: number): boolean {
+    if (!this.isBot(p) || now < p.bot.nextBuildAt) return false;
+    const priorities = [
+      ...(this.botHasCampBuild(inst, p.bot, 'workbench') ? [] : ['workbench']),
+      ...(this.botHasCampBuild(inst, p.bot, 'firepit') ? [] : ['firepit']),
+      ...(p.bot.buildDrive > 0.6 ? ['fence', 'torch', 'wall'] : []),
+    ] as BuildType[];
+    for (const type of priorities) {
+      const slot = this.botFindSlot(p, (entry) => this.content.item(entry.id).place === type);
+      if (slot < 0) continue;
+      const tile = this.botFindBuildTile(inst, p.bot, type);
+      if (!tile) continue;
+      const targetX = (tile.tx + 0.5) * TILE;
+      const targetY = (tile.ty + 0.5) * TILE;
+      if (Math.hypot(targetX - p.x, targetY - p.y) > TILE * 3.5) {
+        this.botMoveToward(p, targetX, targetY);
+        return true;
+      }
+      this.build(p.sid, slot, tile.tx, tile.ty, Math.floor(this.rnd() * 4));
+      p.bot.nextBuildAt = now + BOT_BUILD_COOLDOWN_MS + Math.floor(this.rnd() * 6000);
+      return true;
+    }
+    return false;
+  }
+
+  private botChoosePlayerTarget(p: ServerPlayer, inst: Instance, now: number): ServerPlayer | null {
+    if (!this.isBot(p)) return null;
+    if (p.hp < 25 && now - p.lastHitAt > 2500) return null;
+    const willing = p.bot.aggression > 0.58 || now - p.lastHitAt < 4000;
+    if (!willing) return null;
+    let best: ServerPlayer | null = null;
+    let bestDist = 360 + p.bot.aggression * 140;
+    for (const other of this.players.values()) {
+      if (other.sid === p.sid || other.dead || other.instanceId !== inst.id) continue;
+      if (this.isSafeAt(inst, other.x, other.y)) continue;
+      const dist = Math.hypot(other.x - p.x, other.y - p.y);
+      if (dist >= bestDist) continue;
+      if (dist > GameService.SENSE_RANGE && !this.losClear(inst, p.x, p.y, other.x, other.y)) continue;
+      best = other;
+      bestDist = dist;
+    }
+    return best;
+  }
+
+  private botChooseEnemyTarget(p: ServerPlayer, inst: Instance): Enemy | null {
+    if (!this.isBot(p)) return null;
+    let best: Enemy | null = null;
+    let bestDist = Infinity;
+    for (const enemy of inst.enemies.values()) {
+      const dist = Math.hypot(enemy.x - p.x, enemy.y - p.y);
+      const def = this.content.enemy(enemy.kind);
+      const urgent = enemy.targetSid === p.sid || (def.behavior !== 'flee' && dist < 120);
+      const hunt = def.behavior === 'flee' ? p.hunger < 78 || p.bot.greed > 0.6 : p.hp > 55 && p.bot.aggression > 0.3;
+      if (!urgent && !hunt) continue;
+      if (dist > (def.behavior === 'flee' ? 260 : 180)) continue;
+      if (dist > GameService.SENSE_RANGE && !this.losClear(inst, p.x, p.y, enemy.x, enemy.y)) continue;
+      if (dist < bestDist) {
+        best = enemy;
+        bestDist = dist;
+      }
+    }
+    return best;
+  }
+
+  private botFindLootTarget(inst: Instance, p: ServerPlayer): GroundItem | Container | null {
+    const packed = p.inv.slots.every(Boolean) || invWeight(p.inv, this.content.items) >= invCapacity(p.inv).maxKg * 0.95;
+    if (packed && !this.traderAt(p)) return null;
+    let bestGround: GroundItem | null = null;
+    let bestGroundDist = 220;
+    for (const ground of inst.ground.values()) {
+      const dist = Math.hypot(ground.x - p.x, ground.y - p.y);
+      if (dist < bestGroundDist) {
+        bestGround = ground;
+        bestGroundDist = dist;
+      }
+    }
+    if (bestGround) return bestGround;
+    let bestContainer: Container | null = null;
+    let bestContainerDist = 260;
+    for (const container of inst.containers.values()) {
+      if (container.kind === 'storage' || container.slots.every((slot) => !slot)) continue;
+      const dist = Math.hypot(container.x - p.x, container.y - p.y);
+      if (dist < bestContainerDist) {
+        bestContainer = container;
+        bestContainerDist = dist;
+      }
+    }
+    return bestContainer;
+  }
+
+  private botFindHarvestNode(inst: Instance, p: ServerPlayer): { x: number; y: number; skill: 'woodcutting' | 'mining' } | null {
+    const wantWood = this.botInventoryCount(p, 'wood') < 14 || this.botInventoryCount(p, 'kit_workbench') > 0 || this.botInventoryCount(p, 'kit_firepit') > 0;
+    const wantStone = this.botInventoryCount(p, 'stone') < 12 || this.botInventoryCount(p, 'kit_firepit') > 0 || this.botInventoryCount(p, 'kit_wall') > 0;
+    const preferred: ('woodcutting' | 'mining')[] = wantWood && (!wantStone || this.botInventoryCount(p, 'wood') <= this.botInventoryCount(p, 'stone'))
+      ? ['woodcutting', 'mining']
+      : ['mining', 'woodcutting'];
+    const tx = Math.floor(p.x / TILE);
+    const ty = Math.floor(p.y / TILE);
+    for (const skill of preferred) {
+      let best: { x: number; y: number; skill: 'woodcutting' | 'mining' } | null = null;
+      let bestDist = 9999;
+      for (let y = ty - 18; y <= ty + 18; y++)
+        for (let x = tx - 18; x <= tx + 18; x++) {
+          if (x < 0 || y < 0 || x >= inst.w || y >= inst.h) continue;
+          const index = y * inst.w + x;
+          const tile = inst.tiles[index] as Tile;
+          const resource = this.content.resource(inst.resourceKinds[String(index)]);
+          const nodeSkill = resource?.skill ?? (tile === Tile.Tree ? 'woodcutting' : tile === Tile.Rock || tile === Tile.CopperOre || tile === Tile.IronOre ? 'mining' : null);
+          if (nodeSkill !== skill) continue;
+          const hits = resource?.maxHits ?? NODE_HITS[tile];
+          if (!hits) continue;
+          const px = (x + 0.5) * TILE;
+          const py = (y + 0.5) * TILE;
+          const dist = Math.hypot(px - p.x, py - p.y);
+          if (dist < bestDist) {
+            best = { x: px, y: py, skill };
+            bestDist = dist;
+          }
+        }
+      if (best) return best;
+    }
+    return null;
+  }
+
+  private botFightTarget(p: ServerPlayer, x: number, y: number) {
+    const dist = Math.hypot(x - p.x, y - p.y);
+    const slot = this.botBestCombatSlot(p, dist);
+    if (slot !== null && p.equipped !== slot) this.invEquip(p.sid, slot);
+    const held = p.equipped !== null ? p.inv.slots[p.equipped] : null;
+    const weapon = held ? this.content.item(held.id) : null;
+    const isRanged = Boolean(held && weapon?.weapon && this.botHasRangedAmmo(p, held.id));
+    const range = weapon?.weapon?.range ?? (weapon?.melee?.range ?? FISTS.range) + PLAYER_RADIUS + 6;
+    if (isRanged && dist < 86) this.botMoveAway(p, x, y);
+    else if (dist > Math.min(range * 0.75, 240)) this.botMoveToward(p, x, y, true);
+    else this.botStop(p);
+    p.input.angle = Math.atan2(y - p.y, x - p.x);
+    p.input.shoot = true;
+  }
+
+  private botRespawn(p: ServerPlayer) {
+    if (!this.isBot(p)) return;
+    const world = this.instances.get(WORLD)!;
+    p.hp = PLAYER_MAX_HP;
+    p.dead = false;
+    p.inv = this.botStarterInventory();
+    p.equipment = { helmet: null, vest: null, mod: null };
+    p.equipped = this.firstWeaponSlot(p.inv);
+    p.mags = {};
+    p.hunger = 75 + Math.floor(this.rnd() * 25);
+    p.thirst = 75 + Math.floor(this.rnd() * 25);
+    p.stamina = STAMINA_MAX;
+    p.staminaExhausted = false;
+    p.action = null;
+    p.reloadTarget = null;
+    p.reloadUntil = 0;
+    p.loggedOutAt = null;
+    p.bot.respawnAt = 0;
+    this.resetBotWorldPosition(p, world);
+  }
+
+  private updateBot(p: ServerPlayer, inst: Instance, now: number) {
+    if (!this.isBot(p) || inst.kind !== 'world') return;
+    this.botStop(p);
+    if (p.action) return;
+    if (this.botTrySelfCare(p, inst, now)) return;
+    const playerTarget = this.botChoosePlayerTarget(p, inst, now);
+    if (playerTarget) {
+      this.botFightTarget(p, playerTarget.x, playerTarget.y);
+      return;
+    }
+    const enemyTarget = this.botChooseEnemyTarget(p, inst);
+    if (enemyTarget) {
+      this.botFightTarget(p, enemyTarget.x, enemyTarget.y);
+      return;
+    }
+    const lootTarget = this.botFindLootTarget(inst, p);
+    if (lootTarget) {
+      if ('item' in lootTarget) {
+        if (Math.hypot(lootTarget.x - p.x, lootTarget.y - p.y) <= INTERACT_RANGE) {
+          if (this.botPickupGround(p, inst, lootTarget)) p.bot.nextUtilityAt = now + 250;
+          return;
+        }
+        this.botMoveToward(p, lootTarget.x, lootTarget.y);
+        return;
+      }
+      if (Math.hypot(lootTarget.x - p.x, lootTarget.y - p.y) <= INTERACT_RANGE * 1.25) {
+        const slot = lootTarget.slots.findIndex((entry) => !!entry);
+        if (slot >= 0) {
+          this.containerTake(p.sid, lootTarget.id, slot);
+          p.bot.nextUtilityAt = now + 250;
+          return;
+        }
+      }
+      this.botMoveToward(p, lootTarget.x, lootTarget.y);
+      return;
+    }
+    if (this.botTryTrade(p, now)) return;
+    if (this.botTryBuild(p, inst, now)) return;
+    if (this.botTryCraft(p, inst, now)) return;
+    const harvest = this.botFindHarvestNode(inst, p);
+    if (harvest) {
+      const harvestSlot = this.botBestHarvestSlot(p, harvest.skill);
+      if (harvestSlot !== null && p.equipped !== harvestSlot) this.invEquip(p.sid, harvestSlot);
+      else if (harvestSlot === null && p.equipped !== null && (!p.inv.slots[p.equipped] || !this.content.item(p.inv.slots[p.equipped]!.id).melee)) p.equipped = null;
+      const dist = Math.hypot(harvest.x - p.x, harvest.y - p.y);
+      if (dist > 52) this.botMoveToward(p, harvest.x, harvest.y, false);
+      else this.botStop(p);
+      p.input.angle = Math.atan2(harvest.y - p.y, harvest.x - p.x);
+      p.input.shoot = true;
+      return;
+    }
+    if (p.thirst < 45 && this.nearTile(p, Tile.Water, 8)) {
+      for (let ty = Math.max(0, Math.floor(p.y / TILE) - 8); ty <= Math.min(inst.h - 1, Math.floor(p.y / TILE) + 8); ty++)
+        for (let tx = Math.max(0, Math.floor(p.x / TILE) - 8); tx <= Math.min(inst.w - 1, Math.floor(p.x / TILE) + 8); tx++)
+          if (inst.tiles[ty * inst.w + tx] === Tile.Water) {
+            this.botMoveToward(p, (tx + 0.5) * TILE, (ty + 0.5) * TILE, false);
+            return;
+          }
+    }
+    if (now >= p.bot.roamUntil || Math.hypot(p.bot.roamX - p.x, p.bot.roamY - p.y) < TILE * 1.2) {
+      const choices = [
+        ...inst.lootSpots.map((spot) => ({ x: spot.x, y: spot.y })),
+        ...inst.spawns.map((spot) => ({ x: spot.x, y: spot.y })),
+        ...inst.traders.map((spot) => ({ x: spot.x, y: spot.y })),
+        ...inst.pois.map((poi) => ({ x: poi.x, y: poi.y })),
+        { x: p.bot.campX, y: p.bot.campY },
+      ];
+      const next = choices[Math.floor(this.rnd() * choices.length)] ?? { x: p.bot.campX, y: p.bot.campY };
+      p.bot.roamX = next.x + (this.rnd() - 0.5) * TILE * 3;
+      p.bot.roamY = next.y + (this.rnd() - 0.5) * TILE * 3;
+      p.bot.roamUntil = now + 5000 + Math.floor(this.rnd() * 9000);
+    }
+    this.botMoveToward(p, p.bot.roamX, p.bot.roamY);
   }
 
   // ── input & interactions ──────────────────────────────────────────────────
@@ -664,7 +1895,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const inst = this.inst(p);
 
     // hideout exit mat
-    if (inst.kind === 'hideout' && inst.exit && Math.hypot(inst.exit.x - p.x, inst.exit.y - p.y) < INTERACT_RANGE) {
+    if (inst.kind !== 'world' && inst.exit && Math.hypot(inst.exit.x - p.x, inst.exit.y - p.y) < INTERACT_RANGE) {
       this.leaveHideout(sid);
       return;
     }
@@ -678,6 +1909,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     // extraction beacon — hold still to go home with the loot (not from safety)
     for (const ex of inst.extracts) {
       if (Math.hypot(ex.x - p.x, ex.y - p.y) < INTERACT_RANGE) {
+        if (p.guest) {
+          this.toast(sid, 'Guest raids cannot extract — register to secure loot and unlock a hideout');
+          return;
+        }
         if (this.isSafeAt(inst, p.x, p.y)) {
           this.toast(sid, 'You cannot extract from inside a safe zone');
           return;
@@ -694,26 +1929,21 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (d < bestD) { best = c; bestD = d; }
     }
     // nearest placed station tile (firepit / furnace / workbench)
-    const STATION_TILES: Partial<Record<number, BuildType>> = {
-      [Tile.Firepit]: 'firepit',
-      [Tile.Furnace]: 'furnace',
-      [Tile.Workbench]: 'workbench',
-      [Tile.Anvil]: 'anvil',
-    };
-    let station: BuildType | null = null;
+    let station: CraftingStation | null = null;
+    let stationIndex = -1;
     let stationD = INTERACT_RANGE;
     const ptx = Math.floor(p.x / TILE);
     const pty = Math.floor(p.y / TILE);
     for (let ty = pty - 2; ty <= pty + 2; ty++)
       for (let tx = ptx - 2; tx <= ptx + 2; tx++) {
         if (tx < 0 || ty < 0 || tx >= inst.w || ty >= inst.h) continue;
-        const st = STATION_TILES[inst.tiles[ty * inst.w + tx]];
+        const st = this.stationAtIndex(inst, ty * inst.w + tx);
         if (!st) continue;
         const d = Math.hypot((tx + 0.5) * TILE - p.x, (ty + 0.5) * TILE - p.y);
-        if (d < stationD) { station = st; stationD = d; }
+        if (d < stationD) { station = st; stationIndex = ty * inst.w + tx; stationD = d; }
       }
     if (station && stationD < bestD) {
-      this.emitTo(sid, EV.station, { type: station } satisfies StationOpen);
+      this.emitTo(sid, EV.station, this.stationPayload(inst, station, stationIndex));
       return;
     }
     if (best) {
@@ -733,17 +1963,17 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (d < bestD) { bestG = g; bestD = d; }
     }
     if (bestG) {
-      const leftover = this.addItem(p.inv, bestG.item, bestG.qty);
+      const leftover = this.addItem(p.inv, bestG.item, bestG.qty, bestG.dur);
       if (leftover === bestG.qty) {
         this.toast(sid, 'Inventory full');
         return;
       }
       if (leftover > 0) {
         bestG.qty = leftover;
-        this.toast(sid, `Picked up some ${ITEMS[bestG.item].name} (bag full)`);
+        this.toast(sid, `Picked up some ${this.content.item(bestG.item).name} (bag full)`);
       } else {
         inst.ground.delete(bestG.id);
-        this.toast(sid, `Picked up ${ITEMS[bestG.item].name} x${bestG.qty}`);
+        this.toast(sid, `Picked up ${this.content.item(bestG.item).name} x${bestG.qty}`);
       }
       this.pushInventory(p);
       return;
@@ -767,12 +1997,108 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     return false;
   }
 
+  /** Resolve station behavior from either the compatibility tile or a published player block. */
+  private stationAtIndex(inst: Instance, index: number): CraftingStation | null {
+    const blockType = this.content.block(inst.blockKinds[String(index)])?.playerPlacement?.buildType;
+    if (blockType === 'workbench' || blockType === 'firepit' || blockType === 'furnace' || blockType === 'anvil') return blockType;
+    const tile = inst.tiles[index];
+    if (tile === Tile.Workbench) return 'workbench';
+    if (tile === Tile.Firepit) return 'firepit';
+    if (tile === Tile.Furnace) return 'furnace';
+    if (tile === Tile.Anvil) return 'anvil';
+    return null;
+  }
+
+  private nearestStationIndex(p: ServerPlayer, station: CraftingStation, r = 2): number | null {
+    const inst = this.inst(p);
+    const tx = Math.floor(p.x / TILE);
+    const ty = Math.floor(p.y / TILE);
+    let best: number | null = null;
+    let bestDistance = (r + 0.5) * TILE;
+    for (let y = ty - r; y <= ty + r; y++)
+      for (let x = tx - r; x <= tx + r; x++) {
+        if (x < 0 || y < 0 || x >= inst.w || y >= inst.h) continue;
+        const index = y * inst.w + x;
+        if (this.stationAtIndex(inst, index) !== station) continue;
+        const distance = Math.hypot((x + 0.5) * TILE - p.x, (y + 0.5) * TILE - p.y);
+        if (distance < bestDistance) { best = index; bestDistance = distance; }
+      }
+    return best;
+  }
+
+  private stationPayload(inst: Instance, type: CraftingStation, index: number): StationOpen {
+    if (type !== 'firepit' && type !== 'furnace') return { type, index };
+    return {
+      type,
+      index,
+      fuel: inst.stationFuel.get(index) ?? 0,
+      maxFuel: STATION_FUEL_MAX,
+      fuelPerWood: STATION_FUEL_PER_WOOD,
+    };
+  }
+
+  private persistStationFuel(inst: Instance, index: number) {
+    if (inst.kind === 'world' || !inst.hideout) return;
+    const tx = index % inst.w;
+    const ty = Math.floor(index / inst.w);
+    const object = inst.hideout.objects.find((entry) => entry.tx === tx && entry.ty === ty && (entry.type === 'firepit' || entry.type === 'furnace'));
+    if (!object) return;
+    object.fuel = inst.stationFuel.get(index) ?? 0;
+    this.persistHideout(inst);
+  }
+
+  private consumeStationFuel(inst: Instance, index: number, amount = STATION_FUEL_PER_ACTION): boolean {
+    const current = inst.stationFuel.get(index) ?? 0;
+    const result = consumeFuel(current, amount);
+    if (!result.consumed) return false;
+    const next = result.fuel;
+    if (next > 0) inst.stationFuel.set(index, next);
+    else inst.stationFuel.delete(index);
+    this.io?.to(inst.id).emit(EV.stationFuelUpdate, { i: index, fuel: next });
+    this.persistStationFuel(inst, index);
+    return true;
+  }
+
+  addStationFuel(sid: string, index: number, qty: number) {
+    const p = this.players.get(sid);
+    if (!p || p.dead) return;
+    const inst = this.inst(p);
+    if (index < 0 || index >= inst.w * inst.h) return;
+    const station = this.stationAtIndex(inst, index);
+    if (station !== 'firepit' && station !== 'furnace') return;
+    const x = (index % inst.w + 0.5) * TILE;
+    const y = (Math.floor(index / inst.w) + 0.5) * TILE;
+    if (Math.hypot(x - p.x, y - p.y) > INTERACT_RANGE * 1.5) return;
+    const current = inst.stationFuel.get(index) ?? 0;
+    const addition = planFuelAddition(current, qty, this.countItem(p.inv, 'wood'), STATION_FUEL_MAX, STATION_FUEL_PER_WOOD);
+    if (current >= STATION_FUEL_MAX) {
+      this.toast(sid, 'That station is already full of fuel');
+      return;
+    }
+    const wood = addition.wood;
+    if (wood <= 0) {
+      this.toast(sid, 'You need wood to fuel that station');
+      return;
+    }
+    this.removeItem(p.inv, 'wood', wood);
+    inst.stationFuel.set(index, addition.fuel);
+    this.io?.to(inst.id).emit(EV.stationFuelUpdate, { i: index, fuel: addition.fuel });
+    this.persistStationFuel(inst, index);
+    this.pushInventory(p);
+    this.emitTo(sid, EV.station, this.stationPayload(inst, station, index));
+    this.toast(sid, `Added ${wood} wood to the ${station}`);
+  }
+
+  private nearStation(p: ServerPlayer, station: CraftingStation, r = 2): boolean {
+    return this.nearestStationIndex(p, station, r) !== null;
+  }
+
   private startAction(
     p: ServerPlayer,
     kind: NonNullable<ServerPlayer['action']>['kind'],
     label: string,
     ms: number,
-    data?: { id?: string; slot?: number },
+    data?: { id?: string; slot?: number; station?: number },
   ) {
     if (p.action) return false;
     p.action = { kind, until: Date.now() + ms, data };
@@ -808,10 +2134,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       case 'fill': {
         const slot = act.data?.slot ?? -1;
         const item = p.inv.slots[slot];
-        const fillDef = item ? ITEMS[item.id] : null;
+        const fillDef = item ? this.content.item(item.id) : null;
         if (item && fillDef?.fillFrom) {
-          const filled = ITEMS[fillDef.fillFrom];
-          p.inv.slots[slot] = { id: fillDef.fillFrom, qty: filled.stack };
+          const filled = this.content.item(fillDef.fillFrom);
+          p.inv.slots[slot] = { id: fillDef.fillFrom as ItemId, qty: filled.stack };
           this.toast(p.sid, `${filled.name} filled (${filled.stack} drinks)`);
           this.pushInventory(p);
         }
@@ -819,16 +2145,25 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       }
       case 'cook': {
         const slot = act.data?.slot ?? -1;
+        const station = act.data?.station ?? -1;
         const item = p.inv.slots[slot];
-        const def = item ? ITEMS[item.id] : null;
-        if (item && def?.raw && this.nearTile(p, Tile.Firepit)) {
+        const def = item ? this.content.item(item.id) : null;
+        const stationX = (station % inst.w + 0.5) * TILE;
+        const stationY = (Math.floor(station / inst.w) + 0.5) * TILE;
+        const usable = station >= 0
+          && this.stationAtIndex(inst, station) === 'firepit'
+          && Math.hypot(stationX - p.x, stationY - p.y) <= INTERACT_RANGE * 1.5;
+        if (item && def?.raw && usable && this.consumeStationFuel(inst, station)) {
           item.qty -= 1;
           if (item.qty <= 0) p.inv.slots[slot] = null;
           const leftover = this.addItem(p.inv, def.raw, 1);
           if (leftover > 0) this.dropAt(inst, p.x, p.y + 20, def.raw, 1);
-          this.toast(p.sid, `Cooked ${ITEMS[def.raw].name}`);
+          this.toast(p.sid, `Meal ready: ${this.content.item(def.raw).name}`);
           this.addXp(p, 'crafting', 3);
           this.pushInventory(p);
+          this.emitTo(p.sid, EV.station, this.stationPayload(inst, 'firepit', station));
+        } else if (item && def?.raw && usable) {
+          this.toast(p.sid, 'The fire has gone out — add wood');
         }
         break;
       }
@@ -847,6 +2182,18 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   /** Extraction beacon success: back to your base, loot intact. */
   private async extractHome(p: ServerPlayer) {
     if (p.dead) return;
+    if (p.guest) {
+      this.toast(p.sid, 'Guest raids cannot extract — register to keep progression and build a hideout');
+      return;
+    }
+    const value = this.inventoryValue(p.inv);
+    this.telemetry.record({
+      kind: 'extraction',
+      userId: p.userId,
+      value,
+      source: 'beacon',
+      metadata: { items: p.inv.slots.reduce((count, slot) => count + (slot?.qty ?? 0), 0) },
+    });
     const home = await this.hideoutInstance(p.userId);
     p.returnPos = null;
     this.switchInstance(p, home, home.spawns[0].x, home.spawns[0].y);
@@ -867,8 +2214,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       this.takeNow(p, inst, containerId, slot);
       return;
     }
-    const ms = Math.min(3000, LOOT_TIME_BASE_MS + ITEMS[item.id].kg * item.qty * LOOT_TIME_PER_KG_MS);
-    this.startAction(p, 'loot', `Taking ${ITEMS[item.id].name}…`, ms, { id: containerId, slot });
+    const ms = Math.min(3000, LOOT_TIME_BASE_MS + this.content.item(item.id).kg * item.qty * LOOT_TIME_PER_KG_MS);
+    this.startAction(p, 'loot', `Taking ${this.content.item(item.id).name}…`, ms, { id: containerId, slot });
   }
 
   private takeNow(p: ServerPlayer, inst: Instance, containerId: string, slot: number) {
@@ -876,12 +2223,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (!c || Math.hypot(c.x - p.x, c.y - p.y) > INTERACT_RANGE * 1.5) return;
     const item = c.slots[slot];
     if (!item) return;
-    const leftover = this.addItem(p.inv, item.id, item.qty);
+    const leftover = this.addItem(p.inv, item.id, item.qty, item.dur);
     if (leftover === item.qty) {
       this.toast(p.sid, 'Not enough space or weight');
       return;
     }
-    c.slots[slot] = leftover > 0 ? { id: item.id, qty: leftover } : null;
+    c.slots[slot] = leftover > 0
+      ? { id: item.id, qty: leftover, ...(item.dur !== undefined ? { dur: item.dur } : {}) }
+      : null;
 
     if (c.kind === 'storage') this.persistHideout(inst);
     if (c.slots.every((s) => !s)) {
@@ -889,7 +2238,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         inst.containers.delete(c.id);
         this.io?.to(inst.id).emit(EV.containerGone, c.id);
       } else if (c.kind !== 'storage') {
-        c.restockAt = Date.now() + 180_000;
+        c.restockAt = Date.now() + CHEST_RESTOCK_MS;
       }
     }
     this.pushInventory(p);
@@ -917,7 +2266,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (slot < 0 || slot >= p.inv.slots.length) return;
     const item = p.inv.slots[slot];
     if (!item) return;
-    const def = ITEMS[item.id];
+    const def = this.content.item(item.id);
 
     // dropped onto a specific slot: stack if same item, else swap the two stacks
     if (target >= 0 && target < c.slots.length) {
@@ -928,7 +2277,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         item.qty -= add;
         if (item.qty <= 0) { p.inv.slots[slot] = null; if (p.equipped === slot) p.equipped = null; }
       } else {
-        c.slots[target] = { id: item.id, qty: item.qty };
+        c.slots[target] = { id: item.id, qty: item.qty, ...(item.dur !== undefined ? { dur: item.dur } : {}) };
         p.inv.slots[slot] = dest ?? null;
         if (p.equipped === slot && !p.inv.slots[slot]) p.equipped = null;
       }
@@ -951,7 +2300,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     for (let i = 0; i < c.slots.length && qty > 0; i++) {
       if (!c.slots[i]) {
         const add = Math.min(def.stack, qty);
-        c.slots[i] = { id: item.id, qty: add };
+        c.slots[i] = { id: item.id, qty: add, ...(item.dur !== undefined ? { dur: item.dur } : {}) };
         qty -= add;
       }
     }
@@ -980,8 +2329,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const a = c.slots[from];
     if (!a) return;
     const b = c.slots[to];
-    if (b && b.id === a.id && ITEMS[a.id].stack > 1) {
-      const moved = Math.min(ITEMS[a.id].stack - b.qty, a.qty);
+    if (b && b.id === a.id && this.content.item(a.id).stack > 1) {
+      const moved = Math.min(this.content.item(a.id).stack - b.qty, a.qty);
       b.qty += moved;
       a.qty -= moved;
       if (a.qty <= 0) c.slots[from] = null;
@@ -1006,8 +2355,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const a = s[from];
     const b = s[to];
     if (!a) return;
-    if (b && b.id === a.id && ITEMS[a.id].stack > 1) {
-      const room = ITEMS[a.id].stack - b.qty;
+    if (b && b.id === a.id && this.content.item(a.id).stack > 1) {
+      const room = this.content.item(a.id).stack - b.qty;
       const moved = Math.min(room, a.qty);
       b.qty += moved;
       a.qty -= moved;
@@ -1028,13 +2377,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const item = p.inv.slots[slot];
     if (!item) return;
     const droppedId = item.id;
+    const droppedDur = item.dur;
     const n = Math.max(1, Math.min(Math.floor(qty) || item.qty, item.qty));
     item.qty -= n;
     if (item.qty <= 0) {
       p.inv.slots[slot] = null;
       if (p.equipped === slot) p.equipped = null;
     }
-    this.dropAt(inst, p.x + (this.rnd() - 0.5) * 24, p.y + 20 + this.rnd() * 10, droppedId, n);
+    this.dropAt(inst, p.x + (this.rnd() - 0.5) * 24, p.y + 20 + this.rnd() * 10, droppedId, n, droppedDur);
     this.pushInventory(p);
   }
 
@@ -1044,7 +2394,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (slot < 0 || slot >= p.inv.slots.length) return;
     const item = p.inv.slots[slot];
     if (!item) return;
-    const def = ITEMS[item.id];
+    const def = this.content.item(item.id);
     if (def.kind === 'placeable') {
       // placement is a client-driven flow; nothing to do here
       this.toast(sid, `Hold ${def.name} and click the ground to place it`);
@@ -1065,11 +2415,30 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         }
         p.thirst = Math.min(100, p.thirst + def.drink);
         item.qty -= 1;
-        if (item.qty <= 0) p.inv.slots[slot] = def.emptyTo ? { id: def.emptyTo, qty: 1 } : null;
+        if (item.qty <= 0) p.inv.slots[slot] = def.emptyTo ? { id: def.emptyTo as ItemId, qty: 1 } : null;
         this.toast(sid, `Drank ${def.name} (+${def.drink} thirst)`);
         this.pushInventory(p);
-      } else if (def.raw && this.nearTile(p, Tile.Firepit)) {
-        this.startAction(p, 'cook', `Cooking ${def.name}…`, COOK_TIME_MS, { slot });
+      } else if (def.raw) {
+        const firepit = this.nearestStationIndex(p, 'firepit');
+        if (firepit !== null) {
+          const inst = this.inst(p);
+          if ((inst.stationFuel.get(firepit) ?? 0) < STATION_FUEL_PER_ACTION) {
+            this.toast(sid, 'The firepit needs wood before it can cook');
+            this.emitTo(sid, EV.station, this.stationPayload(inst, 'firepit', firepit));
+            return;
+          }
+          this.startAction(p, 'cook', `Cooking ${def.name}…`, COOK_TIME_MS, { slot, station: firepit });
+        } else if (def.food) {
+          if (p.hunger >= 100) {
+            this.toast(sid, 'You are not hungry');
+            return;
+          }
+          p.hunger = Math.min(100, p.hunger + def.food);
+          item.qty -= 1;
+          if (item.qty <= 0) p.inv.slots[slot] = null;
+          this.toast(sid, `Ate ${def.name} (+${def.food} hunger) — cook it at a fueled firepit for more`);
+          this.pushInventory(p);
+        }
       } else if (def.food) {
         if (p.hunger >= 100) {
           this.toast(sid, 'You are not hungry');
@@ -1105,8 +2474,17 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     } else if (def.kind === 'armor' && def.armor) {
       const piece = def.armor.piece;
       const old = p.equipment[piece];
+      const oldMax = old ? this.content.item(old).durability : undefined;
+      const oldDur = old && oldMax !== undefined ? Math.max(1, Math.min(oldMax, p.armorDur[piece] ?? oldMax)) : undefined;
+      const incomingDur = def.durability !== undefined
+        ? Math.max(1, Math.min(def.durability, item.dur ?? def.durability))
+        : undefined;
       p.equipment[piece] = item.id;
-      p.inv.slots[slot] = old ? { id: old, qty: 1 } : null;
+      p.inv.slots[slot] = old
+        ? { id: old, qty: 1, ...(oldDur !== undefined ? { dur: oldDur } : {}) }
+        : null;
+      if (incomingDur !== undefined) p.armorDur[piece] = incomingDur;
+      else delete p.armorDur[piece];
       if (p.equipped === slot) p.equipped = null;
       this.toast(sid, `Equipped ${def.name}`);
       this.pushInventory(p);
@@ -1127,11 +2505,16 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (!p || (piece !== 'helmet' && piece !== 'vest' && piece !== 'mod')) return;
     const id = p.equipment[piece];
     if (!id) return;
-    if (this.addItem(p.inv, id, 1) > 0) {
+    const maxDur = this.content.item(id).durability;
+    const dur = piece !== 'mod' && maxDur !== undefined
+      ? Math.max(1, Math.min(maxDur, p.armorDur[piece] ?? maxDur))
+      : undefined;
+    if (this.addItem(p.inv, id, 1, dur) > 0) {
       this.toast(sid, 'No space in backpack');
       return;
     }
     p.equipment[piece] = null;
+    if (piece !== 'mod') delete p.armorDur[piece];
     this.pushInventory(p);
   }
 
@@ -1140,7 +2523,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (!p) return;
     const item = p.inv.slots[slot];
     if (!item) return;
-    const kind = ITEMS[item.id].kind;
+    const kind = this.content.item(item.id).kind;
     // weapons, tools, consumables and build kits can be held in hand (click to use/attack/place)
     if (kind !== 'weapon' && kind !== 'tool' && kind !== 'consumable' && kind !== 'placeable') return;
     p.equipped = p.equipped === slot ? null : slot;
@@ -1154,35 +2537,57 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const recipe = this.content.recipes.find((r) => r.id === recipeId);
     if (!recipe) return;
     if (!this.craftChecks(p, recipe)) return;
-    this.startAction(p, 'craft', `Crafting ${ITEMS[recipe.out.id].name}…`, CRAFT_TIME_MS, { id: recipeId });
+    this.startAction(p, 'craft', `Crafting ${this.content.item(recipe.out.id).name}…`, CRAFT_TIME_MS, { id: recipeId });
   }
 
   /** Station / material / weight validation, with feedback toasts. */
-  private craftChecks(p: ServerPlayer, recipe: (typeof RECIPES)[number]): boolean {
-    const STATION_TILE: Record<string, Tile> = { workbench: Tile.Workbench, furnace: Tile.Furnace, anvil: Tile.Anvil };
-    if (recipe.station && !this.nearTile(p, STATION_TILE[recipe.station])) {
-      this.toast(p.sid, `You need to be at a ${recipe.station}`);
-      return false;
-    }
-    for (const cost of recipe.cost) {
-      if (this.countItem(p.inv, cost.id) < cost.qty) {
-        this.toast(p.sid, `Missing ${ITEMS[cost.id].name}`);
+  private craftChecks(p: ServerPlayer, recipe: RuntimeRecipe): boolean {
+    if (recipe.station) {
+      const station = this.nearestStationIndex(p, recipe.station);
+      if (station === null) {
+        this.toast(p.sid, `You need to be at a ${recipe.station}`);
         return false;
       }
+      if (recipe.station === 'furnace' && (this.inst(p).stationFuel.get(station) ?? 0) < STATION_FUEL_PER_ACTION) {
+        this.toast(p.sid, 'The furnace needs wood before it can smelt');
+        this.emitTo(p.sid, EV.station, this.stationPayload(this.inst(p), 'furnace', station));
+        return false;
+      }
+    }
+    if (!canPayRecipe(p.inv, recipe.cost)) {
+      const missing = recipe.cost.find((cost) => this.countItem(p.inv, cost.id) < cost.qty);
+      if (missing) this.toast(p.sid, `Missing ${this.content.item(missing.id).name}`);
+      return false;
     }
     return true;
   }
 
-  private doCraft(p: ServerPlayer, inst: Instance, recipe: (typeof RECIPES)[number]) {
-    for (const cost of recipe.cost) this.removeItem(p.inv, cost.id, cost.qty);
+  private doCraft(p: ServerPlayer, inst: Instance, recipe: RuntimeRecipe) {
+    if (recipe.station === 'furnace') {
+      const furnace = this.nearestStationIndex(p, 'furnace');
+      if (furnace === null || !this.consumeStationFuel(inst, furnace)) return;
+      this.emitTo(p.sid, EV.station, this.stationPayload(inst, 'furnace', furnace));
+    }
+    for (const cost of recipe.cost) {
+      this.removeItem(p.inv, cost.id, cost.qty);
+      this.telemetry.record({
+        kind: 'item_destroyed', userId: p.userId, itemId: cost.id, quantity: cost.qty,
+        value: this.content.estimatedItemValue(cost.id) * cost.qty, source: 'craft',
+      });
+    }
     const leftover = this.addItem(p.inv, recipe.out.id, recipe.out.qty);
     if (leftover > 0) {
       this.dropAt(inst, p.x, p.y + 20, recipe.out.id, leftover);
-      this.toast(p.sid, `Crafted ${ITEMS[recipe.out.id].name} (no slot — dropped at feet)`);
+      this.toast(p.sid, `Crafted ${this.content.item(recipe.out.id).name} (no slot — dropped at feet)`);
     } else {
-      this.toast(p.sid, `Crafted ${ITEMS[recipe.out.id].name}${recipe.out.qty > 1 ? ` x${recipe.out.qty}` : ''}`);
+      this.toast(p.sid, `Crafted ${this.content.item(recipe.out.id).name}${recipe.out.qty > 1 ? ` x${recipe.out.qty}` : ''}`);
     }
     this.addXp(p, 'crafting', 8);
+    this.telemetry.record({
+      kind: 'item_spawned', userId: p.userId, itemId: recipe.out.id, quantity: recipe.out.qty,
+      value: this.content.estimatedItemValue(recipe.out.id) * recipe.out.qty, source: 'craft',
+    });
+    void this.saveProfileOf(p);
     this.pushInventory(p);
   }
 
@@ -1192,15 +2597,18 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (!p || p.dead) return;
     if (slot < 0 || slot >= p.inv.slots.length) return;
     const held = p.inv.slots[slot];
-    const heldDef = held ? ITEMS[held.id] : null;
+    const heldDef = held ? this.content.item(held.id) : null;
     if (!held || !heldDef?.place) {
       this.toast(sid, 'That is not a placeable item');
       return;
     }
     const type: BuildType = heldDef.place;
     const inst = this.inst(p);
-    const inHideout = inst.kind === 'hideout';
-    if (inHideout && (inst.ownerId !== p.userId || !inst.hideout)) {
+    const inHideout = inst.kind !== 'world';
+    const mayBuildHere = inst.kind === 'hideout'
+      ? inst.ownerId === p.userId
+      : Boolean(inst.clanId && inst.clanId === p.clanId && canBuildClanHideout(p.clanRank));
+    if (inHideout && (!mayBuildHere || !inst.hideout)) {
       this.toast(sid, 'This is not your camp');
       return;
     }
@@ -1227,6 +2635,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     rotation = ((rotation | 0) % 4 + 4) % 4;
     const targetTile = inst.tiles[i];
     const isFloorPiece = type === 'wood_floor' || type === 'stone_floor';
+    const existingBlockId = inst.blockKinds[String(i)];
+    const existingBlock = this.content.block(existingBlockId);
+    const canReplaceFoundation = !isFloorPiece && existingBlock?.playerPlacement?.foundation;
+    if (existingBlockId && !canReplaceFoundation) {
+      this.toast(sid, 'Something is already built there');
+      return;
+    }
     // floors go on grass; everything else can also sit ON a floor (Minecraft-style layering)
     const ok = isFloorPiece ? targetTile === Tile.Grass : targetTile === Tile.Grass || FLOOR_TILES[targetTile];
     if (!ok) {
@@ -1294,14 +2709,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (!p || p.dead || slot < 0 || slot >= p.inv.slots.length) return;
     const item = p.inv.slots[slot];
     if (!item) return;
-    const def = ITEMS[item.id];
+    const def = this.content.item(item.id);
     const info = repairInfo(def);
     if (!info || def.durability === undefined) {
       this.toast(sid, 'That cannot be repaired');
       return;
     }
-    const stationTile = info.station === 'anvil' ? Tile.Anvil : info.station === 'furnace' ? Tile.Furnace : Tile.Workbench;
-    if (!this.nearTile(p, stationTile)) {
+    if (!this.nearStation(p, info.station)) {
       this.toast(sid, `Repair it at a ${info.station}`);
       return;
     }
@@ -1315,7 +2729,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const scrapCost = Math.max(1, Math.ceil(info.scrap * frac));
     const barCost = info.bar ? Math.max(1, Math.round(2 * frac)) : 0;
     if (this.countItem(p.inv, 'scrap') < scrapCost || (info.bar && this.countItem(p.inv, info.bar) < barCost)) {
-      this.toast(sid, `Need ${scrapCost} scrap${info.bar ? ` + ${barCost} ${ITEMS[info.bar].name}` : ''} to repair`);
+      this.toast(sid, `Need ${scrapCost} scrap${info.bar ? ` + ${barCost} ${this.content.item(info.bar).name}` : ''} to repair`);
       return;
     }
     this.removeItem(p.inv, 'scrap', scrapCost);
@@ -1339,8 +2753,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const p = this.players.get(sid);
     if (!p || p.dead) return;
     const inst = this.inst(p);
-    if (inst.kind !== 'hideout' || inst.ownerId !== p.userId || !inst.hideout) {
-      this.toast(sid, 'You can only demolish in your own camp');
+    const mayDemolish = inst.kind === 'hideout'
+      ? inst.ownerId === p.userId
+      : inst.kind === 'clan_hideout' && inst.clanId === p.clanId && canDemolishClanHideout(p.clanRank);
+    if (!mayDemolish || !inst.hideout) {
+      this.toast(sid, inst.kind === 'clan_hideout' ? 'Only clan officers and the owner can demolish here' : 'You can only demolish in your own camp');
       return;
     }
     tx = tx | 0;
@@ -1363,7 +2780,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       this.toast(sid, 'Empty the chest first');
       return;
     }
-    const kit = Object.values(ITEMS).find((d) => d.place === obj.type);
+    const kit = Object.values(this.content.items).find((d) => d.place === obj.type);
     if (kit && this.addItem(p.inv, kit.id, 1) > 0) {
       this.toast(sid, 'No space to carry the kit');
       return;
@@ -1372,7 +2789,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const buildable = BUILDABLES[obj.type];
     if (buildable.tile) {
       const i = ty * inst.w + tx;
-      const restore = inst.unders.get(i) ?? Tile.Grass; // the floor beneath survives
+      inst.stationFuel.delete(i);
+          const restore = restoredStructureTile(inst.unders.get(i), Tile.Grass); // the floor beneath survives
       inst.unders.delete(i);
       inst.tiles[i] = restore;
       this.io?.to(inst.id).emit(EV.tile, { i, tile: restore });
@@ -1381,7 +2799,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.syncHideoutContainers(inst);
     if (obj.type === 'bed') this.syncHideoutSpawn(inst);
     this.persistHideout(inst);
-    this.toast(sid, `Demolished ${buildable.name}${kit ? ` — ${ITEMS[kit.id].name} returned` : ''}`);
+    this.toast(sid, `Demolished ${buildable.name}${kit ? ` — ${this.content.item(kit.id).name} returned` : ''}`);
     this.pushInventory(p);
   }
 
@@ -1393,6 +2811,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.hitFx(inst, (i % inst.w) * TILE + 16, Math.floor(i / inst.w) * TILE + 16, dmg, 'node', 'stone');
     if (s.hp <= 0) {
       inst.structures.delete(i);
+      inst.stationFuel.delete(i);
       const restore = s.under ?? Tile.Grass;
       inst.unders.delete(i);
       inst.tiles[i] = restore;
@@ -1426,11 +2845,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       return true;
     }
     inst.blockHp.delete(i);
+    inst.stationFuel.delete(i);
     delete inst.blockKinds[String(i)];
     delete inst.blockRotations[String(i)];
     inst.openDoors.delete(i);
     for (const drop of block.drops) {
-      if (this.rnd() > drop.chance || !(drop.itemId in ITEMS)) continue;
+      if (this.rnd() > drop.chance || !this.content.hasItem(drop.itemId)) continue;
       const quantity = drop.min + Math.floor(this.rnd() * (drop.max - drop.min + 1));
       this.dropAt(inst, x + (this.rnd() - .5) * 12, y + (this.rnd() - .5) * 12, drop.itemId as ItemId, quantity);
     }
@@ -1448,37 +2868,304 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.io?.to(inst.id).emit(EV.block, { i, ...(blockId ? { blockId } : {}), open: false });
   }
 
-  /** Safe-zone local chat with overhead bubbles. */
+  /** Instance-wide local chat plus a relay-wide private clan radio channel. */
   chat(sid: string, text: string) {
     const p = this.players.get(sid);
     if (!p || p.dead) return;
-    const inst = this.inst(p);
-    if (!this.isSafeAt(inst, p.x, p.y)) {
-      this.toast(sid, 'You can only chat inside safe zones');
+    if (p.guest) {
+      this.toast(sid, 'Guest chat is disabled — register to join the community');
       return;
     }
+    if (p.mutedUntil > Date.now()) {
+      const minutes = Math.max(1, Math.ceil((p.mutedUntil - Date.now()) / 60_000));
+      this.toast(sid, `Chat muted for ${minutes} more minute${minutes === 1 ? '' : 's'}`);
+      return;
+    }
+    const inst = this.inst(p);
     const clean = String(text ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 120);
     if (!clean) return;
-    this.io?.to(inst.id).emit(EV.chatMsg, { id: p.sid, name: p.name, text: clean });
+    const clanMatch = /^\/(?:c|clan)\s+(.+)$/i.exec(clean);
+    if (clanMatch) {
+      const message = clanMatch[1].trim().slice(0, 110);
+      if (!p.clanId || !p.clanTag) {
+        this.toast(sid, 'Join a clan before using /c clan radio');
+        return;
+      }
+      if (!message) return;
+      for (const member of this.players.values()) {
+        if (this.isBot(member) || member.clanId !== p.clanId) continue;
+        this.emitTo(member.sid, EV.chatMsg, {
+          id: p.sid,
+          name: `[${p.clanTag}] ${p.name}`,
+          text: message,
+          channel: 'clan',
+          admin: p.admin,
+        });
+      }
+      return;
+    }
+    this.io?.to(inst.id).emit(EV.chatMsg, { id: p.sid, name: p.name, text: clean, channel: 'local', admin: p.admin });
   }
 
   // ── quests ────────────────────────────────────────────────────────────────
 
-  /** Quest tree: a quest is unlocked once its prerequisite is claimed. */
-  private questUnlocked(p: ServerPlayer, def: QuestDef): boolean {
-    if (def.requires === null) return true;
-    return !!p.quests[def.requires]?.claimed;
+  private async liveAdmin(sid: string): Promise<ServerPlayer | null> {
+    const player = this.players.get(sid);
+    if (!player || this.isBot(player)) return null;
+    const access = await this.db.loadPlayerAccess(player.userId);
+    player.admin = access.admin;
+    player.mutedUntil = access.mutedUntil;
+    if (player.admin) return player;
+    player.adminMode = false;
+    this.toast(sid, 'Administrator access is no longer active');
+    return null;
   }
 
-  /** Quests this trader offers: unlocked (or already claimed) quests of its tier. */
-  private questStatus(p: ServerPlayer, tier: TraderTier): QuestStatus[] {
+  private adminTarget(targetId: unknown): ServerPlayer | null {
+    if (typeof targetId !== 'string' || targetId.length === 0 || targetId.length > 160) return null;
+    const target = this.players.get(targetId);
+    return target && !this.isBot(target) ? target : null;
+  }
+
+  private adminAudit(actor: ServerPlayer, action: string, target?: ServerPlayer, metadata?: Record<string, unknown>) {
+    this.telemetry.record({
+      kind: 'admin_action', userId: actor.userId, source: action,
+      metadata: { actor: actor.name, targetUserId: target?.userId, target: target?.name, instanceId: actor.instanceId, ...metadata },
+    });
+    this.log.log(`ADMIN ${actor.name}: ${action}${target ? ` -> ${target.name}` : ''}`);
+  }
+
+  private clearPlayerActivity(player: ServerPlayer) {
+    player.input = { up: false, down: false, left: false, right: false, angle: player.angle, shoot: false };
+    player.moving = false;
+    player.action = null;
+    player.reloadTarget = null;
+    player.reloadUntil = 0;
+    player.openContainer = null;
+    this.emitTo(player.sid, EV.action, { label: '', ms: 0 } satisfies ActionSnap);
+  }
+
+  private adminTeleportPoint(inst: Instance, rawTileX: unknown, rawTileY: unknown): { x: number; y: number } | null {
+    const tileX = adminTileCoordinate(rawTileX, inst.w);
+    const tileY = adminTileCoordinate(rawTileY, inst.h);
+    if (tileX === null || tileY === null) return null;
+    for (let radius = 0; radius <= 8; radius++) for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
+      if (radius > 0 && Math.abs(dx) !== radius && Math.abs(dy) !== radius) continue;
+      const tx = tileX + dx;
+      const ty = tileY + dy;
+      if (tx < 1 || ty < 1 || tx >= inst.w - 1 || ty >= inst.h - 1) continue;
+      const x = (tx + 0.5) * TILE;
+      const y = (ty + 0.5) * TILE;
+      if (!this.isBlocked(inst, x, y, PLAYER_RADIUS)) return { x, y };
+    }
+    return null;
+  }
+
+  private relocateByAdmin(player: ServerPlayer, inst: Instance, x: number, y: number) {
+    this.clearPlayerActivity(player);
+    if (player.instanceId === inst.id) {
+      player.x = x;
+      player.y = y;
+      player.ignoreInteractUntil = Date.now() + 900;
+      this.pushInventory(player);
+    } else {
+      this.switchInstance(player, inst, x, y);
+    }
+  }
+
+  async adminState(sid: string) {
+    const actor = await this.liveAdmin(sid);
+    if (!actor) return;
+    const sanctions = await this.db.listActiveModeration().catch(() => []);
+    const state: AdminPanelState = {
+      server: this.db.serverStateKey,
+      protected: actor.adminMode,
+      players: [...this.players.values()].flatMap((player) => {
+        if (this.isBot(player)) return [];
+        const inst = this.inst(player);
+        return [{
+          id: player.sid, name: player.name, instanceId: inst.id, instanceName: inst.name, instanceKind: inst.kind,
+          tileX: Math.floor(player.x / TILE), tileY: Math.floor(player.y / TILE), hp: player.hp, maxHp: PLAYER_MAX_HP,
+          dead: player.dead, connected: Boolean(this.io?.sockets.sockets.has(player.sid)), admin: player.admin, guest: player.guest,
+          protected: player.adminMode, mutedUntil: player.mutedUntil,
+        }];
+      }).sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name)),
+      sanctions,
+    };
+    this.emitTo(sid, EV.adminState, state);
+  }
+
+  async adminAction(sid: string, action: AdminActionPayload) {
+    const actor = await this.liveAdmin(sid);
+    if (!actor || !action || typeof action !== 'object' || typeof action.type !== 'string') return;
+
+    if (action.type === 'protection') {
+      actor.adminMode = action.enabled === true;
+      if (actor.adminMode) {
+        actor.hp = PLAYER_MAX_HP; actor.hunger = 100; actor.thirst = 100; actor.stamina = STAMINA_MAX; actor.staminaExhausted = false;
+        this.pushInventory(actor);
+      }
+      this.adminAudit(actor, actor.adminMode ? 'protection_enabled' : 'protection_disabled');
+      this.toast(sid, `Admin protection ${actor.adminMode ? 'enabled' : 'disabled'}`);
+      await this.adminState(sid);
+      return;
+    }
+
+    if (action.type === 'announce') {
+      const message = adminText(action.message, 160);
+      if (!message) return this.toast(sid, 'Enter an announcement first');
+      this.io?.emit(EV.toast, `ADMIN BROADCAST — ${message}`);
+      this.adminAudit(actor, 'announcement', undefined, { message });
+      await this.adminState(sid);
+      return;
+    }
+
+    if (action.type === 'teleport') {
+      const inst = this.inst(actor);
+      const point = this.adminTeleportPoint(inst, action.tileX, action.tileY);
+      if (!point) return this.toast(sid, 'No walkable tile near those coordinates');
+      this.relocateByAdmin(actor, inst, point.x, point.y);
+      this.adminAudit(actor, 'teleport_coordinates', undefined, { tileX: Math.floor(point.x / TILE), tileY: Math.floor(point.y / TILE) });
+      this.toast(sid, `Teleported to ${Math.floor(point.x / TILE)}, ${Math.floor(point.y / TILE)}`);
+      await this.adminState(sid);
+      return;
+    }
+
+    if (action.type === 'clear_mute' || action.type === 'clear_ban') {
+      const targetUserId = typeof action.targetUserId === 'string' ? action.targetUserId.slice(0, 120) : '';
+      if (!targetUserId) return;
+      const kind = action.type === 'clear_mute' ? 'mute' : 'ban';
+      const cleared = await this.db.clearPlayerSanction(actor.userId, targetUserId, kind);
+      if (!cleared) return this.toast(sid, `Could not clear ${kind}`);
+      const online = [...this.players.values()].find((player) => !this.isBot(player) && player.userId === targetUserId);
+      if (online && kind === 'mute') online.mutedUntil = 0;
+      this.adminAudit(actor, `${kind}_cleared`, online);
+      this.toast(sid, `${kind === 'mute' ? 'Mute' : 'Ban'} cleared`);
+      await this.adminState(sid);
+      return;
+    }
+
+    const target = this.adminTarget('targetId' in action ? action.targetId : null);
+    if (!target) return this.toast(sid, 'That player is no longer available');
+
+    if (action.type === 'goto') {
+      const targetInst = this.inst(target);
+      const point = this.adminTeleportPoint(targetInst, Math.floor(target.x / TILE) + 1, Math.floor(target.y / TILE)) ?? { x: target.x, y: target.y };
+      this.relocateByAdmin(actor, targetInst, point.x, point.y);
+      this.adminAudit(actor, 'goto', target);
+      this.toast(sid, `Teleported to ${target.name}`);
+    } else if (action.type === 'bring') {
+      const actorInst = this.inst(actor);
+      const point = this.adminTeleportPoint(actorInst, Math.floor(actor.x / TILE) + 1, Math.floor(actor.y / TILE)) ?? { x: actor.x, y: actor.y };
+      this.relocateByAdmin(target, actorInst, point.x, point.y);
+      this.adminAudit(actor, 'bring', target);
+      this.toast(target.sid, `An administrator moved you to ${actorInst.name}`);
+      this.toast(sid, `Brought ${target.name}`);
+    } else if (action.type === 'send_home') {
+      target.returnPos = null;
+      if (target.guest) {
+        const world = this.instances.get(WORLD)!;
+        const origin = this.choose(world.spawns);
+        const spawn = this.findClearPointNear(world, origin.x, origin.y, 10);
+        this.relocateByAdmin(target, world, spawn.x, spawn.y);
+      } else {
+        const home = await this.hideoutInstance(target.userId);
+        this.relocateByAdmin(target, home, home.spawns[0].x, home.spawns[0].y);
+      }
+      this.adminAudit(actor, 'send_home', target);
+      this.toast(target.sid, target.guest ? 'An administrator redeployed your guest raid' : 'An administrator returned you home');
+      this.toast(sid, target.guest ? `Redeployed ${target.name}` : `Returned ${target.name} home`);
+    } else if (action.type === 'heal') {
+      if (target.dead) return this.toast(sid, 'Dead survivors must respawn; healing cannot duplicate dropped gear');
+      target.hp = PLAYER_MAX_HP; target.hunger = 100; target.thirst = 100; target.stamina = STAMINA_MAX;
+      target.staminaExhausted = false; target.starveAcc = 0;
+      this.pushInventory(target);
+      void this.saveProfileOf(target);
+      this.adminAudit(actor, 'heal', target);
+      this.toast(target.sid, 'An administrator restored your condition');
+      this.toast(sid, `Restored ${target.name}`);
+    } else if (action.type === 'give_item') {
+      if (target.dead) return this.toast(sid, 'Wait for the survivor to respawn before issuing items');
+      const itemId = adminText(action.itemId, 60);
+      if (!itemId || !this.content.hasItem(itemId)) return this.toast(sid, 'Unknown item in the active content revision');
+      const quantity = adminItemQuantity(action.quantity);
+      const leftover = this.addItem(target.inv, itemId, quantity);
+      const issued = quantity - leftover;
+      if (leftover > 0) this.dropAt(this.inst(target), target.x, target.y, itemId, leftover);
+      this.pushInventory(target);
+      void this.saveProfileOf(target);
+      this.telemetry.record({ kind: 'item_spawned', userId: target.userId, itemId, quantity,
+        value: this.content.estimatedItemValue(itemId) * quantity, source: 'admin_console',
+        metadata: { actorUserId: actor.userId, actor: actor.name } });
+      this.adminAudit(actor, 'give_item', target, { itemId, quantity, issued, dropped: leftover });
+      this.toast(target.sid, `Administrator issued ${quantity}× ${this.content.item(itemId).name}`);
+      this.toast(sid, `Issued ${quantity}× ${this.content.item(itemId).name} to ${target.name}${leftover ? ` (${leftover} dropped nearby)` : ''}`);
+    } else if (action.type === 'kick') {
+      if (target.admin || target.sid === actor.sid) return this.toast(sid, 'Administrators cannot be kicked from the live console');
+      const reason = adminText(action.reason, 160, 'Removed by an administrator');
+      this.adminAudit(actor, 'kick', target, { reason });
+      this.toast(target.sid, `Kicked by administrator — ${reason}`);
+      this.toast(sid, `Kicked ${target.name}`);
+      setTimeout(() => this.io?.sockets.sockets.get(target.sid)?.disconnect(true), 150);
+    } else if (action.type === 'mute' || action.type === 'ban') {
+      if (target.admin || target.sid === actor.sid) return this.toast(sid, 'Administrators cannot be sanctioned from the live console');
+      const kind = action.type;
+      const minutes = adminSanctionMinutes(action.minutes);
+      const reason = adminText(action.reason, 160, 'No reason supplied');
+      const until = new Date(Date.now() + minutes * 60_000);
+      if (target.guest) {
+        this.adminAudit(actor, `${kind}_guest`, target, { minutes, reason, until: until.toISOString() });
+        if (kind === 'mute') {
+          target.mutedUntil = until.getTime();
+          this.toast(target.sid, `Guest session muted for ${minutes} minutes — ${reason}`);
+          this.toast(sid, `Muted ${target.name} for this guest session`);
+        } else {
+          this.guestBans.set(target.userId, until.getTime());
+          this.toast(target.sid, `Guest access suspended on this relay for ${minutes} minutes — ${reason}`);
+          this.toast(sid, `Suspended ${target.name}'s guest identity for ${minutes} minutes`);
+          setTimeout(() => this.io?.sockets.sockets.get(target.sid)?.disconnect(true), 150);
+        }
+        await this.adminState(sid);
+        return;
+      }
+      const applied = await this.db.setPlayerSanction(actor.userId, target.userId, kind, until, reason);
+      if (!applied) return this.toast(sid, `Could not ${kind} ${target.name}; their role may have changed`);
+      this.adminAudit(actor, kind, target, { minutes, reason, until: until.toISOString() });
+      if (kind === 'mute') {
+        target.mutedUntil = until.getTime();
+        this.toast(target.sid, `Chat muted for ${minutes} minutes — ${reason}`);
+        this.toast(sid, `Muted ${target.name} for ${minutes} minutes`);
+      } else {
+        this.toast(target.sid, `Access suspended for ${minutes} minutes — ${reason}`);
+        this.toast(sid, `Banned ${target.name} for ${minutes} minutes`);
+        setTimeout(() => this.io?.sockets.sockets.get(target.sid)?.disconnect(true), 150);
+      }
+    }
+    await this.adminState(sid);
+  }
+
+  /** Quest tree: a quest is unlocked once its prerequisite is claimed. */
+  private questUnlocked(p: ServerPlayer, def: QuestDef): boolean {
+    return questRuleUnlocked(
+      Object.fromEntries(Object.entries(p.quests).map(([id, progress]) => [id, Boolean(progress.claimed)])),
+      def,
+    );
+  }
+
+  /** All unlocked jobs, including completed entries, for traders and the HUD tracker. */
+  private trackedQuests(p: ServerPlayer): QuestStatus[] {
     return this.quests
-      .filter((def) => def.tier === tier && this.questUnlocked(p, def))
+      .filter((def) => this.questUnlocked(p, def))
       .map((def) => {
         const prog = p.quests[def.id] ?? { kills: 0, claimed: false };
         const progress = def.kind === 'kill' ? Math.min(prog.kills, def.count) : Math.min(this.countItem(p.inv, def.target as ItemId), def.count);
         return { def, progress, done: progress >= def.count, claimed: !!prog.claimed };
       });
+  }
+
+  /** Quests this trader offers: unlocked (or already claimed) quests of its tier. */
+  private questStatus(p: ServerPlayer, tier: TraderTier): QuestStatus[] {
+    return this.trackedQuests(p).filter((status) => status.def.tier === tier);
   }
 
   private sendTrade(p: ServerPlayer) {
@@ -1499,49 +3186,67 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const def = this.quests.find((q) => q.id === questId);
     if (!def || def.tier !== (trader.tier ?? 1) || !this.questUnlocked(p, def)) return;
     const prog = p.quests[def.id] ?? { kills: 0, claimed: false };
-    if (prog.claimed) return;
-    if (def.kind === 'fetch') {
-      if (this.countItem(p.inv, def.target as ItemId) < def.count) {
-        this.toast(sid, 'You do not have the goods yet');
-        return;
-      }
-      this.removeItem(p.inv, def.target as ItemId, def.count);
-    } else if (prog.kills < def.count) {
-      this.toast(sid, 'The job is not done yet');
+    const progress = def.kind === 'fetch' ? this.countItem(p.inv, def.target) : prog.kills;
+    if (!questCanClaim(def, progress, prog.claimed)) {
+      if (!prog.claimed) this.toast(sid, def.kind === 'fetch' ? 'You do not have the goods yet' : 'The job is not done yet');
       return;
+    }
+    if (def.kind === 'fetch') {
+      this.removeItem(p.inv, def.target as ItemId, def.count);
+      this.telemetry.record({
+        kind: 'item_destroyed', userId: p.userId, itemId: def.target, quantity: def.count,
+        value: this.content.estimatedItemValue(def.target) * def.count, source: 'quest_claim',
+      });
     }
     prog.claimed = true;
     p.quests[def.id] = prog;
     p.money += def.rewardMoney;
+    if (def.rewardMoney > 0) this.telemetry.record({ kind: 'currency_spawned', userId: p.userId, credits: def.rewardMoney, source: 'quest_reward' });
     if (def.rewardItem) {
       const leftover = this.addItem(p.inv, def.rewardItem, def.rewardQty);
       if (leftover > 0) this.dropAt(this.inst(p), p.x, p.y + 20, def.rewardItem, leftover);
+      this.telemetry.record({
+        kind: 'item_spawned', userId: p.userId, itemId: def.rewardItem, quantity: def.rewardQty,
+        value: this.content.estimatedItemValue(def.rewardItem) * def.rewardQty, source: 'quest_reward',
+      });
     }
-    this.toast(sid, `Job complete: ${def.name} (+${def.rewardMoney}cr${def.rewardItem ? ` +${ITEMS[def.rewardItem].name}` : ''})`);
+    this.toast(sid, `Job complete: ${def.name} (+${def.rewardMoney}cr${def.rewardItem ? ` +${this.content.item(def.rewardItem).name}` : ''})`);
     void this.saveProfileOf(p);
     this.pushInventory(p);
     this.sendTrade(p);
   }
 
-  respawn(sid: string) {
+  async respawn(sid: string) {
     const p = this.players.get(sid);
-    if (!p || !p.dead) return;
-    const world = this.instances.get(WORLD)!;
-    if (p.instanceId !== WORLD) this.switchInstance(p, world, p.x, p.y);
-    const spawn = world.spawns[Math.floor(this.rnd() * world.spawns.length)];
-    p.x = spawn.x;
-    p.y = spawn.y;
-    p.hp = PLAYER_MAX_HP;
-    p.dead = false;
-    p.inv = this.starterInventory();
-    p.equipment = { helmet: null, vest: null, mod: null };
-    p.equipped = null;
-    p.mags = {};
-    p.hunger = 100;
-    p.thirst = 100;
-    p.action = null;
-    this.pushInventory(p);
-    void this.saveProfileOf(p);
+    if (!p || !p.dead || p.ignoreInteractUntil === Number.POSITIVE_INFINITY) return;
+    p.ignoreInteractUntil = Number.POSITIVE_INFINITY;
+    try {
+      const destination = p.guest ? this.instances.get(WORLD)! : await this.hideoutInstance(p.userId);
+      const origin = p.guest ? this.choose(destination.spawns) : destination.spawns[0];
+      const spawn = p.guest ? this.findClearPointNear(destination, origin.x, origin.y, 10) : origin;
+      if (!this.players.has(sid)) return;
+      p.hp = PLAYER_MAX_HP;
+      p.dead = false;
+      p.inv = this.starterInventory();
+      p.equipment = { helmet: null, vest: null, mod: null };
+      p.armorDur = {};
+      p.equipped = null;
+      p.mags = {};
+      p.hunger = 100;
+      p.thirst = 100;
+      p.stamina = STAMINA_MAX;
+      p.staminaExhausted = false;
+      p.action = null;
+      this.switchInstance(p, destination, spawn.x, spawn.y);
+      this.toast(sid, p.guest
+        ? 'Guest redeployed into the zone empty-handed'
+        : 'You wake at home empty-handed. Regear from your stash when you are ready.');
+      void this.saveProfileOf(p);
+    } catch (error) {
+      p.ignoreInteractUntil = 0;
+      this.log.error(`Respawn failed for ${p.name}: ${(error as Error).message}`);
+      this.toast(sid, 'Could not return you home. Try again.');
+    }
   }
 
   // ── trading ───────────────────────────────────────────────────────────────
@@ -1578,9 +3283,15 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     p.money -= bought * entry.buy;
-    this.toast(sid, `Bought ${ITEMS[entry.id].name} x${bought} (-${bought * entry.buy}cr)`);
+    this.telemetry.record({ kind: 'currency_destroyed', userId: p.userId, credits: bought * entry.buy, source: 'trade_buy' });
+    this.telemetry.record({
+      kind: 'item_spawned', userId: p.userId, itemId: entry.id, quantity: bought,
+      value: this.content.estimatedItemValue(entry.id) * bought, source: 'trade_buy',
+    });
+    this.toast(sid, `Bought ${this.content.item(entry.id).name} x${bought} (-${bought * entry.buy}cr)`);
     this.pushInventory(p);
     this.sendTrade(p);
+    void this.saveProfileOf(p);
   }
 
   tradeSell(sid: string, slot: number, qty: number) {
@@ -1604,9 +3315,15 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (p.equipped === slot) p.equipped = null;
     }
     p.money += n * entry.sell;
-    this.toast(sid, `Sold ${ITEMS[item.id].name} x${n} (+${n * entry.sell}cr)`);
+    this.telemetry.record({
+      kind: 'item_destroyed', userId: p.userId, itemId: item.id, quantity: n,
+      value: this.content.estimatedItemValue(item.id) * n, source: 'trade_sell',
+    });
+    this.telemetry.record({ kind: 'currency_spawned', userId: p.userId, credits: n * entry.sell, source: 'trade_sell' });
+    this.toast(sid, `Sold ${this.content.item(item.id).name} x${n} (+${n * entry.sell}cr)`);
     this.pushInventory(p);
     this.sendTrade(p);
+    void this.saveProfileOf(p);
   }
 
   // ── hideout ───────────────────────────────────────────────────────────────
@@ -1614,11 +3331,25 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   async enterHideout(sid: string, ownerId?: string) {
     const p = this.players.get(sid);
     if (!p || p.dead) return;
+    if (p.guest) {
+      this.toast(sid, 'Personal and allied hideouts require a registered survivor');
+      return;
+    }
     const inst = this.inst(p);
     const owner = ownerId && typeof ownerId === 'string' ? ownerId : p.userId;
     if (owner === p.userId) {
       // no free warp home — the only way out of the zone is an extraction beacon
       this.toast(sid, 'Reach an extraction beacon to get home');
+      return;
+    }
+    const onlineOwner = [...this.players.values()].find((candidate) =>
+      !this.isBot(candidate)
+      && candidate.userId === owner
+      && !candidate.dead
+      && candidate.loggedOutAt === null,
+    );
+    if (!onlineOwner) {
+      this.toast(sid, 'That friend must be online on this relay before you can visit their camp');
       return;
     }
     // visit friends from the comfort of your own base, or from a safe zone
@@ -1642,11 +3373,122 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (op.userId === owner) this.toast(op.sid, `👋 ${p.name} is visiting your camp`);
   }
 
+  async enterClanHideout(sid: string) {
+    const player = this.players.get(sid);
+    if (!player || player.dead || this.isBot(player)) return;
+    if (player.guest) {
+      this.toast(sid, 'Clan holdouts require a registered survivor');
+      return;
+    }
+    await this.refreshPlayerSocial(player);
+    if (!player.clanId || !player.clanName || !player.clanTag || !player.clanRank) {
+      this.toast(sid, 'Join a clan before entering a clan holdout');
+      return;
+    }
+    const current = this.inst(player);
+    if (current.kind === 'clan_hideout' && current.clanId === player.clanId) {
+      this.toast(sid, 'You are already in your clan holdout');
+      return;
+    }
+    const fromPersonalHome = current.kind === 'hideout' && current.ownerId === player.userId;
+    if (!fromPersonalHome && (current.kind !== 'world' || !this.isSafeAt(current, player.x, player.y))) {
+      this.toast(sid, 'Enter the clan holdout from your home or a safe zone');
+      return;
+    }
+    if (!await this.db.acquireClanHideoutLease(player.clanId)) {
+      this.toast(sid, 'Your clan holdout is active on another relay — try again shortly');
+      return;
+    }
+    player.returnPos = fromPersonalHome ? null : { x: player.x, y: player.y };
+    let clanHoldout: Instance;
+    try {
+      clanHoldout = await this.clanHideoutInstance({ id: player.clanId, name: player.clanName, tag: player.clanTag });
+    } catch (error) {
+      void this.db.releaseClanHideoutLease(player.clanId);
+      throw error;
+    }
+    this.switchInstance(player, clanHoldout, clanHoldout.spawns[0].x, clanHoldout.spawns[0].y);
+    this.toast(sid, `Entered [${player.clanTag}] ${player.clanName} Holdout`);
+    for (const member of this.players.values()) {
+      if (member.sid !== sid && member.clanId === player.clanId && member.instanceId === clanHoldout.id) {
+        this.toast(member.sid, `${player.name} entered the clan holdout`);
+      }
+    }
+  }
+
+  async transferClanTreasury(sid: string, rawAmount: number) {
+    const player = this.players.get(sid);
+    if (!player || player.dead || this.isBot(player)) return;
+    if (player.guest) {
+      this.toast(sid, 'Clan banking requires a registered survivor');
+      return;
+    }
+    await this.refreshPlayerSocial(player).catch(() => undefined);
+    if (!player.clanId || !player.clanRank) {
+      this.toast(sid, 'Join a clan before using a clan treasury');
+      return;
+    }
+    const instance = this.inst(player);
+    if (instance.kind === 'world' && !this.isSafeAt(instance, player.x, player.y)) {
+      this.toast(sid, 'Clan banking is available at home, the clan holdout, or a safe trader');
+      return;
+    }
+    const amount = Math.max(-100_000, Math.min(100_000, Math.trunc(Number(rawAmount) || 0)));
+    if (amount === 0) {
+      this.toast(sid, 'Enter a credit amount');
+      return;
+    }
+    const result = await this.enqueueProfileWork(player.userId, async () => {
+      if (!await this.persistProfileOf(player, player.sid)) return { ok: false as const, reason: 'stale_lease' as const };
+      return this.db.transferClanTreasury(player.userId, player.sid, player.name, player.clanId!, amount);
+    });
+    if (!result.ok) {
+      const message = {
+        not_member: 'Your clan membership changed',
+        forbidden: 'Only clan officers and the owner can withdraw credits',
+        insufficient_credits: 'You do not have enough credits',
+        insufficient_treasury: 'The clan treasury does not have enough credits',
+        stale_lease: 'Your survivor session is no longer authoritative',
+        unavailable: 'Clan treasury is temporarily unavailable',
+      }[result.reason];
+      this.toast(sid, message);
+      return;
+    }
+    player.money = result.money;
+    this.pushInventory(player);
+    for (const member of this.players.values()) {
+      if (member.clanId !== player.clanId || this.isBot(member)) continue;
+      this.emitTo(member.sid, EV.clanTreasuryUpdate, {
+        clanId: player.clanId,
+        treasury: result.treasury,
+        actor: player.name,
+        amount,
+      });
+    }
+    this.toast(sid, amount > 0 ? `Contributed ${amount} credits to the clan` : `Withdrew ${Math.abs(amount)} clan credits`);
+  }
+
   async leaveHideout(sid: string) {
     const p = this.players.get(sid);
     if (!p || p.dead) return;
     const inst = this.inst(p);
-    if (inst.kind !== 'hideout') return;
+    if (inst.kind === 'world') return;
+    if (inst.kind === 'clan_hideout') {
+      if (clanHideoutExitTarget(p.returnPos !== null) === 'safe_zone') {
+        const world = this.instances.get(WORLD)!;
+        const returnPosition = p.returnPos!;
+        p.returnPos = null;
+        this.switchInstance(p, world, returnPosition.x, returnPosition.y);
+        this.toast(sid, 'Returned to the safe zone');
+      } else {
+        const home = await this.hideoutInstance(p.userId);
+        const spawn = home.spawns[0];
+        p.returnPos = null;
+        this.switchInstance(p, home, spawn.x, spawn.y);
+        this.toast(sid, 'Returned to your personal hideout');
+      }
+      return;
+    }
     if (inst.ownerId !== p.userId) {
       // leaving a friend's camp: back to the safe zone you came from, or home
       if (p.returnPos) {
@@ -1671,60 +3513,36 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   // ── inventory primitives ──────────────────────────────────────────────────
 
-  private addItem(inv: Inventory, id: ItemId, qty: number): number {
+  private addItem(inv: Inventory, id: string, qty: number, durability?: number): number {
     // no hard weight cap — carrying too much slows you down instead (see tick)
-    const def = ITEMS[id];
-    const remaining = qty;
-    let toPlace = remaining;
-    for (const s of inv.slots) {
-      if (toPlace <= 0) break;
-      if (s && s.id === id && s.qty < def.stack) {
-        const add = Math.min(def.stack - s.qty, toPlace);
-        s.qty += add;
-        toPlace -= add;
-      }
-    }
-    for (let i = 0; i < inv.slots.length && toPlace > 0; i++) {
-      if (!inv.slots[i]) {
-        const add = Math.min(def.stack, toPlace);
-        inv.slots[i] = { id, qty: add };
-        toPlace -= add;
-      }
-    }
-    return qty - (remaining - toPlace);
+    return addInventoryItem(inv, this.content.items, id, qty, durability);
   }
 
-  private removeItem(inv: Inventory, id: ItemId, qty: number): number {
-    let left = qty;
-    for (let i = 0; i < inv.slots.length && left > 0; i++) {
-      const s = inv.slots[i];
-      if (s && s.id === id) {
-        const take = Math.min(s.qty, left);
-        s.qty -= take;
-        left -= take;
-        if (s.qty <= 0) inv.slots[i] = null;
-      }
-    }
-    return qty - left;
+  private removeItem(inv: Inventory, id: string, qty: number): number {
+    return removeInventoryItem(inv, id, qty);
   }
 
-  private countItem(inv: Inventory, id: ItemId): number {
-    return inv.slots.reduce((n, s) => n + (s && s.id === id ? s.qty : 0), 0);
+  private countItem(inv: Inventory, id: string): number {
+    return countInventoryItem(inv, id);
   }
 
-  private dropAt(inst: Instance, x: number, y: number, id: ItemId, qty: number) {
+  private dropAt(inst: Instance, x: number, y: number, id: string, qty: number, dur?: number) {
     if (!id || qty <= 0) return;
     const gid = `g${this.nextId++}`;
-    inst.ground.set(gid, { id: gid, x, y, item: id, qty });
+    inst.ground.set(gid, { id: gid, x, y, item: id as ItemId, qty, ...(dur !== undefined ? { dur } : {}) });
   }
 
   private spawnGroundAt(inst: Instance, x: number, y: number) {
     const roll = rollGround(this.rnd, this.content.lootTables);
     const gid = `g${this.nextId++}`;
     inst.ground.set(gid, { id: gid, x, y, item: roll.id, qty: roll.qty });
+    this.telemetry.record({
+      kind: 'item_spawned', itemId: roll.id, quantity: roll.qty,
+      value: this.content.estimatedItemValue(roll.id) * roll.qty, source: 'ground_loot',
+    });
   }
 
-  private spawnEnemy(inst: Instance, x: number, y: number, kind: EnemyKind, respawnMs?: number) {
+  private spawnEnemy(inst: Instance, x: number, y: number, kind: EnemyKind, respawnMs?: number): string | null {
     // never spawn inside solid tiles — search nearby free ground
     if (this.isBlocked(inst, x, y, ENEMY_RADIUS)) {
       let found = false;
@@ -1739,7 +3557,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
               found = true;
             }
           }
-      if (!found) return; // nowhere sane to put it
+      if (!found) return null; // nowhere sane to put it
     }
     const def = this.content.enemy(kind);
     const id = `e${this.nextId++}`;
@@ -1768,6 +3586,55 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       lastAttackAt: 0,
       lastHitAt: 0,
     });
+    return id;
+  }
+
+  private updateNightHorde(inst: Instance, now: number, day: number, night: boolean) {
+    if (this.wasNight && !night) {
+      for (const id of this.nightHordeIds) inst.enemies.delete(id);
+      this.nightHordeIds.clear();
+    }
+    this.wasNight = night;
+    if (!night || day < 0.82 || day > 0.9) return;
+    const cycle = Math.floor(now / DAY_LENGTH_MS);
+    if (this.lastNightHordeCycle === cycle) return;
+    const targets = [...this.players.values()].filter((player) =>
+      !this.isBot(player)
+      && !player.dead
+      && player.loggedOutAt === null
+      && player.instanceId === inst.id
+      && !this.isSafeAt(inst, player.x, player.y),
+    );
+    if (!targets.length) return;
+    this.lastNightHordeCycle = cycle;
+
+    const desired = Math.min(36, 7 + targets.length * 3);
+    let spawned = 0;
+    for (let index = 0; index < desired; index++) {
+      const target = targets[index % targets.length];
+      let point: { x: number; y: number } | null = null;
+      for (let attempt = 0; attempt < 80; attempt++) {
+        const angle = this.rnd() * Math.PI * 2;
+        const distance = (9 + this.rnd() * 7) * TILE;
+        const x = Math.max(TILE * 2, Math.min((inst.w - 2) * TILE, target.x + Math.cos(angle) * distance));
+        const y = Math.max(TILE * 2, Math.min((inst.h - 2) * TILE, target.y + Math.sin(angle) * distance));
+        if (this.isSafeAt(inst, x, y) || this.isBlocked(inst, x, y, ENEMY_RADIUS)) continue;
+        // Prefer the treeline or structures outside the survivor's sight cone.
+        if (attempt < 55 && this.losClear(inst, target.x, target.y, x, y)) continue;
+        point = { x, y };
+        break;
+      }
+      if (!point) continue;
+      const id = this.spawnEnemy(inst, point.x, point.y, 'zombie', 0);
+      if (id) {
+        this.nightHordeIds.add(id);
+        spawned++;
+      }
+    }
+    if (spawned > 0) {
+      this.io?.to(inst.id).emit(EV.toast, `☾ NIGHT SURGE — ${spawned} infected are moving through the dark`);
+      this.log.log(`Night surge spawned ${spawned} infected around ${targets.length} exposed survivor(s)`);
+    }
   }
 
   // ── simulation ────────────────────────────────────────────────────────────
@@ -1776,30 +3643,54 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const now = Date.now();
     const dt = Math.min(0.1, (now - this.lastTick) / 1000);
     this.lastTick = now;
+    if (now >= this.nextBotSyncAt) {
+      this.syncBotPopulation();
+      this.nextBotSyncAt = now + BOT_SYNC_MS;
+    }
 
     for (const p of this.players.values()) {
       // combat-log body: no owner online — expire it (or reap it once it dies)
       if (p.loggedOutAt !== null) {
-        if (p.dead || now - p.loggedOutAt > 60_000) { this.finalizePlayerExit(p); continue; }
+        if (p.dead) { void this.finalizePlayerExitWithLease(p); continue; }
+        if (now - p.loggedOutAt > 60_000) {
+          // A disconnect must never become a free extraction. If the owner does
+          // not reconnect during the grace window, the exposed body dies and
+          // leaves its carried gear in the shared world.
+          this.damagePlayer(p, PLAYER_MAX_HP * 10, 'the zone', null, null);
+          void this.finalizePlayerExitWithLease(p);
+          continue;
+        }
         p.moving = false;
         continue; // frozen: still a target, but takes no input, survival, or actions
       }
-      if (p.dead) continue;
       const inst = this.inst(p);
+      if (p.dead) {
+        if (this.isBot(p)) {
+          if (!p.bot.respawnAt) p.bot.respawnAt = now + Math.max(5000, this.content.settings.bots.respawnMs | 0);
+          if (now >= p.bot.respawnAt) this.botRespawn(p);
+        }
+        continue;
+      }
+      if (this.isBot(p)) this.updateBot(p, inst, now);
       // near-station flags must follow you around — push the moment they change
       // (fixes "standing at the workbench but it says I need one")
       const stationMask =
-        (this.nearTile(p, Tile.Workbench) ? 1 : 0) |
-        (this.nearTile(p, Tile.Firepit) ? 2 : 0) |
-        (this.nearTile(p, Tile.Furnace) ? 4 : 0) |
-        (this.nearTile(p, Tile.Anvil) ? 8 : 0) |
+        (this.nearStation(p, 'workbench') ? 1 : 0) |
+        (this.nearStation(p, 'firepit') ? 2 : 0) |
+        (this.nearStation(p, 'furnace') ? 4 : 0) |
+        (this.nearStation(p, 'anvil') ? 8 : 0) |
         (this.nearTile(p, Tile.Water) ? 16 : 0);
       if (stationMask !== p.lastStationMask) {
         p.lastStationMask = stationMask;
         this.pushInventory(p);
       }
+      if (p.admin && p.adminMode) {
+        p.hunger = 100;
+        p.thirst = 100;
+        p.starveAcc = 0;
+      }
       // survival decay (paused inside hideouts — it's a rest space)
-      if (inst.kind !== 'hideout') {
+      if (inst.kind === 'world' && !(p.admin && p.adminMode)) {
         p.hunger = Math.max(0, p.hunger - HUNGER_DECAY_PER_S * dt);
         p.thirst = Math.max(0, p.thirst - THIRST_DECAY_PER_S * dt);
         if (p.hunger <= 0 || p.thirst <= 0) {
@@ -1839,7 +3730,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       }
       // timed actions: cancel on movement, complete on schedule
       if (p.action) {
-        if (Math.hypot(p.x - p.actionStart.x, p.y - p.actionStart.y) > 14) {
+        if (actionInterruptedByMovement(p.actionStart.x, p.actionStart.y, p.x, p.y)) {
           p.action = null;
           this.emitTo(p.sid, EV.action, { label: '', ms: 0 } satisfies ActionSnap);
         } else if (now >= p.action.until) {
@@ -1850,7 +3741,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       }
       // finish reloads
       if (p.reloadTarget && now >= p.reloadUntil) {
-        const def = ITEMS[p.reloadTarget];
+        const def = this.content.item(p.reloadTarget);
         if (def.weapon) {
           const have = p.mags[p.reloadTarget] ?? 0;
           const need = def.weapon.magSize - have;
@@ -1869,7 +3760,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (moving) p.facing = Math.atan2(dy, dx);
       else if (actionFacing) p.facing = p.input.angle;
       // sprint: hold to run, drains stamina; can't sprint while swimming/overweight/exhausted
-      const overweight = invWeight(p.inv) > invCapacity(p.inv).maxKg;
+      const overweight = invWeight(p.inv, this.content.items) > invCapacity(p.inv).maxKg;
       const wantSprint = !!p.input.sprint && moving && !this.inWater(inst, p) && !overweight
         && !p.staminaExhausted && p.stamina > 0;
       if (wantSprint) {
@@ -1890,7 +3781,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         const speed = PLAYER_SPEED
           * (this.inWater(inst, p) ? SWIM_SPEED_MULT : 1)
           * this.terrainMoveMultiplier(inst, p.x, p.y)
-          * (overweight ? OVERWEIGHT_SPEED_MULT : 1)
+          * fatigueMoveMultiplier(overweight, p.staminaExhausted, OVERWEIGHT_SPEED_MULT)
           * (wantSprint ? SPRINT_SPEED_MULT : 1);
         this.moveEntity(inst, p, dx * speed * dt, dy * speed * dt, PLAYER_RADIUS);
         p.moving = true;
@@ -1907,9 +3798,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (p.input.shoot) this.tryAttack(p, inst, now);
     }
 
-    const night = isNight((now % DAY_LENGTH_MS) / DAY_LENGTH_MS);
+    const day = (now % DAY_LENGTH_MS) / DAY_LENGTH_MS;
+    const night = isNight(day);
     for (const inst of this.instances.values()) {
       if (inst.kind === 'world') {
+        this.updateNightHorde(inst, now, day, night);
         this.updateEnemies(inst, dt, now, night);
         // chest restock
         for (const c of inst.containers.values()) {
@@ -1920,9 +3813,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             c.restockAt = null;
           }
         }
-        // node regrowth — rocks re-roll their ore vein so nobody camps a node:
-        // plain rock has the normal ore chances; a depleted ore vein only has a
-        // small chance to come back as the same ore, otherwise it's just rock
+        // Node regrowth selects a weighted published tree/rock variant. Rock
+        // family nodes then reroll their ore vein, preventing fixed rare camps.
+        let nodesRegrown = false;
         for (let i = inst.nodeRespawns.length - 1; i >= 0; i--) {
           const nr = inst.nodeRespawns[i];
           if (now < nr.at) continue;
@@ -1935,17 +3828,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             nr.at = now + 10_000;
             continue;
           }
-          let tile = nr.tile;
-          if (!nr.resourceId && tile === Tile.Rock) {
-            const roll = this.rnd();
-            tile = roll < IRON_CHANCE ? Tile.IronOre : roll < IRON_CHANCE + COPPER_CHANCE ? Tile.CopperOre : Tile.Rock;
-          } else if (!nr.resourceId && (tile === Tile.CopperOre || tile === Tile.IronOre)) {
-            if (this.rnd() >= 0.25) tile = Tile.Rock;
-          }
-          inst.tiles[nr.i] = tile;
-          this.io?.to(inst.id).emit(EV.tile, { i: nr.i, tile });
+          this.regrowResourceNode(inst, nr);
           inst.nodeRespawns.splice(i, 1);
+          nodesRegrown = true;
         }
+        if (nodesRegrown) void this.persistWorldState(inst);
         // enemy respawns
         for (let i = inst.enemyRespawns.length - 1; i >= 0; i--) {
           const er = inst.enemyRespawns[i];
@@ -1957,6 +3844,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         for (const [i, s] of inst.structures) {
           if (now < s.expiresAt) continue;
           inst.structures.delete(i);
+          inst.stationFuel.delete(i);
           const restore = s.under ?? Tile.Grass;
           inst.unders.delete(i);
           inst.tiles[i] = restore;
@@ -2061,9 +3949,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   ): boolean {
     let moved = false;
     const nx = e.x + dx;
-    if (Math.abs(this.elevationUnder(inst, nx, e.y) - this.elevationUnder(inst, e.x, e.y)) <= 1 && !this.isBlocked(inst, nx, e.y, radius, blocks)) { e.x = nx; moved = true; }
+    if (elevationStepAllowed(this.elevationUnder(inst, e.x, e.y), this.elevationUnder(inst, nx, e.y)) && !this.isBlocked(inst, nx, e.y, radius, blocks)) { e.x = nx; moved = true; }
     const ny = e.y + dy;
-    if (Math.abs(this.elevationUnder(inst, e.x, ny) - this.elevationUnder(inst, e.x, e.y)) <= 1 && !this.isBlocked(inst, e.x, ny, radius, blocks)) { e.y = ny; moved = true; }
+    if (elevationStepAllowed(this.elevationUnder(inst, e.x, e.y), this.elevationUnder(inst, e.x, ny)) && !this.isBlocked(inst, e.x, ny, radius, blocks)) { e.y = ny; moved = true; }
     return moved;
   }
 
@@ -2071,10 +3959,15 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   private tryAttack(p: ServerPlayer, inst: Instance, now: number) {
     const slot = p.equipped !== null ? p.inv.slots[p.equipped] : null;
-    const def = slot ? ITEMS[slot.id] : null;
+    const def = slot ? this.content.item(slot.id) : null;
     if (def?.kind === 'placeable') return; // held kits place via c:build, never swing
-    if (def?.weapon) this.tryShoot(p, inst, def.weapon, slot!.id, now);
-    else if (def?.kind === 'consumable') this.tryConsume(p, p.equipped!, now);
+    if (def?.kind === 'consumable') this.tryConsume(p, p.equipped!, now);
+    else if (!combatAttackAllowed(p.staminaExhausted)) {
+      if (now - p.lastExhaustedAttackToastAt > 1500) {
+        p.lastExhaustedAttackToastAt = now;
+        this.toast(p.sid, 'Too exhausted to attack');
+      }
+    } else if (def?.weapon) this.tryShoot(p, inst, def.weapon, slot!.id, now);
     else this.tryMelee(p, inst, def?.melee ?? FISTS, now);
   }
 
@@ -2083,7 +3976,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (now - p.lastAttackAt < 600) return;
     const item = p.inv.slots[slot];
     if (!item) return;
-    const def = ITEMS[item.id];
+    const def = this.content.item(item.id);
     // items with a contextual action (cook raw / fill canteen) always try; pure
     // heal/food/drink are skipped when the need is already full so holding the
     // button doesn't chew the stack or spam "not hungry"
@@ -2097,7 +3990,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.invUse(p.sid, slot);
   }
 
-  private tryShoot(p: ServerPlayer, inst: Instance, w: WeaponStats, weaponId: ItemId, now: number) {
+  private tryShoot(p: ServerPlayer, inst: Instance, w: RuntimeWeaponStats, weaponId: ItemId, now: number) {
     if (now - p.lastAttackAt < w.fireRateMs) return;
     if (now < p.reloadUntil) return; // mid-reload
     if (this.inWater(inst, p)) {
@@ -2160,13 +4053,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     this.pushInventory(p);
   }
 
-  private startReload(p: ServerPlayer, weaponId: ItemId, w: WeaponStats, now: number, auto = false) {
+  private startReload(p: ServerPlayer, weaponId: ItemId, w: RuntimeWeaponStats, now: number, auto = false) {
     if (now < p.reloadUntil) return;
     const mag = p.mags[weaponId] ?? 0;
     if (mag >= w.magSize) return;
     if (this.countItem(p.inv, w.ammo) <= 0) {
       if (!auto || now - p.lastAttackAt > 800) {
-        this.toast(p.sid, `No ${ITEMS[w.ammo].name}`);
+        this.toast(p.sid, `No ${this.content.item(w.ammo).name}`);
         p.lastAttackAt = now;
       }
       return;
@@ -2180,7 +4073,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const p = this.players.get(sid);
     if (!p || p.dead || p.equipped === null) return;
     const slot = p.inv.slots[p.equipped];
-    const def = slot ? ITEMS[slot.id] : null;
+    const def = slot ? this.content.item(slot.id) : null;
     if (def?.weapon) this.startReload(p, slot!.id, def.weapon, Date.now());
   }
 
@@ -2261,6 +4154,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (!totalHits) continue;
 
       const isTree = resourceDef ? resourceDef.skill === 'woodcutting' : tile === Tile.Tree;
+      const genericRockResource = Boolean(resourceDef && resourceDef.tile === Tile.Rock && !isTree);
       const skill = resourceDef?.skill ?? (isTree ? 'woodcutting' : 'mining');
       const bonus = Math.floor((skillLevel(p.skills[skill]) - 1) / 5);
       // swinging at a node is hard work — costs stamina and slows you when spent
@@ -2273,13 +4167,19 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       let awarded = 0;
       if (resourceDef) {
         for (const drop of resourceDef.drops) {
-          if (drop.when !== 'hit' || this.rnd() > drop.chance || !(drop.itemId in ITEMS)) continue;
+          if (drop.when !== 'hit' || this.rnd() > drop.chance || !this.content.hasItem(drop.itemId)) continue;
           const quantity = drop.min + Math.floor(this.rnd() * (drop.max - drop.min + 1)) + bonus;
           awarded += quantity - this.addItem(p.inv, drop.itemId as ItemId, quantity);
         }
+        const ore = genericRockResource ? ORE_YIELD[tile] : undefined;
+        const explicitOreDrop = Boolean(ore && resourceDef.drops.some((drop) => drop.when === 'hit' && drop.itemId === ore && drop.chance > 0));
+        if (ore && !explicitOreDrop && this.addItem(p.inv, ore, 1) === 0) {
+          awarded++;
+          this.addXp(p, 'mining', 4);
+        }
         if (left <= 0) {
           for (const drop of resourceDef.drops) {
-            if (drop.when !== 'depleted' || this.rnd() > drop.chance || !(drop.itemId in ITEMS)) continue;
+            if (drop.when !== 'depleted' || this.rnd() > drop.chance || !this.content.hasItem(drop.itemId)) continue;
             const quantity = drop.min + Math.floor(this.rnd() * (drop.max - drop.min + 1));
             awarded += quantity - this.addItem(p.inv, drop.itemId as ItemId, quantity);
           }
@@ -2301,9 +4201,21 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       if (left <= 0) {
         inst.nodeHits.delete(i);
         const depleted = resourceDef?.depletedTile ?? NODE_DEPLETED[tile] ?? Tile.Grass;
+        const family: ResourceFamily = this.content.resourceFamily(resourceDef, tile) ?? (isTree ? 'tree' : 'rock');
+        const previousVariant = inst.nodeVariants.get(i);
+        const baseTile = previousVariant?.baseTile ?? tile;
+        const baseResourceId = previousVariant?.baseResourceId ?? resourceId ?? '';
         inst.tiles[i] = depleted;
         this.io?.to(inst.id).emit(EV.tile, { i, tile: depleted });
-        inst.nodeRespawns.push({ i, tile, at: now + (resourceDef?.respawnMs ?? NODE_RESPAWN_MS), resourceId });
+        inst.nodeRespawns.push({
+          i,
+          at: now + (resourceDef?.respawnMs ?? NODE_RESPAWN_MS),
+          family,
+          depletedTile: depleted,
+          baseTile,
+          baseResourceId,
+        });
+        void this.persistWorldState(inst);
         this.toast(p.sid, `${resourceDef?.name ?? (isTree ? 'Tree' : 'Rock')} depleted`);
       } else {
         inst.nodeHits.set(i, left);
@@ -2498,6 +4410,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         : e.kind === 'rabbit' ? 12
         : e.kind === 'boar' ? 13
         : e.kind === 'wolf' ? 14
+        : e.kind === 'fox' ? 15
+        : e.kind === 'bear' ? 16
         : 9,
     };
     for (const viewer of this.players.values()) {
@@ -2528,7 +4442,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const id = `b${this.nextId++}`;
       inst.containers.set(id, { id, x: e.x, y: e.y, kind: 'bag', tier: 'normal', slots: drops, restockAt: null });
     }
-    inst.enemyRespawns.push({ x: e.homeX, y: e.homeY, kind: e.kind, respawnMs: e.respawnMs, at: Date.now() + e.respawnMs + this.rnd() * 30_000 });
+    this.nightHordeIds.delete(e.id);
+    if (e.respawnMs > 0) inst.enemyRespawns.push({ x: e.homeX, y: e.homeY, kind: e.kind, respawnMs: e.respawnMs, at: Date.now() + e.respawnMs + this.rnd() * 30_000 });
   }
 
   /** Straight-line sight check — walls, trees and rock block vision. */
@@ -2624,8 +4539,13 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     weapon: ItemId | null,
     killer: ServerPlayer | null,
   ) {
-    if (target.dead) return;
-    const mitigated = Math.max(1, Math.round(dmg * armorMultiplier(target.equipment)));
+    if (target.dead || (target.admin && target.adminMode)) return;
+    if (actionInterruptedByDamage(Boolean(target.action), dmg)) {
+      target.action = null;
+      this.emitTo(target.sid, EV.action, { label: '', ms: 0 } satisfies ActionSnap);
+      this.toast(target.sid, 'Action interrupted by damage');
+    }
+    const mitigated = Math.max(1, Math.round(dmg * armorMultiplier(target.equipment, this.content.items)));
     // armor soaks the hit and wears down for it
     if (target.equipment.helmet) this.wearArmor(target, 'helmet');
     if (target.equipment.vest) this.wearArmor(target, 'vest');
@@ -2644,16 +4564,20 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     }
 
     const inst = this.inst(target);
-    const dropped = target.inv.slots.filter((s): s is NonNullable<InvSlot> => !!s);
-    if (target.equipment.helmet) dropped.push({ id: target.equipment.helmet, qty: 1 });
-    if (target.equipment.vest) dropped.push({ id: target.equipment.vest, qty: 1 });
-    if (target.equipment.mod) dropped.push({ id: target.equipment.mod, qty: 1 });
+    const dropped = collectCarriedDrops(target.inv, target.equipment, target.armorDur, this.content.items);
     if (dropped.length > 0) {
       const id = `b${this.nextId++}`;
       inst.containers.set(id, { id, x: target.x, y: target.y, kind: 'bag', tier: 'normal', slots: dropped, restockAt: null });
     }
+    if (this.isBot(target)) {
+      this.telemetry.record({
+        kind: 'bot_contribution', value: dropped.reduce((value, slot) => value + this.content.estimatedItemValue(slot.id) * slot.qty, 0),
+        credits: target.money, source: 'bot_death', metadata: { bot: target.name, droppedStacks: dropped.length },
+      });
+    }
     target.inv = this.starterInventory();
     target.equipment = { helmet: null, vest: null, mod: null };
+    target.armorDur = {};
     target.equipped = null;
     target.mags = {};
     this.pushInventory(target);
@@ -2699,6 +4623,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         look: p.appearance.outfit,
         appearance: p.appearance,
         hitAt: now - p.lastHitAt < 1000 ? p.lastHitAt : 0,
+        admin: p.admin,
+        guest: p.guest,
       });
     }
     const allEnemies: StateSnap['enemies'] = [...inst.enemies.values()].map((e) => ({
@@ -2716,30 +4642,53 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const base = {
       t: now,
       day: (now % DAY_LENGTH_MS) / DAY_LENGTH_MS,
-      projectiles: inst.projectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x), y: Math.round(pr.y), angle: pr.angle })),
-      containers: [...inst.containers.values()].map(
-        (c): ContainerSnap => ({ id: c.id, x: c.x, y: c.y, kind: c.kind, looted: c.slots.every((s) => !s) }),
-      ),
-      ground: [...inst.ground.values()].map(
-        (g): GroundItemSnap => ({ id: g.id, x: Math.round(g.x), y: Math.round(g.y), item: g.item, qty: g.qty }),
-      ),
+      population: allPlayers.length,
     };
-    if (inst.kind === 'hideout') {
+    const allProjectiles = inst.projectiles.map((pr) => ({ id: pr.id, x: Math.round(pr.x), y: Math.round(pr.y), angle: pr.angle }));
+    const allContainers = [...inst.containers.values()].map(
+      (c): ContainerSnap => ({ id: c.id, x: c.x, y: c.y, kind: c.kind, looted: c.slots.every((s) => !s) }),
+    );
+    const allGround = [...inst.ground.values()].map(
+      (g): GroundItemSnap => ({
+        id: g.id, x: Math.round(g.x), y: Math.round(g.y), item: g.item, qty: g.qty,
+        ...(g.dur !== undefined ? { dur: g.dur } : {}),
+      }),
+    );
+    if (inst.kind !== 'world') {
       // your own camp: nothing to hide
-      this.io.to(inst.id).emit(EV.state, { ...base, players: allPlayers, enemies: allEnemies } satisfies StateSnap);
+      this.io.to(inst.id).emit(EV.state, {
+        ...base, players: allPlayers, mapPlayers: [], enemies: allEnemies,
+        projectiles: allProjectiles, containers: allContainers, ground: allGround,
+      } satisfies StateSnap);
       return;
     }
     // per-viewer snapshots: walls (and forest) hide other players, NPCs and enemies
     for (const viewer of this.players.values()) {
       if (viewer.instanceId !== inst.id) continue;
-      const sees = (x: number, y: number) =>
-        viewer.dead ||
-        Math.hypot(x - viewer.x, y - viewer.y) < GameService.SENSE_RANGE ||
-        this.losClear(inst, viewer.x, viewer.y, x, y);
+      const sees = (x: number, y: number) => {
+        if (viewer.dead || (viewer.admin && viewer.adminMode)) return true;
+        const distance = Math.hypot(x - viewer.x, y - viewer.y);
+        return distance < GameService.SENSE_RANGE
+          || (distance < SNAPSHOT_VIEW_RANGE && this.losClear(inst, viewer.x, viewer.y, x, y));
+      };
       const snap: StateSnap = {
         ...base,
         players: allPlayers.filter((s) => s.id === viewer.sid || sees(s.x, s.y)),
+        mapPlayers: allPlayers.flatMap((snapshot) => {
+          if (snapshot.id === viewer.sid) return [];
+          const other = this.players.get(snapshot.id);
+          if (!other || other.dead || this.isBot(other)) return [];
+          const sameClan = Boolean(viewer.clanId && other.clanId === viewer.clanId);
+          const isFriend = viewer.friendUserIds.has(other.userId);
+          const adminTracking = viewer.admin && viewer.adminMode;
+          if (!adminTracking && !sameClan && !isFriend) return [];
+          return [{ id: snapshot.id, name: snapshot.name, x: snapshot.x, y: snapshot.y,
+            relation: adminTracking ? 'admin' as const : sameClan ? 'clan' as const : 'friend' as const }];
+        }),
         enemies: allEnemies.filter((s) => sees(s.x, s.y)),
+        projectiles: allProjectiles.filter((s) => sees(s.x, s.y)),
+        containers: allContainers.filter((s) => sees(s.x, s.y)),
+        ground: allGround.filter((s) => sees(s.x, s.y)),
       };
       this.emitTo(viewer.sid, EV.state, snap);
     }
@@ -2749,22 +4698,24 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     // never hold an empty slot (e.g. after finishing a stack of food in hand)
     if (p.equipped !== null && !p.inv.slots[p.equipped]) p.equipped = null;
     const eqSlot = p.equipped !== null ? p.inv.slots[p.equipped] : null;
-    const mag = eqSlot && ITEMS[eqSlot.id].weapon ? p.mags[eqSlot.id] ?? 0 : 0;
+    const mag = eqSlot && this.content.item(eqSlot.id).weapon ? p.mags[eqSlot.id] ?? 0 : 0;
     this.emitTo(p.sid, EV.inventory, {
       inv: p.inv,
       equipped: p.equipped,
       equipment: p.equipment,
+      armorDur: p.armorDur,
       hp: p.hp,
       kills: p.kills,
       deaths: p.deaths,
       money: p.money,
       skills: p.skills,
+      quests: this.trackedQuests(p),
       mag,
       reloading: !!p.reloadTarget,
-      nearWorkbench: this.nearTile(p, Tile.Workbench),
-      nearFirepit: this.nearTile(p, Tile.Firepit),
-      nearFurnace: this.nearTile(p, Tile.Furnace),
-      nearAnvil: this.nearTile(p, Tile.Anvil),
+      nearWorkbench: this.nearStation(p, 'workbench'),
+      nearFirepit: this.nearStation(p, 'firepit'),
+      nearFurnace: this.nearStation(p, 'furnace'),
+      nearAnvil: this.nearStation(p, 'anvil'),
       nearWater: this.nearTile(p, Tile.Water),
       hunger: Math.round(p.hunger),
       thirst: Math.round(p.thirst),
@@ -2784,6 +4735,62 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async saveAll() {
-    await Promise.all([...this.players.values()].map((p) => this.saveProfileOf(p)));
+    const world = this.instances.get(WORLD);
+    await Promise.all([
+      ...[...this.players.values()].map((p) => this.saveProfileOf(p)),
+      ...[...this.instances.values()].flatMap((instance) => instance.clanId && instance.players > 0 ? [this.db.renewClanHideoutLease(instance.clanId)] : []),
+      world ? this.persistWorldState(world) : Promise.resolve(),
+    ]);
+  }
+
+  private async renewPlayerLeases() {
+    await Promise.all([...this.players.values()].flatMap((player) => {
+      if (this.isBot(player) || player.guest || this.exitingPlayers.has(player.sid)) return [];
+      return [this.db.renewPlayerWorldLease(player.userId, player.sid, PLAYER_LEASE_TTL_SECONDS)
+        .then(async (renewed) => {
+          if (renewed) return;
+          // A successful query that updates nothing means another simulation
+          // owns this survivor. Discard this stale in-memory copy immediately.
+          this.telemetry.record({
+            kind: 'profile_lease_conflict',
+            userId: player.userId,
+            source: 'lease_heartbeat',
+            metadata: { serverKey: this.db.serverStateKey },
+          });
+          this.toast(player.sid, 'Your survivor became active on another relay');
+          await this.evictPersonalHideoutVisitors(player.userId);
+          this.finalizePlayerExit(player);
+          this.io?.sockets.sockets.get(player.sid)?.disconnect(true);
+        })
+        .catch((error) => {
+          // A transient database outage is not proof that ownership changed.
+          // Guarded profile writes still prevent stale progress from committing.
+          this.log.warn(`Player lease heartbeat unavailable: ${(error as Error).message}`);
+        })];
+    }));
+  }
+
+  runtimeStats() {
+    const players = [...this.players.values()];
+    const world = this.instances.get(WORLD);
+    const memory = process.memoryUsage();
+    return {
+      players: players.filter((player) => !this.isBot(player)).length,
+      guests: players.filter((player) => !this.isBot(player) && player.guest).length,
+      registeredPlayers: players.filter((player) => !this.isBot(player) && !player.guest).length,
+      bots: players.filter((player) => this.isBot(player)).length,
+      capacity: MAX_PLAYERS_PER_SERVER,
+      instances: this.instances.size,
+      worldEnemies: world?.enemies.size ?? 0,
+      worldContainers: world?.containers.size ?? 0,
+      worldGroundItems: world?.ground.size ?? 0,
+      activeMapId: this.activeMapId,
+      activeMapVersion: this.activeMapVersion || null,
+      memoryMb: {
+        rss: Math.round(memory.rss / 1024 / 1024),
+        heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
+        heapTotal: Math.round(memory.heapTotal / 1024 / 1024),
+      },
+    };
   }
 }

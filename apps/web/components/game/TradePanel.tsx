@@ -1,5 +1,6 @@
-import { InventoryUpdate, ITEMS, ItemId, TradeOpen } from '@holdout/shared';
+import { InventoryUpdate, ItemId, TradeOpen } from '@holdout/shared';
 import { Tip, itemTip } from '@/components/Tooltip';
+import { itemDef } from '@/lib/runtime-gameplay';
 import { ItemIcon } from './ItemIcon';
 
 export type TradeTab = 'buy' | 'sell' | 'jobs';
@@ -81,8 +82,8 @@ export function TradePanel({
           <div className="craft-detail">
             {selectedBuy && (
               <>
-                <div className="cd-head"><ItemIcon id={selectedBuy.id} size={40} /><div><b>{ITEMS[selectedBuy.id].name}</b></div></div>
-                <div className="cd-desc">{ITEMS[selectedBuy.id].desc}</div>
+                <div className="cd-head"><ItemIcon id={selectedBuy.id} size={40} /><div><b>{itemDef(selectedBuy.id).name}</b></div></div>
+                <div className="cd-desc">{itemDef(selectedBuy.id).desc}</div>
                 <div className="cd-costs">
                   <div className={inventory.money >= selectedBuy.buy ? 'have' : 'missing'}>
                     PRICE <span className="cd-count">{selectedBuy.buy} cr</span>
@@ -122,9 +123,9 @@ export function TradePanel({
               <>
                 <div className="cd-head">
                   <ItemIcon id={selectedSell.item.id} size={40} />
-                  <div><b>{ITEMS[selectedSell.item.id].name}</b><span className="cd-qty"> &times;{selectedSell.item.qty}</span></div>
+                  <div><b>{itemDef(selectedSell.item.id).name}</b><span className="cd-qty"> &times;{selectedSell.item.qty}</span></div>
                 </div>
-                <div className="cd-desc">{ITEMS[selectedSell.item.id].desc}</div>
+                <div className="cd-desc">{itemDef(selectedSell.item.id).desc}</div>
                 <div className="cd-costs">
                   <div className="have">EACH <span className="cd-count">{selectedSell.entry.sell} cr</span></div>
                   <div className="have">WHOLE STACK <span className="cd-count">{selectedSell.entry.sell * selectedSell.item.qty} cr</span></div>
@@ -148,9 +149,9 @@ export function TradePanel({
                 <div className="job-desc">
                   {quest.def.desc || (quest.def.kind === 'kill'
                     ? `Kill ${quest.def.count} ${quest.def.target}s`
-                    : `Bring ${quest.def.count} ${ITEMS[quest.def.target as ItemId]?.name ?? quest.def.target}`)}
+                    : `Bring ${quest.def.count} ${itemDef(quest.def.target).name}`)}
                   {' '}&middot; {quest.progress}/{quest.def.count}
-                  {' '}&middot; reward {quest.def.rewardMoney}cr{quest.def.rewardItem ? ` + ${ITEMS[quest.def.rewardItem].name}` : ''}
+                  {' '}&middot; reward {quest.def.rewardMoney}cr{quest.def.rewardItem ? ` + ${itemDef(quest.def.rewardItem).name}` : ''}
                 </div>
               </div>
               {quest.claimed

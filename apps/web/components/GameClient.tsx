@@ -5,6 +5,8 @@ import { useRouter } from 'next/navigation';
 import { io, Socket } from 'socket.io-client';
 import {
   ActionSnap,
+  AdminActionPayload,
+  AdminPanelState,
   BACKPACKS,
   BUILDABLES,
   BlockUpdate,
@@ -15,15 +17,15 @@ import {
   FLOOR_TILES,
   HitSnap,
   INTERACT_RANGE,
-  ITEMS,
   InventoryUpdate,
   ItemId,
   KillFeedEntry,
-  RECIPES,
   RecipeCat,
+  RuntimeGameplayContent,
   SKILL_LIST,
   StateSnap,
   StationOpen,
+  StationFuelUpdate,
   TILE,
   Tile,
   TileUpdate,
@@ -46,21 +48,25 @@ import { CookingPanel } from '@/components/game/CookingPanel';
 import { CraftingPanel } from '@/components/game/CraftingPanel';
 import { ItemIcon } from '@/components/game/ItemIcon';
 import { SkillsPanel } from '@/components/game/SkillsPanel';
-import { FriendContact, SocialPanel } from '@/components/game/SocialPanel';
+import { ClanInvitation, ClanSummary, FriendContact, SocialPanel } from '@/components/game/SocialPanel';
 import { DeathOverlay, PauseOverlay } from '@/components/game/SystemOverlays';
 import { TradePanel, TradeTab } from '@/components/game/TradePanel';
-import { WORLD_MAP_SIZE, WorldMapIcon, WorldMapOverlay } from '@/components/game/WorldMapOverlay';
+import { WORLD_MAP_DEFAULT_ZOOM, WORLD_MAP_SIZE, WorldMapIcon, WorldMapOverlay, type WorldMapViewport } from '@/components/game/WorldMapOverlay';
+import { AdminPanel } from '@/components/game/AdminPanel';
+import { applyRuntimeGameplay, itemDef, runtimeItems, runtimeRecipes } from '@/lib/runtime-gameplay';
+import { applyRuntimeVisuals } from '@/lib/runtime-visuals';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 /** the server picked in the login-screen server browser (falls back to env) */
 function gameServerUrl(): string {
   try {
-    return localStorage.getItem('holdout_server_url') || API_URL;
+    return new URLSearchParams(window.location.search).get('server') || localStorage.getItem('holdout_server_url') || API_URL;
   } catch {
     return API_URL;
   }
 }
 const MINIMAP_SIZE = 168;
+const MINIMAP_VISIBLE_TILES = 72;
 
 interface Toast { id: number; msg: string }
 interface FloatRec { x: number; y: number; amount: number; kind: DamageFloat['kind']; label?: string; at: number }
@@ -69,19 +75,20 @@ const SKILL_ABBR: Record<string, string> = { woodcutting: 'WC', mining: 'MIN', s
 
 // starter objectives — gives new players a direction (tracked locally, once done stays done)
 const OBJECTIVES: { id: string; label: string }[] = [
-  { id: 'wood', label: 'Punch a tree for wood' },
+  { id: 'deploy', label: 'Deploy via the door mat (E)' },
+  { id: 'wood', label: 'Collect wood from a tree' },
   { id: 'spear', label: 'Craft a Wooden Spear (C)' },
   { id: 'kill', label: 'Make your first kill' },
+  { id: 'extract', label: 'Extract safely at a beacon' },
+  { id: 'trade', label: 'Meet an outpost trader' },
   { id: 'cook', label: 'Cook a meal at a firepit' },
-  { id: 'trade', label: 'Trade at the outpost' },
   { id: 'build', label: 'Build something at home (B)' },
-  { id: 'extract', label: 'Extract from the zone' },
 ];
 
 // tiles a player can reclaim in their own camp (built chests sit on grass, handled separately)
 const DEMOLISHABLE = new Set<number>([
   Tile.WoodFloor, Tile.StoneFloor, Tile.WoodWall, Tile.Door, Tile.Fence, Tile.Torch,
-  Tile.Workbench, Tile.Firepit, Tile.Furnace,
+  Tile.Workbench, Tile.Firepit, Tile.Furnace, Tile.Anvil, Tile.Bed,
 ]);
 
 type DragZone = 'inv' | 'cont' | 'helmet' | 'vest' | 'mod' | 'weapon';
@@ -90,9 +97,13 @@ interface CtxMenu { x: number; y: number; zone: DragZone; index: number; item: I
 
 export default function GameClient() {
   const router = useRouter();
+  const guestRequested = useRef<boolean>((() => {
+    try { return new URLSearchParams(window.location.search).get('guest') === '1'; } catch { return false; }
+  })()).current;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const minimapRef = useRef<HTMLCanvasElement>(null);
   const worldMapRef = useRef<HTMLCanvasElement>(null);
+  const worldMapViewRef = useRef<WorldMapViewport>({ centerX: 0, centerY: 0, zoom: WORLD_MAP_DEFAULT_ZOOM });
   const socketRef = useRef<Socket | null>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const snapRef = useRef<StateSnap | null>(null);
@@ -113,6 +124,7 @@ export default function GameClient() {
   const promptRef = useRef<string | null>(null);
   const safeRef = useRef(false);
   const friendNamesRef = useRef(new Set<string>());
+  const clanNamesRef = useRef(new Set<string>());
   const latestInvRef = useRef<InventoryUpdate | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const dragStart = useRef({ x: 0, y: 0 });
@@ -123,7 +135,7 @@ export default function GameClient() {
   const heldKitRef = useRef<{ slot: number; item: ItemId } | null>(null); // equipped placeable = placement mode
   const buildRotationRef = useRef(0);
   const chatOpenRef = useRef(false);
-  const menuRef = useRef({ gear: false, craft: false, skills: false, social: false, map: false });
+  const menuRef = useRef({ gear: false, craft: false, skills: false, social: false, map: false, admin: false });
   const lootContRef = useRef<string | null>(null); // container the loot queue belongs to
   const lootAwaitRef = useRef<{ slot: number; at: number } | null>(null); // fired, waiting on server
   const cookAwaitRef = useRef<{ slot: number; at: number } | null>(null);
@@ -138,12 +150,18 @@ export default function GameClient() {
 
   const [connected, setConnected] = useState(false);
   const [failed, setFailed] = useState('');
+  const [, setGameplayRevision] = useState('fallback');
   const [inv, setInv] = useState<InventoryUpdate | null>(null);
   const [showGear, setShowGear] = useState(false);
   const [showCraft, setShowCraft] = useState(false);
   const [showSocial, setShowSocial] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
   const [showMap, setShowMap] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [isGuest, setIsGuest] = useState(guestRequested);
+  const [adminPanel, setAdminPanel] = useState<AdminPanelState | null>(null);
+  const [worldMapView, setWorldMapView] = useState<WorldMapViewport>(worldMapViewRef.current);
   const [craftTab, setCraftTab] = useState<RecipeCat>('survival');
   const [craftSel, setCraftSel] = useState<string | null>(null);
   const [container, setContainer] = useState<ContainerContents | null>(null);
@@ -160,11 +178,18 @@ export default function GameClient() {
   const [inSafe, setInSafe] = useState(false);
   const [inHideout, setInHideout] = useState(false);
   const [ownHideout, setOwnHideout] = useState(false);
+  const [canDemolishHideout, setCanDemolishHideout] = useState(false);
   const [hurtAt, setHurtAt] = useState(0);
   const [muted, setMuted] = useState(false);
   const [friends, setFriends] = useState<FriendContact[]>([]);
   const [friendUsername, setFriendUsername] = useState('');
   const [friendMsg, setFriendMsg] = useState('');
+  const [clan, setClan] = useState<ClanSummary | null>(null);
+  const [clanInvitations, setClanInvitations] = useState<ClanInvitation[]>([]);
+  const [clanName, setClanName] = useState('');
+  const [clanTag, setClanTag] = useState('');
+  const [clanUsername, setClanUsername] = useState('');
+  const [clanMsg, setClanMsg] = useState('');
   const [drag, setDrag] = useState<DragState | null>(null);
   const [dragPos, setDragPos] = useState({ x: 0, y: 0 });
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
@@ -175,7 +200,7 @@ export default function GameClient() {
   const [lootQueue, setLootQueue] = useState<number[]>([]); // container slots queued for taking
   const [cookQueue, setCookQueue] = useState<number[]>([]); // inventory slots queued for cooking
   const [craftQueue, setCraftQueue] = useState<string[]>([]); // recipe ids queued for crafting
-  const [station, setStation] = useState<'firepit' | null>(null); // open campfire UI
+  const [station, setStation] = useState<StationOpen | null>(null);
   const [clock, setClock] = useState('');
   const [demolishMode, setDemolishMode] = useState(false); // camp demolish mode (X)
   const [buildRotation, setBuildRotation] = useState(0);
@@ -217,7 +242,7 @@ export default function GameClient() {
     latestInvRef.current = inv;
     // holding a build kit in hand = placement mode (ghost + click-to-place)
     const s = inv?.equipped !== null && inv?.equipped !== undefined ? inv.inv.slots[inv.equipped] : null;
-    const next = s && ITEMS[s.id].place ? { slot: inv!.equipped!, item: s.id } : null;
+    const next = s && itemDef(s.id).place ? { slot: inv!.equipped!, item: s.id } : null;
     if (heldKitRef.current?.item !== next?.item) {
       buildRotationRef.current = 0;
       setBuildRotation(0);
@@ -253,9 +278,8 @@ export default function GameClient() {
     const has = (id: ItemId) => inv.inv.slots.some((s) => s && s.id === id);
     const next: Record<string, boolean> = { ...objectives };
     if (!next.wood && has('wood')) next.wood = true;
-    if (!next.spear && (has('spear') || inv.inv.slots.some((s) => s && ITEMS[s.id].melee && s.id !== 'fishing_rod'))) next.spear = true;
+    if (!next.spear && has('spear')) next.spear = true;
     if (!next.kill && inv.kills > 0) next.kill = true;
-    if (!next.cook && (has('cooked_meat') || has('cooked_fish'))) next.cook = true;
     if (JSON.stringify(next) !== JSON.stringify(objectives)) {
       setObjectives(next);
       localStorage.setItem('holdout_objectives', JSON.stringify(next));
@@ -300,14 +324,14 @@ export default function GameClient() {
       return () => clearTimeout(t);
     }
     const slots = inv?.inv.slots;
-    if (!slots || !inv?.nearFirepit) { setCookQueue([]); return; }
+    if (!slots || !inv?.nearFirepit || station?.type !== 'firepit' || (station.fuel ?? 0) <= 0) { setCookQueue([]); return; }
     const i = cookQueue[0];
     setCookQueue((q) => q.slice(1));
     const s = slots[i];
-    if (!s || !ITEMS[s.id].raw) return; // stack moved or finished — skip this entry
+    if (!s || !itemDef(s.id).raw) return; // stack moved or finished — skip this entry
     cookAwaitRef.current = { slot: i, at: Date.now() };
     socketRef.current?.emit(EV.invUse, { slot: i });
-  }, [action, inv, cookQueue]);
+  }, [action, inv, cookQueue, station]);
   // Craft queue: each craft is a timed server action; fire the next once the bar clears.
   useEffect(() => {
     if (action) { craftAwaitRef.current = null; return; }
@@ -320,12 +344,12 @@ export default function GameClient() {
     }
     const id = craftQueue[0];
     setCraftQueue((q) => q.slice(1));
-    const r = RECIPES.find((x) => x.id === id);
-    const have = (iid: ItemId) => inv?.inv.slots.reduce((n, s) => n + (s && s.id === iid ? s.qty : 0), 0) ?? 0;
-    if (!r || !r.cost.every((c) => have(c.id) >= c.qty)) return; // can no longer pay — skip
+    const r = runtimeRecipes().find((x) => x.id === id);
+    const have = (iid: string) => inv?.inv.slots.reduce((n, s) => n + (s && s.id === iid ? s.qty : 0), 0) ?? 0;
+    if (!r || !r.cost.every((c) => have(c.id) >= c.qty) || (r.station === 'furnace' && (station?.fuel ?? 0) <= 0)) return; // can no longer pay or fuel it — skip
     craftAwaitRef.current = Date.now();
     socketRef.current?.emit(EV.craft, { recipe: id });
-  }, [action, craftQueue, inv]);
+  }, [action, craftQueue, inv, station]);
 
   // if you walk away from a station while its exclusive craft tab is open, fall back
   useEffect(() => {
@@ -335,23 +359,45 @@ export default function GameClient() {
   }, [inv, craftTab]);
 
   useEffect(() => {
-    menuRef.current = { gear: showGear, craft: showCraft, skills: showSkills, social: showSocial, map: showMap };
-  }, [showGear, showCraft, showSkills, showSocial, showMap]);
+    menuRef.current = { gear: showGear, craft: showCraft, skills: showSkills, social: showSocial, map: showMap, admin: showAdmin };
+  }, [showGear, showCraft, showSkills, showSocial, showMap, showAdmin]);
   useEffect(() => { chatOpenRef.current = chatOpen; if (chatOpen) chatInputRef.current?.focus(); }, [chatOpen]);
 
+  const updateWorldMapView = useCallback((next: WorldMapViewport) => {
+    worldMapViewRef.current = next;
+    setWorldMapView(next);
+  }, []);
+
+  const getMapPlayerPosition = useCallback(() => {
+    const id = youRef.current;
+    const displayed = displayPos.current.get(id);
+    if (displayed) return { x: displayed.x / TILE, y: displayed.y / TILE };
+    const player = snapRef.current?.players.find((entry) => entry.id === id);
+    return player ? { x: player.x / TILE, y: player.y / TILE } : null;
+  }, []);
+
   // exactly one full-screen menu open at a time (no stacking)
-  const only = useCallback((which: 'gear' | 'craft' | 'skills' | 'social' | 'map' | null) => {
+  const only = useCallback((which: 'gear' | 'craft' | 'skills' | 'social' | 'map' | 'admin' | null) => {
+    if (which === 'map') {
+      const player = getMapPlayerPosition();
+      if (player) updateWorldMapView({ ...worldMapViewRef.current, centerX: player.x, centerY: player.y });
+    }
     setShowGear(which === 'gear');
     setShowCraft(which === 'craft');
     setShowSkills(which === 'skills');
     setShowSocial(which === 'social');
     setShowMap(which === 'map');
+    setShowAdmin(which === 'admin');
+    if (which === 'admin') {
+      setAdminPanel(null);
+      socketRef.current?.emit(EV.adminRequest);
+    }
     setTrade(null);
     setStation(null);
     if (which !== 'gear') { setContainer(null); socketRef.current?.emit(EV.containerClose); }
     if (which !== null) setDemolishMode(false);
     setEscMenu(false);
-  }, []);
+  }, [getMapPlayerPosition, updateWorldMapView]);
 
   // no build mode: holding a kit IS placement — equip it, ghost follows, click places
   const holdKit = useCallback((slot: number) => {
@@ -364,8 +410,8 @@ export default function GameClient() {
   }, [only, pushToast]);
 
   const toggleDemolish = useCallback(() => {
-    if (!initRef.current?.ownHideout) {
-      pushToast('Demolish only works in your own camp');
+    if (!initRef.current?.canDemolish) {
+      pushToast(initRef.current?.kind === 'clan_hideout' ? 'Only clan officers and the owner can demolish here' : 'Demolish only works in your own camp');
       return;
     }
     only(null);
@@ -377,7 +423,7 @@ export default function GameClient() {
   const useSlot = useCallback((i: number) => {
     const s = latestInvRef.current?.inv.slots[i];
     if (!s) return;
-    const def = ITEMS[s.id];
+    const def = itemDef(s.id);
     const kind = def.kind;
     if (kind === 'weapon' || kind === 'tool' || kind === 'consumable' || kind === 'placeable')
       socketRef.current?.emit(EV.invEquip, { slot: i });
@@ -391,7 +437,7 @@ export default function GameClient() {
     const cand: number[] = [];
     for (let i = 0; i < 5 && i < u.inv.slots.length; i++) {
       const s = u.inv.slots[i];
-      const k = s && ITEMS[s.id].kind;
+      const k = s && itemDef(s.id).kind;
       if (k === 'weapon' || k === 'tool' || k === 'consumable' || k === 'placeable') cand.push(i);
     }
     if (cand.length === 0) return;
@@ -404,6 +450,7 @@ export default function GameClient() {
   }, []);
 
   const refreshFriends = useCallback(async () => {
+    if (guestRequested) return;
     try {
       const res = await fetch('/api/friends');
       if (!res.ok) return;
@@ -415,9 +462,28 @@ export default function GameClient() {
           .map((friend: FriendContact) => friend.name),
       );
     } catch { /* offline is fine */ }
-  }, []);
+  }, [guestRequested]);
 
-  useEffect(() => { void refreshFriends(); }, [refreshFriends]);
+  const refreshClans = useCallback(async () => {
+    if (guestRequested) return;
+    try {
+      const response = await fetch('/api/clans');
+      if (!response.ok) return;
+      const data = await response.json();
+      setClan(data.clan ?? null);
+      setClanInvitations(data.invitations ?? []);
+      clanNamesRef.current = new Set((data.clan?.members ?? []).map((member: { name: string }) => member.name));
+    } catch { /* offline is fine */ }
+  }, [guestRequested]);
+
+  const refreshCommunity = useCallback(() => {
+    if (guestRequested) return;
+    void refreshFriends();
+    void refreshClans();
+    socketRef.current?.emit(EV.socialRefresh);
+  }, [guestRequested, refreshClans, refreshFriends]);
+
+  useEffect(() => { refreshCommunity(); }, [refreshCommunity]);
 
   // ── socket lifecycle ────────────────────────────────────────────────────
   useEffect(() => {
@@ -425,53 +491,83 @@ export default function GameClient() {
     let socket: Socket | null = null;
 
     (async () => {
-      const res = await fetch('/api/game-token', { method: 'POST' });
+      const selectedServerUrl = gameServerUrl();
+      const res = await fetch('/api/game-token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ serverUrl: selectedServerUrl, guest: guestRequested }),
+      });
       if (res.status === 401) {
         router.replace('/');
         return;
       }
       if (!res.ok) {
-        setFailed('Could not get a game session token.');
+        const failure = await res.json().catch(() => ({})) as { error?: string };
+        setFailed(failure.error || 'Could not get a game session token.');
         return;
       }
       const { token } = await res.json();
       const sheets = await loadSheets();
       if (cancelled) return;
 
-      socket = io(gameServerUrl(), { auth: { token }, transports: ['websocket'] });
+      socket = io(selectedServerUrl, { auth: { token }, transports: ['websocket'] });
       socketRef.current = socket;
 
-      socket.on('connect_error', () => setFailed('Cannot reach the game server. Is the API running on :3001?'));
+      socket.on('connect_error', () => setFailed('Cannot reach the selected game server. Return to deployment to choose another relay, or retry.'));
       socket.on('disconnect', () => setConnected(false));
       socket.on(EV.init, (init: WorldInit) => {
         youRef.current = init.you;
         initRef.current = init;
+        setIsGuest(init.guest === true);
+        setIsAdmin(init.admin === true);
+        if (!init.admin) {
+          setShowAdmin(false);
+          setAdminPanel(null);
+        }
+        applyRuntimeGameplay(init.gameplay);
+        setGameplayRevision(init.gameplay?.version ?? 'fallback');
         const visuals = init.visuals ?? { assets: {}, animations: {}, resources: {}, sounds: { presets: {}, actions: {} }, mobSounds: {}, blocks: {}, terrain: {} };
+        applyRuntimeVisuals(visuals);
         const cellCount = init.width * init.height;
         const tiles = init.tiles.length === cellCount ? Uint8Array.from(init.tiles) : decodeByteRuns(init.tileRuns, cellCount, Tile.Grass);
         const elevations = init.elevations.length === cellCount ? Uint8Array.from(init.elevations) : decodeByteRuns(init.elevationRuns, cellCount, 0);
         sfx.applyContent(visuals.sounds);
         const terrainKinds = { ...decodeTerrainRuns(init.terrainRuns, cellCount), ...(init.terrainKinds ?? {}) };
-        rendererRef.current = new Renderer(tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {}, elevations, visuals, terrainKinds, init.resourceKinds ?? {}, init.blockKinds ?? {}, init.blockRotations ?? {}, init.openDoors ?? [], (soundId, volume) => sfx.play(soundId, volume));
+        rendererRef.current = new Renderer(tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {}, elevations, visuals, terrainKinds, init.resourceKinds ?? {}, init.blockKinds ?? {}, init.blockRotations ?? {}, init.openDoors ?? [], init.stationFuel ?? {}, init.gameplay, (soundId, volume) => sfx.play(soundId, volume));
+        updateWorldMapView({ centerX: init.width / 2, centerY: init.height / 2, zoom: WORLD_MAP_DEFAULT_ZOOM });
         displayPos.current.clear();
         seenProjectiles.current.clear();
         snapRef.current = null;
-        setInHideout(init.kind === 'hideout');
+        setInHideout(init.kind !== 'world');
         setOwnHideout(init.ownHideout);
+        setCanDemolishHideout(init.canDemolish);
         setDemolishMode(false);
         setStation(null);
         setContainer(null);
         setTrade(null);
         setConnected(true);
         setFailed('');
-        setLocation(init.kind === 'hideout' ? init.name : null);
-        locationRef.current = init.kind === 'hideout' ? init.name : null;
+        setLocation(init.kind !== 'world' ? init.name : null);
+        locationRef.current = init.kind !== 'world' ? init.name : null;
+        if (init.kind === 'world') completeObjective('deploy');
       });
-      socket.on(EV.visuals, (visuals) => { sfx.applyContent(visuals.sounds); rendererRef.current?.applyVisuals(visuals); });
+      socket.on(EV.gameplay, (gameplay: RuntimeGameplayContent) => {
+        applyRuntimeGameplay(gameplay);
+        rendererRef.current?.applyGameplay(gameplay);
+        setGameplayRevision(gameplay.version);
+        setCraftSel(null);
+        setCraftQueue([]);
+      });
+      socket.on(EV.visuals, (visuals) => {
+        applyRuntimeVisuals(visuals);
+        sfx.applyContent(visuals.sounds);
+        rendererRef.current?.applyVisuals(visuals);
+        setGameplayRevision((revision) => `${revision}:v`);
+      });
       socket.on(EV.entityDeath, (death: EntityDeathSnap) => rendererRef.current?.entityDeath(death));
       socket.on(EV.state, (s: StateSnap) => {
         snapRef.current = s;
-        setOnline(s.players.length);
+        setOnline(s.population ?? s.players.length);
         const you = s.players.find((p) => p.id === youRef.current);
         const next = new Set<number>();
         for (const pr of s.projectiles) {
@@ -497,10 +593,11 @@ export default function GameClient() {
         }
         if (you && now - lastGruntAt.current > 4500) {
           for (const e of s.enemies) {
-            if (e.kind !== 'boar') continue;
+            if (e.kind !== 'boar' && e.kind !== 'bear') continue;
             const d = Math.hypot(e.x - you.x, e.y - you.y);
-            if (d < 220 && Math.random() < 0.4) {
-              sfx.grunt(Math.max(0.2, 1 - d / 260));
+            const range = e.kind === 'bear' ? 340 : 220;
+            if (d < range && Math.random() < 0.4) {
+              sfx.grunt(Math.max(0.2, 1 - d / (range + 40)));
               lastGruntAt.current = now;
               break;
             }
@@ -531,7 +628,7 @@ export default function GameClient() {
         prevReloading.current = u.reloading;
         if (u.hp > 0) setDead(null);
         // overweight warning — once per transition, not a nag
-        const over = invWeight(u.inv) > invCapacity(u.inv).maxKg;
+        const over = invWeight(u.inv, runtimeItems()) > invCapacity(u.inv).maxKg;
         if (over && !prevOverRef.current) pushToast('⚠ OVERWEIGHT — you move at a crawl. Drop or stash something.');
         prevOverRef.current = over;
         // XP gain floats + level-up fanfare
@@ -572,22 +669,27 @@ export default function GameClient() {
       socket.on(EV.station, (s: StationOpen) => {
         if (s.type === 'firepit') {
           only(null);
-          setStation('firepit');
+          setStation(s);
         } else if (s.type === 'furnace') {
           setCraftTab('smelt');
           only('craft');
+          setStation(s);
         } else if (s.type === 'workbench') {
           setCraftTab('survival');
           only('craft');
+          setStation(s);
         } else if (s.type === 'anvil') {
           setCraftTab('forge');
           only('craft');
+          setStation(s);
         }
       });
       socket.on(EV.toast, (msg: string) => {
         pushToast(msg);
         if (msg.startsWith('Picked up')) sfx.pickup();
-        else if (msg.startsWith('Crafted') || msg.startsWith('Placed') || msg.startsWith('Bought') || msg.startsWith('Sold') || msg.startsWith('Job complete')) sfx.craft();
+        else if (msg.startsWith('Crafted') || msg.startsWith('Meal ready:') || msg.startsWith('Placed') || msg.startsWith('Bought') || msg.startsWith('Sold') || msg.startsWith('Job complete')) sfx.craft();
+        if (msg.startsWith('Crafted Wooden Spear')) completeObjective('spear');
+        if (msg.startsWith('Meal ready:')) completeObjective('cook');
         if (msg.startsWith('Placed')) completeObjective('build');
         if (msg.startsWith('Extraction successful')) completeObjective('extract');
       });
@@ -601,13 +703,25 @@ export default function GameClient() {
           else sfx.hit(Math.max(0.2, 1 - d / 380));
         }
       });
-      socket.on(EV.tile, (u: TileUpdate) => rendererRef.current?.applyTile(u.i, u.tile, u.under));
+      socket.on(EV.tile, (u: TileUpdate) => rendererRef.current?.applyTile(u.i, u.tile, u.under, u.resourceId));
       socket.on(EV.block, (update: BlockUpdate) => rendererRef.current?.applyBlock(update.i, update.blockId, update.rotation, update.open));
+      socket.on(EV.stationFuelUpdate, (update: StationFuelUpdate) => rendererRef.current?.applyStationFuel(update.i, update.fuel));
+      socket.on(EV.clanTreasuryUpdate, (update: { clanId: string; treasury: number; actor: string; amount: number }) => {
+        setClan((current) => current?.id === update.clanId ? { ...current, treasury: update.treasury } : current);
+        setClanMsg(update.amount > 0
+          ? `${update.actor} contributed ${update.amount.toLocaleString()} credits`
+          : `${update.actor} withdrew ${Math.abs(update.amount).toLocaleString()} credits`);
+        void refreshClans();
+      });
+      socket.on(EV.adminState, (state: AdminPanelState) => {
+        setIsAdmin(true);
+        setAdminPanel(state);
+      });
       socket.on(EV.action, (a: ActionSnap) => {
         setAction(a.ms > 0 ? { label: a.label, until: Date.now() + a.ms, ms: a.ms, kind: a.kind, container: a.container, slot: a.slot } : null);
       });
       socket.on(EV.chatMsg, (m: ChatMsg) => {
-        bubblesRef.current.set(m.id, { text: m.text, at: performance.now() });
+        if (m.channel !== 'clan') bubblesRef.current.set(m.id, { text: m.text, at: performance.now() });
         setChatLog((log) => [...log.slice(-5), { ...m, at: Date.now() }]);
       });
       socket.on(EV.killfeed, (k: KillFeedEntry) => {
@@ -629,14 +743,15 @@ export default function GameClient() {
       socket?.disconnect();
       socketRef.current = null;
     };
-  }, [router, pushToast, only, completeObjective]);
+  }, [router, pushToast, only, completeObjective, updateWorldMapView, refreshClans]);
 
   useEffect(() => {
-    panelsOpenRef.current = showGear || showCraft || showSocial || showSkills || showMap || !!container || !!trade || chatOpen || !!ctxMenu || !!station || escMenu;
-  }, [showGear, showCraft, showSocial, showSkills, showMap, container, trade, chatOpen, ctxMenu, station, escMenu]);
+    panelsOpenRef.current = showGear || showCraft || showSocial || showSkills || showMap || showAdmin || !!container || !!trade || chatOpen || !!ctxMenu || !!station || escMenu;
+  }, [showGear, showCraft, showSocial, showSkills, showMap, showAdmin, container, trade, chatOpen, ctxMenu, station, escMenu]);
 
   // ── actions ─────────────────────────────────────────────────────────────
   const emit = useCallback((ev: string, payload?: unknown) => socketRef.current?.emit(ev, payload), []);
+  const adminAction = useCallback((action: AdminActionPayload) => emit(EV.adminAction, action), [emit]);
 
   const quickHeal = useCallback(() => {
     const u = latestInvRef.current;
@@ -676,18 +791,19 @@ export default function GameClient() {
       else if (e.code === 'Tab' || e.code === 'KeyI') { e.preventDefault(); only(menuRef.current.gear ? null : 'gear'); }
       else if (e.code === 'KeyC') only(menuRef.current.craft ? null : 'craft');
       else if (e.code === 'KeyK') only(menuRef.current.skills ? null : 'skills');
-      else if (e.code === 'KeyP') { only(menuRef.current.social ? null : 'social'); void refreshFriends(); }
+      else if (e.code === 'KeyP' && !isGuest) { only(menuRef.current.social ? null : 'social'); refreshCommunity(); }
+      else if (e.code === 'F10' && isAdmin) { e.preventDefault(); only(menuRef.current.admin ? null : 'admin'); }
       else if (e.code === 'KeyQ') quickHeal();
       else if (e.code === 'KeyB') {
         // grab the first build kit you own into your hand
         const u = latestInvRef.current;
-        const s = u?.inv.slots.findIndex((x) => x && ITEMS[x.id].place) ?? -1;
+        const s = u?.inv.slots.findIndex((x) => x && itemDef(x.id).place) ?? -1;
         if (u && s >= 0) holdKit(s);
         else pushToast('Craft a build kit first (C → BUILD)');
       }
       else if (e.code === 'KeyX') toggleDemolish();
       else if (e.code === 'KeyM' && initRef.current) { e.preventDefault(); only(menuRef.current.map ? null : 'map'); }
-      else if (e.code === 'Enter' || e.code === 'KeyT') { e.preventDefault(); setChatOpen(true); }
+      else if (!isGuest && (e.code === 'Enter' || e.code === 'KeyT')) { e.preventDefault(); setChatOpen(true); }
       else if (/^Digit[1-5]$/.test(e.code)) useSlot(Number(e.code.slice(5)) - 1);
       else if (e.code === 'Escape') {
         if (escMenuRef.current) {
@@ -777,7 +893,7 @@ export default function GameClient() {
       window.removeEventListener('wheel', onWheel);
       window.removeEventListener('blur', onBlur);
     };
-  }, [emit, quickHeal, toggleDemolish, refreshFriends, pushToast, only, holdKit, rotateBuild, useSlot, cycleHotbar]);
+  }, [emit, quickHeal, toggleDemolish, refreshCommunity, pushToast, only, holdKit, rotateBuild, useSlot, cycleHotbar, isAdmin, isGuest]);
 
   // input + footsteps at 20Hz
   useEffect(() => {
@@ -869,14 +985,16 @@ export default function GameClient() {
         const wy = meNow.dy + (mouse.current.y - canvas.height / 2) / renderer.zoom;
         const tx = Math.floor(wx / TILE);
         const ty = Math.floor(wy / TILE);
-        const bt = ITEMS[pl.item].place;
+        const bt = itemDef(pl.item).place;
         const tile = bt ? (BUILDABLES[bt].tile ?? -1) : -1;
         const inRange = Math.hypot((tx + 0.5) * TILE - meNow.dx, (ty + 0.5) * TILE - meNow.dy) <= TILE * 4;
         const under = renderer.tileAtPublic(tx, ty);
         // floors need grass; everything else can also go on top of flooring
         const isFloorKit = bt === 'wood_floor' || bt === 'stone_floor';
         const groundOk = isFloorKit ? under === Tile.Grass : under === Tile.Grass || !!FLOOR_TILES[under];
-        ghost = { tile, blockId: bt ? renderer.playerBlockId(bt) : undefined, rotation: buildRotationRef.current, tx, ty, valid: inRange && groundOk };
+        const blockOk = !renderer.hasBlockAtPublic(tx, ty) || (!isFloorKit && renderer.blockIsFoundationAtPublic(tx, ty));
+        const containerOk = !snap.containers.some((entry) => Math.floor(entry.x / TILE) === tx && Math.floor(entry.y / TILE) === ty);
+        ghost = { tile, blockId: bt ? renderer.playerBlockId(bt) : undefined, rotation: buildRotationRef.current, tx, ty, valid: inRange && groundOk && blockOk && containerOk };
       }
 
       // demolish marker — is there a reclaimable piece under the cursor?
@@ -890,7 +1008,8 @@ export default function GameClient() {
         const builtChest = snap.containers.some(
           (c) => c.id.startsWith('hc:') && Math.floor(c.x / TILE) === tx && Math.floor(c.y / TILE) === ty,
         );
-        demolish = { tx, ty, valid: inRange && (DEMOLISHABLE.has(renderer.tileAtPublic(tx, ty)) || builtChest) };
+        const builtBlock = renderer.blockBuildTypeAtPublic(tx, ty);
+        demolish = { tx, ty, valid: inRange && (DEMOLISHABLE.has(renderer.tileAtPublic(tx, ty)) || Boolean(builtBlock) || builtChest) };
       }
 
       // world-space aim point for the drawn crosshair
@@ -937,23 +1056,49 @@ export default function GameClient() {
 
       const you = meNow;
       const mm = minimapRef.current;
+      const visibleMapIds = new Set(players.map((player) => player.id));
+      const tacticalPlayers = [
+        ...players,
+        ...(snap.mapPlayers ?? []).filter((player) => !visibleMapIds.has(player.id)).map((player) => ({
+          id: player.id,
+          name: player.name,
+          dx: player.x,
+          dy: player.y,
+          dead: false,
+        })),
+      ];
+      const tacticalFriendNames = new Set(friendNamesRef.current);
+      const tacticalClanNames = new Set(clanNamesRef.current);
+      for (const player of snap.mapPlayers ?? []) {
+        if (player.relation === 'clan') tacticalClanNames.add(player.name);
+        else tacticalFriendNames.add(player.name);
+      }
       const mapView = {
         pois: init.pois,
-        players,
+        players: tacticalPlayers,
         youId: youRef.current,
-        friendNames: friendNamesRef.current,
+        friendNames: tacticalFriendNames,
+        clanNames: tacticalClanNames,
       };
       if (mm && you) {
-        renderer.drawMinimap(mm.getContext('2d')!, MINIMAP_SIZE, mapView);
+        renderer.drawMinimap(mm.getContext('2d')!, MINIMAP_SIZE, mapView, {
+          centerX: you.dx / TILE,
+          centerY: you.dy / TILE,
+          visibleTiles: MINIMAP_VISIBLE_TILES,
+          clampToMap: false,
+        });
       }
       const fullMap = worldMapRef.current;
       if (fullMap && you) {
-        renderer.drawMinimap(fullMap.getContext('2d')!, WORLD_MAP_SIZE, mapView, true);
+        renderer.drawMinimap(fullMap.getContext('2d')!, WORLD_MAP_SIZE, mapView, {
+          detailed: true,
+          ...worldMapViewRef.current,
+        });
       }
 
       if (you) {
-        let loc: string | null = init.kind === 'hideout' ? init.name : null;
-        let safe = init.kind === 'hideout';
+        let loc: string | null = init.kind !== 'world' ? init.name : null;
+        let safe = init.kind !== 'world';
         for (const poi of init.pois) {
           if (Math.hypot(you.dx - poi.x, you.dy - poi.y) < poi.r) {
             loc = poi.name;
@@ -973,9 +1118,9 @@ export default function GameClient() {
         let bestPrompt: string | null = null;
         let bestPos: { x: number; y: number } | null = null;
         let bestD = INTERACT_RANGE;
-        if (init.kind === 'hideout' && init.exit) {
+        if (init.kind !== 'world' && init.exit) {
           const d = Math.hypot(init.exit.x - you.dx, init.exit.y - you.dy);
-          if (d < bestD) { bestD = d; bestPrompt = 'Deploy into the zone'; bestPos = init.exit; }
+          if (d < bestD) { bestD = d; bestPrompt = init.kind === 'clan_hideout' ? 'Return from clan holdout' : 'Deploy into the zone'; bestPos = init.exit; }
         }
         for (const tr of init.traders) {
           const d = Math.hypot(tr.x - you.dx, tr.y - you.dy);
@@ -992,11 +1137,12 @@ export default function GameClient() {
           for (let ty2 = pty - 2; ty2 <= pty + 2; ty2++)
             for (let tx2 = ptx - 2; tx2 <= ptx + 2; tx2++) {
               const t = renderer.tileAtPublic(tx2, ty2);
+              const blockType = renderer.blockBuildTypeAtPublic(tx2, ty2);
               const label =
-                t === Tile.Firepit ? 'Cook at the campfire'
-                : t === Tile.Furnace ? 'Use furnace (smelt ore)'
-                : t === Tile.Workbench ? 'Use workbench (craft)'
-                : t === Tile.Anvil ? 'Use anvil (forge weapons)'
+                t === Tile.Firepit || blockType === 'firepit' ? 'Cook at the campfire'
+                : t === Tile.Furnace || blockType === 'furnace' ? 'Use furnace (smelt ore)'
+                : t === Tile.Workbench || blockType === 'workbench' ? 'Use workbench (craft)'
+                : t === Tile.Anvil || blockType === 'anvil' ? 'Use anvil (forge weapons)'
                 : null;
               if (!label) continue;
               const cx = (tx2 + 0.5) * TILE;
@@ -1022,7 +1168,7 @@ export default function GameClient() {
           if (d < bestD) {
             bestD = d;
             bestPos = { x: g.x, y: g.y };
-            bestPrompt = `Pick up ${ITEMS[g.item].name}${g.qty > 1 ? ` ×${g.qty}` : ''}`;
+            bestPrompt = `Pick up ${itemDef(g.item).name}${g.qty > 1 ? ` ×${g.qty}` : ''}`;
           }
         }
         promptPosRef.current = bestPos;
@@ -1076,11 +1222,11 @@ export default function GameClient() {
       else if (zone === 'cont' && cont) {
         emit(EV.containerPut, { id: cont.id, slot: d.index, target: index }); // drop onto this exact slot
       } else if (zone === 'weapon') {
-        const kind = ITEMS[d.item].kind;
+        const kind = itemDef(d.item).kind;
         if (kind === 'weapon' || kind === 'tool') emit(EV.invEquip, { slot: d.index });
         else pushToast('That is not a weapon');
       } else if (zone === 'helmet' || zone === 'vest' || zone === 'mod') {
-        const def = ITEMS[d.item];
+        const def = itemDef(d.item);
         const fits = (zone === 'mod' && def.kind === 'mod') || (def.armor && def.armor.piece === zone);
         if (fits) emit(EV.invUse, { slot: d.index });
         else pushToast(`That does not fit the ${zone.toUpperCase()} slot`);
@@ -1119,19 +1265,23 @@ export default function GameClient() {
     }
   };
 
-  const countOf = (id: ItemId) => inv?.inv.slots.reduce((n, s) => n + (s && s.id === id ? s.qty : 0), 0) ?? 0;
+  const countOf = (id: string) => inv?.inv.slots.reduce((n, s) => n + (s && s.id === id ? s.qty : 0), 0) ?? 0;
 
   const equippedItem = inv && inv.equipped !== null ? inv.inv.slots[inv.equipped] : null;
-  const eqWeapon = equippedItem ? ITEMS[equippedItem.id].weapon : null;
-  const heldKit = equippedItem && ITEMS[equippedItem.id].place ? { slot: inv!.equipped!, item: equippedItem.id, qty: equippedItem.qty } : null;
-  const anyPanel = showGear || showCraft || showSkills || showSocial || showMap || !!container || !!trade || chatOpen || !!station || !!dead || escMenu;
+  const eqWeapon = equippedItem ? itemDef(equippedItem.id).weapon : null;
+  const heldKit = equippedItem && itemDef(equippedItem.id).place ? { slot: inv!.equipped!, item: equippedItem.id, qty: equippedItem.qty } : null;
+  const anyPanel = showGear || showCraft || showSkills || showSocial || showMap || showAdmin || !!container || !!trade || chatOpen || !!station || !!dead || escMenu;
   const ammoReserve = eqWeapon ? countOf(eqWeapon.ammo) : null;
-  const weight = inv ? invWeight(inv.inv) : 0;
+  const weight = inv ? invWeight(inv.inv, runtimeItems()) : 0;
   const cap = inv ? invCapacity(inv.inv) : BACKPACKS[0];
+  const trackedJobs = [...(inv?.quests ?? [])]
+    .filter((job) => !job.claimed)
+    .sort((a, b) => Number(b.done) - Number(a.done) || a.def.tier - b.def.tier || a.def.id - b.def.id)
+    .slice(0, 3);
 
   const leave = async () => {
     socketRef.current?.disconnect();
-    await authClient.signOut();
+    if (!isGuest) await authClient.signOut();
     router.push('/');
   };
 
@@ -1165,6 +1315,50 @@ export default function GameClient() {
     void refreshFriends();
   };
 
+  const clanRequest = async (method: 'POST' | 'PUT' | 'DELETE', body: Record<string, unknown>, success: string) => {
+    setClanMsg('');
+    const response = await fetch('/api/clans', { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await response.json();
+    setClanMsg(response.ok ? success : data.error ?? 'Clan action failed');
+    if (response.ok) {
+      await refreshClans();
+      emit(EV.socialRefresh);
+    }
+    return response.ok;
+  };
+
+  const createClan = async () => {
+    if (await clanRequest('POST', { action: 'create', name: clanName, tag: clanTag }, 'Clan founded — your shared holdout is ready')) {
+      setClanName(''); setClanTag('');
+    }
+  };
+
+  const inviteClanMember = async () => {
+    if (await clanRequest('POST', { action: 'invite', username: clanUsername }, `Invitation sent to ${clanUsername}`)) setClanUsername('');
+  };
+
+  const transferClan = async (memberId: string) => {
+    const member = clan?.members.find((entry) => entry.id === memberId);
+    if (!member || !window.confirm(`Transfer ownership of [${clan?.tag}] to ${member.name}? You will become an officer.`)) return;
+    await clanRequest('PUT', { action: 'transfer', memberId }, `Ownership transferred to ${member.name}`);
+  };
+
+  const removeClanMember = async (memberId: string) => {
+    const member = clan?.members.find((entry) => entry.id === memberId);
+    if (!member || !window.confirm(`Remove ${member.name} from the clan?`)) return;
+    await clanRequest('DELETE', { action: 'remove', memberId }, `${member.name} removed from the clan`);
+  };
+
+  const leaveClan = async () => {
+    if (!window.confirm('Leave this clan and lose access to its shared holdout?')) return;
+    await clanRequest('DELETE', { action: 'leave' }, 'You left the clan');
+  };
+
+  const disbandClan = async () => {
+    if (!clan || !window.confirm(`Permanently disband [${clan.tag}] ${clan.name}? The shared holdout will be deleted.`)) return;
+    await clanRequest('DELETE', { action: 'disband' }, 'Clan disbanded');
+  };
+
   if (failed) {
     return (
       <div className="game-root">
@@ -1181,7 +1375,7 @@ export default function GameClient() {
 
   const durStrip = (s: { id: ItemId; qty: number; dur?: number } | null) => {
     if (!s) return null;
-    const max = ITEMS[s.id].durability;
+    const max = itemDef(s.id).durability;
     if (max === undefined) return null;
     const frac = (s.dur ?? max) / max;
     if (frac >= 0.999) return null;
@@ -1214,8 +1408,9 @@ export default function GameClient() {
 
   const equipSlot = (zone: 'helmet' | 'vest' | 'mod', label: string) => {
     const id = inv?.equipment[zone] ?? null;
+    const dur = zone === 'helmet' || zone === 'vest' ? inv?.armorDur?.[zone] : undefined;
     return (
-      <Tip tip={id ? itemTip(id) : null}>
+      <Tip tip={id ? itemTip(id, 1, dur) : null}>
         <div
           className="equip-slot"
           onMouseDown={(e) => id && beginDrag(zone, 0, id, 1, e)}
@@ -1238,6 +1433,7 @@ export default function GameClient() {
       {connected && !showMap && (
         <div className="minimap-wrap">
           <canvas ref={minimapRef} width={MINIMAP_SIZE} height={MINIMAP_SIZE} />
+          <span className="minimap-mode">LOCAL / {MINIMAP_VISIBLE_TILES} TILES</span>
         </div>
       )}
 
@@ -1248,16 +1444,25 @@ export default function GameClient() {
           width={initRef.current.width}
           height={initRef.current.height}
           location={location}
+          viewport={worldMapView}
+          getPlayerPosition={getMapPlayerPosition}
+          onViewportChange={updateWorldMapView}
           onClose={() => only(null)}
         />
       )}
 
       {location && <div className="location-banner" key={location}>{location.toUpperCase()}</div>}
-      {inSafe && !inHideout && <div className="safe-chip">SAFE ZONE — ENTER chat · extract to get home</div>}
-      {inHideout && <div className="safe-chip">{ownHideout ? 'HOME BASE — B build · R rotate · X demolish · walk the mat to deploy' : 'ALLY CAMP — E on the mat to leave'}</div>}
+      {inSafe && !inHideout && <div className="safe-chip">SAFE ZONE — extract to get home</div>}
+      {inHideout && <div className="safe-chip">{
+        initRef.current?.kind === 'clan_hideout'
+          ? `CLAN HOLDOUT — B build · R rotate${canDemolishHideout ? ' · X demolish' : ''} · E at the mat to return`
+          : ownHideout
+            ? 'HOME BASE — B build · R rotate · X demolish · E at the mat to deploy'
+            : 'ALLY CAMP — E at the mat to leave'
+      }</div>}
       {heldKit && !anyPanel && (
         <div className="build-bar">
-          <span>HOLDING <b>{ITEMS[heldKit.item].name}</b>{heldKit.qty > 1 ? ` ×${heldKit.qty}` : ''}</span>
+          <span>HOLDING <b>{itemDef(heldKit.item).name}</b>{heldKit.qty > 1 ? ` ×${heldKit.qty}` : ''}</span>
           <span className="build-hint">
             R rotate ({buildRotation * 90}°) · click the ground to place{inHideout ? '' : ' — wears out & is destructible in the world'} · scroll to swap hands
           </span>
@@ -1313,7 +1518,7 @@ export default function GameClient() {
               <div className="label">H2O {inv.thirst}</div>
             </div>
           </div>
-          <div className={`bar mini stamina${inv.staminaExhausted ? ' exhausted' : ''}`} title="Stamina - reaching zero causes a short exhaustion lockout">
+          <div className={`bar mini stamina${inv.staminaExhausted ? ' exhausted' : ''}`} title="Exhaustion prevents attacks and slows movement until 25 stamina recovers">
             <div className="fill" style={{ width: `${inv.stamina}%`, background: inv.staminaExhausted ? '#c85a4a' : inv.stamina > 25 ? '#5fd0a0' : 'var(--gold)' }} />
             <div className="label">{inv.staminaExhausted ? `EXHAUSTED ${inv.stamina}` : `STAM ${inv.stamina} · SHIFT run`}</div>
           </div>
@@ -1321,13 +1526,13 @@ export default function GameClient() {
             {equippedItem
               ? eqWeapon
                 ? inv.reloading
-                  ? `${ITEMS[equippedItem.id].name} · RELOADING…`
-                  : `${ITEMS[equippedItem.id].name} · ${inv.mag}/${eqWeapon.magSize} · ${ammoReserve} reserve ${inv.mag === 0 ? '· R to reload' : ''}`
-                : ITEMS[equippedItem.id].kind === 'consumable'
-                  ? `${ITEMS[equippedItem.id].name} · ${(useVerb(ITEMS[equippedItem.id]) ?? 'USE')} — left-click`
-                  : ITEMS[equippedItem.id].place
-                    ? `${ITEMS[equippedItem.id].name} · click the ground to place`
-                    : ITEMS[equippedItem.id].name
+                  ? `${itemDef(equippedItem.id).name} · RELOADING…`
+                  : `${itemDef(equippedItem.id).name} · ${inv.mag}/${eqWeapon.magSize} · ${ammoReserve} reserve ${inv.mag === 0 ? '· R to reload' : ''}`
+                : itemDef(equippedItem.id).kind === 'consumable'
+                  ? `${itemDef(equippedItem.id).name} · ${(useVerb(itemDef(equippedItem.id)) ?? 'USE')} — left-click`
+                  : itemDef(equippedItem.id).place
+                    ? `${itemDef(equippedItem.id).name} · click the ground to place`
+                    : itemDef(equippedItem.id).name
               : 'FISTS — punch trees & rocks, craft a spear (C)'}
           </div>
         </div>
@@ -1337,7 +1542,7 @@ export default function GameClient() {
       {inv && (
         <div className="hotbar">
           {inv.inv.slots.slice(0, 5).map((s, i) => (
-            <Tip key={i} tip={s ? itemTip(s.id, s.qty) : null}>
+            <Tip key={i} tip={s ? itemTip(s.id, s.qty, s.dur) : null}>
               <div className={`slot${inv.equipped === i ? ' equipped' : ''}`} onClick={() => useSlot(i)}>
                 <span className="keycap">{i + 1}</span>
                 {s && (<><ItemIcon id={s.id} />{s.qty > 1 && <span className="qty">{s.qty}</span>}</>)}
@@ -1350,7 +1555,7 @@ export default function GameClient() {
       {/* contextual interaction hints (fish / drink / cook) */}
       {inv && !panelsOpenRef.current && !heldKit && (() => {
         const hasRod = equippedItem?.id === 'fishing_rod';
-        const rawHeld = inv.inv.slots.filter((s) => s && ITEMS[s.id].raw) as { id: ItemId; qty: number }[];
+        const rawHeld = inv.inv.slots.filter((s) => s && itemDef(s.id).raw) as { id: ItemId; qty: number }[];
         const hints: string[] = [];
         if (inv.nearWater) {
           hints.push(inv.thirst < 100 ? 'E — drink from the water' : 'Water here');
@@ -1368,6 +1573,8 @@ export default function GameClient() {
       })()}
 
       <div className="top-right">
+        {isGuest && <div className="kd-chip guest-self-chip">GUEST · TEMPORARY RAID</div>}
+        {isAdmin && <div className="kd-chip admin-self-chip">ADMIN · F10</div>}
         <div className="online-chip">● {online} IN ZONE</div>
         {clock && <div className="kd-chip dim">{clock}</div>}
         {inv && <div className="kd-chip gold">{inv.money} cr</div>}
@@ -1375,7 +1582,7 @@ export default function GameClient() {
         <div className="kd-chip dim">{muted ? 'SOUND OFF' : 'SOUND ON'}</div>
         <div className="killfeed">
           {feed.map((k) => (
-            <div key={k.id}><b>{k.killer}</b> ☠ {k.victim}{k.weapon ? ` (${ITEMS[k.weapon].name})` : ''}</div>
+            <div key={k.id}><b>{k.killer}</b> ☠ {k.victim}{k.weapon ? ` (${itemDef(k.weapon).name})` : ''}</div>
           ))}
         </div>
       </div>
@@ -1385,20 +1592,20 @@ export default function GameClient() {
           ['🎒', 'TAB', 'Gear & inventory', () => only(menuRef.current.gear ? null : 'gear')],
           ['⚒', 'C', 'Crafting', () => only(menuRef.current.craft ? null : 'craft')],
           ['📈', 'K', 'Skills', () => only(menuRef.current.skills ? null : 'skills')],
-          ['👥', 'P', 'Contacts', () => { only(menuRef.current.social ? null : 'social'); void refreshFriends(); }],
+          ['👥', 'P', 'Community', () => { only(menuRef.current.social ? null : 'social'); refreshCommunity(); }],
           // building controls only show at home — out in the zone the hotbar stays lean
           ...(ownHideout
             ? ([
                 ['🔨', 'B', 'Hold a build kit', () => {
-                  const s = inv?.inv.slots.findIndex((x) => x && ITEMS[x.id].place) ?? -1;
+                  const s = inv?.inv.slots.findIndex((x) => x && itemDef(x.id).place) ?? -1;
                   if (inv && s >= 0) holdKit(s);
                   else pushToast('Craft a build kit first (C → BUILD)');
                 }],
-                ['⛏', 'X', 'Demolish (your camp)', toggleDemolish],
+                ...(canDemolishHideout ? [['⛏', 'X', 'Demolish structures', toggleDemolish] as [string, string, string, () => void]] : []),
               ] as [string, string, string, () => void][])
             : []),
-          ['💬', '⏎', 'Chat (safe zones)', () => setChatOpen(true)],
-        ] as [string, string, string, () => void][]).map(([icon, key, label, fn]) => (
+          ['💬', '⏎', 'Chat', () => setChatOpen(true)],
+        ] as [string, string, string, () => void][]).filter(([, key]) => !isGuest || (key !== 'P' && key !== '⏎')).map(([icon, key, label, fn]) => (
           <button key={key} className="hk" onClick={fn}>
             <span className="hk-icon">{icon}</span>
             <span className="hk-tip">{label} <b>{key}</b></span>
@@ -1412,6 +1619,12 @@ export default function GameClient() {
           <span className="hk-icon">{muted ? '🔇' : '🔊'}</span>
           <span className="hk-tip">Sound {muted ? 'off' : 'on'}</span>
         </button>
+        {isAdmin && (
+          <button className={`hk admin-self-chip${showAdmin ? ' active' : ''}`} onClick={() => only(showAdmin ? null : 'admin')} aria-label="Open administrator world control">
+            <span className="hk-icon">A</span>
+            <span className="hk-tip">World control <b>F10</b></span>
+          </button>
+        )}
       </div>
 
       <div className="toasts">{toasts.map((t) => <div key={t.id}>{t.msg}</div>)}</div>
@@ -1419,16 +1632,16 @@ export default function GameClient() {
       {/* chat log + input */}
       <div className="chat-log">
         {chatLog.filter((m) => Date.now() - m.at < 12000).map((m, i) => (
-          <div key={i}><b>{m.name}:</b> {m.text}</div>
+          <div key={i} className={m.channel === 'clan' ? 'clan-chat' : ''}>{m.admin && <span className="admin-chat-tag">ADMIN</span>}<b>{m.name}:</b> {m.text}</div>
         ))}
       </div>
-      {chatOpen && (
+      {!isGuest && chatOpen && (
         <div className="chat-bar">
           <input
             ref={chatInputRef}
             value={chatText}
             maxLength={120}
-            placeholder={inSafe ? 'say something…' : 'chat only works in safe zones'}
+            placeholder="say in this area…  /c message for clan radio"
             onChange={(e) => setChatText(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') sendChat();
@@ -1467,7 +1680,7 @@ export default function GameClient() {
               {equippedItem ? (
                 <>
                   <ItemIcon id={equippedItem.id} size={40} />
-                  <span className="equip-name">{ITEMS[equippedItem.id].name}{eqWeapon ? ` · ${inv.mag}/${eqWeapon.magSize}` : ''}</span>
+                  <span className="equip-name">{itemDef(equippedItem.id).name}{eqWeapon ? ` · ${inv.mag}/${eqWeapon.magSize}` : ''}</span>
                 </>
               ) : (
                 <span className="equip-label">HANDS — FISTS</span>
@@ -1546,9 +1759,9 @@ export default function GameClient() {
       {/* context menu */}
       {ctxMenu && (
         <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
-          <div className="ctx-title">{ITEMS[ctxMenu.item].name}</div>
+          <div className="ctx-title">{itemDef(ctxMenu.item).name}</div>
           {ctxMenu.zone === 'inv' && (() => {
-            const def = ITEMS[ctxMenu.item];
+            const def = itemDef(ctxMenu.item);
             const verb = useVerb(def);
             const rep = def.durability !== undefined && inv
               ? (def.kind === 'weapon' ? inv.nearAnvil : inv.nearWorkbench)
@@ -1574,6 +1787,7 @@ export default function GameClient() {
       {showCraft && inv && (
         <CraftingPanel
           inventory={inv}
+          action={action}
           tab={craftTab}
           selectedRecipeId={craftSel}
           queue={craftQueue}
@@ -1584,14 +1798,17 @@ export default function GameClient() {
             setCraftQueue((queued) => [...queued, ...new Array<string>(count).fill(id)])
           }
           onClearQueue={() => setCraftQueue([])}
+          station={station}
+          onAddFuel={(quantity) => station?.index !== undefined && emit(EV.stationFuel, { index: station.index, qty: quantity })}
         />
       )}
 
-      {station === 'firepit' && inv && (
+      {station?.type === 'firepit' && inv && (
         <CookingPanel
           inventory={inv}
           action={action}
           queue={cookQueue}
+          station={station}
           onQueueSlot={(slot) => setCookQueue((queued) => [...queued, slot])}
           onQueueAll={(slots) =>
             setCookQueue((queued) => {
@@ -1604,6 +1821,7 @@ export default function GameClient() {
               return next;
             })
           }
+          onAddFuel={(quantity) => station.index !== undefined && emit(EV.stationFuel, { index: station.index, qty: quantity })}
           onClose={() => {
             setCookQueue([]);
             setStation(null);
@@ -1612,12 +1830,24 @@ export default function GameClient() {
       )}
 
       {/* starter objectives checklist */}
-      {connected && !dead && !objectives.celebrated && !panelsOpenRef.current && (
+      {connected && !isGuest && !dead && !objectives.celebrated && !panelsOpenRef.current && (
         <div className="objectives">
           <div className="obj-title">OBJECTIVES</div>
           {OBJECTIVES.map((o) => (
             <div key={o.id} className={`obj-row${objectives[o.id] ? ' done' : ''}`}>
               {objectives[o.id] ? '☑' : '☐'} {o.label}
+            </div>
+          ))}
+        </div>
+      )}
+      {connected && !dead && trackedJobs.length > 0 && !panelsOpenRef.current && (
+        <div className="quest-tracker">
+          <div className="quest-track-title">ACTIVE JOBS <span>claim at trader</span></div>
+          {trackedJobs.map((job) => (
+            <div key={job.def.id} className={`quest-track-row${job.done ? ' done' : ''}`}>
+              <span className="quest-track-tier">T{job.def.tier}</span>
+              <span className="quest-track-name">{job.def.name}</span>
+              <b>{job.done ? 'RETURN' : `${job.progress}/${job.def.count}`}</b>
             </div>
           ))}
         </div>
@@ -1641,12 +1871,19 @@ export default function GameClient() {
         />
       )}
 
-      {showSocial && (
+      {!isGuest && showSocial && (
         <SocialPanel
           friends={friends}
           username={friendUsername}
           message={friendMsg}
-          canVisitCamps={ownHideout || (inSafe && !inHideout)}
+          canVisitCamps={(ownHideout && initRef.current?.kind === 'hideout') || (inSafe && !inHideout)}
+          clan={clan}
+          clanInvitations={clanInvitations}
+          clanName={clanName}
+          clanTag={clanTag}
+          clanUsername={clanUsername}
+          clanMessage={clanMsg}
+          canEnterClanHoldout={Boolean(clan) && (inSafe || (inHideout && initRef.current?.kind === 'hideout')) && initRef.current?.kind !== 'clan_hideout'}
           onUsernameChange={setFriendUsername}
           onAddFriend={addFriend}
           onAcceptFriend={acceptFriend}
@@ -1655,11 +1892,41 @@ export default function GameClient() {
             only(null);
             emit(EV.hideoutEnter, { owner });
           }}
+          onClanNameChange={setClanName}
+          onClanTagChange={setClanTag}
+          onClanUsernameChange={setClanUsername}
+          onCreateClan={() => void createClan()}
+          onInviteClanMember={() => void inviteClanMember()}
+          onAcceptClanInvite={(clanId) => void clanRequest('POST', { action: 'accept', clanId }, 'Joined clan — shared holdout access granted')}
+          onDeclineClanInvite={(clanId) => void clanRequest('DELETE', { action: 'decline', clanId }, 'Clan invitation declined')}
+          onSetClanRank={(memberId, rank) => void clanRequest('PUT', { action: 'rank', memberId, rank }, `Member rank changed to ${rank}`)}
+          onTransferClan={(memberId) => void transferClan(memberId)}
+          onRemoveClanMember={(memberId) => void removeClanMember(memberId)}
+          onCancelClanInvite={(memberId) => void clanRequest('DELETE', { action: 'cancel_invite', memberId }, 'Invitation cancelled')}
+          onLeaveClan={() => void leaveClan()}
+          onDisbandClan={() => void disbandClan()}
+          onEnterClanHoldout={() => {
+            only(null);
+            emit(EV.clanHideoutEnter);
+          }}
+          onClanTreasuryTransfer={(amount) => emit(EV.clanTreasury, { amount })}
+        />
+      )}
+
+      {showAdmin && isAdmin && (
+        <AdminPanel
+          state={adminPanel}
+          selfId={youRef.current}
+          items={runtimeItems()}
+          onAction={adminAction}
+          onRefresh={() => emit(EV.adminRequest)}
+          onClose={() => only(null)}
         />
       )}
 
       {escMenu && !dead && (
         <PauseOverlay
+          guest={isGuest}
           inHideout={inHideout}
           inSafeZone={inSafe}
           muted={muted}
@@ -1672,6 +1939,7 @@ export default function GameClient() {
 
       {dead && (
         <DeathOverlay
+          guest={isGuest}
           killer={dead}
           inventory={inv}
           onRespawn={() => emit(EV.respawn)}

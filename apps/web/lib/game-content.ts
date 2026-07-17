@@ -3,8 +3,10 @@ import {
   BLOCKS_BULLET,
   BLOCKS_ENEMY,
   BLOCKS_MOVE,
+  DEFAULT_ENGINE_SETTINGS,
   DEFAULT_LOOT_TABLES,
   DEFAULT_PIXEL_PALETTE,
+  DEFAULT_RESOURCE_NODES,
   ENEMY_DEFS,
   ENGINE_CONTENT_KINDS,
   ENTITY_ANIMATION_STATES,
@@ -12,10 +14,29 @@ import {
   ITEMS,
   ITEM_SPRITE_ORDER,
   RECIPES,
+  type ResourceNodeDef,
   Tile,
   TRADER_STOCK,
   TRADER_STOCK_T2,
 } from '@holdout/shared';
+
+const normalizeResourceTile = (tile: number, skill: ResourceNodeDef['skill'] | undefined) =>
+  tile === Tile.Tree || skill === 'woodcutting' ? Tile.Tree : Tile.Rock;
+
+const normalizeResourceNode = (resource: ResourceNodeDef): ResourceNodeDef => ({
+  ...resource,
+  tile: normalizeResourceTile(resource.tile, resource.skill),
+  depletedTile: normalizeResourceTile(resource.tile, resource.skill) === Tile.Tree ? Tile.Stump : Tile.Rubble,
+  skill: normalizeResourceTile(resource.tile, resource.skill) === Tile.Tree ? 'woodcutting' : 'mining',
+  respawnFamily: normalizeResourceTile(resource.tile, resource.skill) === Tile.Tree ? 'tree' : 'rock',
+  respawnWeight: Number.isFinite(resource.respawnWeight) && Number(resource.respawnWeight) >= 0
+    ? Number(resource.respawnWeight)
+    : resource.id === 'ironwood' ? 6 : resource.id === 'tree' ? 94 : 1,
+});
+
+export function normalizeResourceDocument(resources: Record<string, ResourceNodeDef>): Record<string, ResourceNodeDef> {
+  return Object.fromEntries(Object.entries(resources).map(([id, resource]) => [id, normalizeResourceNode(resource)]));
+}
 
 const spriteAssets = [
   ...ITEM_SPRITE_ORDER.map((id, col) => ({
@@ -26,7 +47,7 @@ const spriteAssets = [
     pixels: [] as string[],
     source: { sheet: 'items' as const, col, row: 0 },
   })),
-  ...Object.entries({ player: 0, zombie: 8, military: 9, trader: 10, deer: 11, rabbit: 12, boar: 13, wolf: 14 })
+  ...Object.entries({ player: 0, zombie: 8, military: 9, trader: 10, deer: 11, rabbit: 12, boar: 13, wolf: 14, fox: 15, bear: 16 })
     .map(([id, row]) => ({
       id: `character:${id}`,
       name: id.replace('_', ' '),
@@ -34,13 +55,11 @@ const spriteAssets = [
       height: 16,
       pixels: [] as string[],
       source: { sheet: 'chars' as const, col: 0, row, frames: 2 },
-    })),
+  })),
   { id: 'character:brute', name: 'Brute', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'chars' as const, col: 0, row: 8, frames: 2 } },
   { id: 'resource:tree', name: 'Common tree', width: 32, height: 32, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 10, row: 0, frames: 1 } },
   { id: 'resource:ironwood', name: 'Ironwood tree', width: 32, height: 32, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 10, row: 0, frames: 1 } },
   { id: 'resource:rock', name: 'Stone outcrop', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 12, row: 0, frames: 1 } },
-  { id: 'resource:copper_vein', name: 'Copper vein', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 25, row: 0, frames: 1 } },
-  { id: 'resource:iron_vein', name: 'Iron vein', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 26, row: 0, frames: 1 } },
   { id: 'block:steel_crate', name: 'Steel crate block', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 14, row: 0, frames: 1 } },
   ...Object.entries({ workbench: 14, firepit: 15, furnace: 16, wood_floor: 19, stone_floor: 20, wall: 21, door: 22, fence: 23, torch: 24, anvil: 27 })
     .map(([id, col]) => ({ id: `block:${id}`, name: BUILDABLES[id as keyof typeof BUILDABLES].name, width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col, row: 0, frames: 1 } })),
@@ -63,13 +82,7 @@ const defaultClips = {
   death: { frames: [1], frameMs: 400, loop: false },
 };
 
-const defaultResources = {
-  tree: { id: 'tree', name: 'Common tree', tile: Tile.Tree, depletedTile: Tile.Stump, maxHits: 6, respawnMs: 240_000, skill: 'woodcutting', spriteId: 'resource:tree', hitSound: 'chop', breakSound: 'tree_fall', drops: [{ itemId: 'wood', min: 2, max: 3, chance: 1, when: 'hit' }] },
-  ironwood: { id: 'ironwood', name: 'Ironwood tree', tile: Tile.Tree, depletedTile: Tile.Stump, maxHits: 14, respawnMs: 480_000, skill: 'woodcutting', spriteId: 'resource:ironwood', hitSound: 'wood_heavy', breakSound: 'tree_crack', drops: [{ itemId: 'wood', min: 3, max: 5, chance: 1, when: 'hit' }, { itemId: 'iron_ore', min: 1, max: 2, chance: 0.35, when: 'depleted' }] },
-  rock: { id: 'rock', name: 'Stone outcrop', tile: Tile.Rock, depletedTile: Tile.Rubble, maxHits: 8, respawnMs: 240_000, skill: 'mining', spriteId: 'resource:rock', hitSound: 'mine', breakSound: 'rock_break', drops: [{ itemId: 'stone', min: 2, max: 3, chance: 1, when: 'hit' }] },
-  copper_vein: { id: 'copper_vein', name: 'Copper vein', tile: Tile.CopperOre, depletedTile: Tile.Rubble, maxHits: 8, respawnMs: 300_000, skill: 'mining', spriteId: 'resource:copper_vein', hitSound: 'mine', breakSound: 'rock_break', drops: [{ itemId: 'stone', min: 2, max: 3, chance: 1, when: 'hit' }, { itemId: 'copper_ore', min: 1, max: 1, chance: 1, when: 'hit' }] },
-  iron_vein: { id: 'iron_vein', name: 'Iron vein', tile: Tile.IronOre, depletedTile: Tile.Rubble, maxHits: 10, respawnMs: 360_000, skill: 'mining', spriteId: 'resource:iron_vein', hitSound: 'mine_heavy', breakSound: 'rock_break', drops: [{ itemId: 'stone', min: 2, max: 3, chance: 1, when: 'hit' }, { itemId: 'iron_ore', min: 1, max: 1, chance: 1, when: 'hit' }] },
-};
+const defaultResources = DEFAULT_RESOURCE_NODES;
 
 const preset = (id: string, name: string, frequency: number, endFrequency: number, durationMs: number, wave = 'triangle', noise = 0.05) => ({ id, name, frequency, endFrequency, durationMs, wave, volume: 0.16, noise, filterHz: 2400 });
 const defaultSounds = {
@@ -168,11 +181,7 @@ export function defaultGameContent(kind: EngineContentKind): unknown {
     case 'sounds':
       return defaultSounds;
     case 'settings':
-      return {
-        map: { minSize: 20, maxSize: 200 },
-        publishing: { contentPollMs: 10_000, questPollMs: 60_000 },
-        notes: 'Global tuning values are introduced here as their runtime systems are migrated.',
-      };
+      return DEFAULT_ENGINE_SETTINGS;
   }
 }
 
@@ -217,6 +226,7 @@ export function sanitizeGameContent(kind: EngineContentKind, input: unknown): un
         spriteId: text(item.spriteId, `item:${id}`, 80),
       };
       if (item.durability !== undefined) sanitized.durability = finite(item.durability, 1, 1, 1_000_000) | 0;
+      if (item.lightRadius !== undefined) sanitized.lightRadius = finite(item.lightRadius, 0, 0, 2_000);
 
       if (kind === 'weapon') {
         const weapon = record(item.weapon);
@@ -389,12 +399,26 @@ export function sanitizeGameContent(kind: EngineContentKind, input: unknown): un
       const id = rawId.trim().replace(/[^a-z0-9_-]/gi, '_').slice(0, 50);
       const resource = record(rawResource);
       if (!id) continue;
-      const drops = Array.isArray(resource.drops) ? resource.drops.slice(0, 100).map((rawDrop) => {
+      const drops: ResourceNodeDef['drops'] = Array.isArray(resource.drops) ? resource.drops.slice(0, 100).map((rawDrop) => {
         const drop = record(rawDrop);
         const min = finite(drop.min, 1, 1, 100_000);
-        return { itemId: text(drop.itemId, '', 60), min, max: finite(drop.max, min, min, 100_000), chance: finite(drop.chance, 1, 0, 1), when: drop.when === 'depleted' ? 'depleted' : 'hit' };
+        return { itemId: text(drop.itemId, '', 60), min, max: finite(drop.max, min, min, 100_000), chance: finite(drop.chance, 1, 0, 1), when: (drop.when === 'depleted' ? 'depleted' : 'hit') as 'hit' | 'depleted' };
       }).filter((drop) => drop.itemId) : [];
-      out[id] = { id, name: text(resource.name, id), tile: finite(resource.tile, Tile.Tree, 0, 255) | 0, depletedTile: finite(resource.depletedTile, Tile.Stump, 0, 255) | 0, maxHits: finite(resource.maxHits, 6, 1, 100_000) | 0, respawnMs: finite(resource.respawnMs, 240_000, 1000, 86_400_000), skill: resource.skill === 'mining' ? 'mining' : 'woodcutting', spriteId: text(resource.spriteId, '', 80), hitSound: text(resource.hitSound, '', 60), breakSound: text(resource.breakSound, '', 60), drops };
+      out[id] = normalizeResourceNode({
+        id,
+        name: text(resource.name, id),
+        tile: finite(resource.tile, Tile.Tree, 0, 255) | 0,
+        depletedTile: finite(resource.depletedTile, Tile.Stump, 0, 255) | 0,
+        maxHits: finite(resource.maxHits, 6, 1, 100_000) | 0,
+        respawnMs: finite(resource.respawnMs, 240_000, 1000, 86_400_000),
+        skill: resource.skill === 'mining' ? 'mining' : 'woodcutting',
+        respawnFamily: resource.respawnFamily === 'rock' ? 'rock' : resource.respawnFamily === 'tree' ? 'tree' : undefined,
+        respawnWeight: finite(resource.respawnWeight, id === 'ironwood' ? 6 : id === 'tree' ? 94 : 1, 0, 1_000_000),
+        spriteId: text(resource.spriteId, '', 80),
+        hitSound: text(resource.hitSound, '', 60),
+        breakSound: text(resource.breakSound, '', 60),
+        drops,
+      });
     }
     if (!Object.keys(out).length) throw new Error('At least one resource definition is required');
     return out;
@@ -458,19 +482,21 @@ export function sanitizeGameContent(kind: EngineContentKind, input: unknown): un
 
   if (kind === 'recipes') {
     if (!Array.isArray(input)) throw new Error('Recipes must be an array');
+    const recipeCategories = new Set(['survival', 'medical', 'gear', 'build', 'smelt', 'forge']);
+    const recipeStations = new Set(['workbench', 'furnace', 'anvil']);
     return input.slice(0, 5000).map((raw, index) => {
       const recipe = record(raw);
       const output = record(recipe.out);
       const costs = Array.isArray(recipe.cost) ? recipe.cost : [];
       return {
         id: text(recipe.id, `recipe_${index}`, 60),
-        cat: text(recipe.cat, 'survival', 30),
+        cat: recipeCategories.has(String(recipe.cat)) ? String(recipe.cat) : 'survival',
         out: { id: text(output.id, '', 60), qty: finite(output.qty, 1, 1, 100_000) },
         cost: costs.slice(0, 50).map((rawCost) => {
           const cost = record(rawCost);
           return { id: text(cost.id, '', 60), qty: finite(cost.qty, 1, 1, 100_000) };
         }).filter((cost) => cost.id),
-        ...(recipe.station ? { station: text(recipe.station, '', 30) } : {}),
+        ...(recipeStations.has(String(recipe.station)) ? { station: String(recipe.station) } : {}),
       };
     }).filter((recipe) => recipe.out.id);
   }
@@ -487,6 +513,37 @@ export function sanitizeGameContent(kind: EngineContentKind, input: unknown): un
       if (id) out[id] = { id, name: text(trader.name, id), questTier: finite(trader.questTier, 1, 1, 100) | 0, stock };
     }
     return out;
+  }
+
+  if (kind === 'settings') {
+    const settings = record(input);
+    const map = record(settings.map);
+    const publishing = record(settings.publishing);
+    const bots = record(settings.bots);
+    const names = Array.isArray(bots.names)
+      ? bots.names
+        .slice(0, 400)
+        .map((value) => text(value, '', 24).replace(/[^a-z0-9_-]/gi, ''))
+        .filter(Boolean)
+      : DEFAULT_ENGINE_SETTINGS.bots.names;
+    return {
+      map: {
+        minSize: finite(map.minSize, DEFAULT_ENGINE_SETTINGS.map.minSize, 20, 2000) | 0,
+        maxSize: finite(map.maxSize, DEFAULT_ENGINE_SETTINGS.map.maxSize, 20, 2000) | 0,
+      },
+      publishing: {
+        contentPollMs: finite(publishing.contentPollMs, DEFAULT_ENGINE_SETTINGS.publishing.contentPollMs, 1000, 3_600_000) | 0,
+        questPollMs: finite(publishing.questPollMs, DEFAULT_ENGINE_SETTINGS.publishing.questPollMs, 1000, 3_600_000) | 0,
+      },
+      bots: {
+        count: finite(bots.count, DEFAULT_ENGINE_SETTINGS.bots.count, 0, 128) | 0,
+        respawnMs: finite(bots.respawnMs, DEFAULT_ENGINE_SETTINGS.bots.respawnMs, 5000, 600_000) | 0,
+        playerAggroChance: finite(bots.playerAggroChance, DEFAULT_ENGINE_SETTINGS.bots.playerAggroChance, 0, 1),
+        buildChance: finite(bots.buildChance, DEFAULT_ENGINE_SETTINGS.bots.buildChance, 0, 1),
+        names,
+      },
+      notes: text(settings.notes, DEFAULT_ENGINE_SETTINGS.notes, 500),
+    };
   }
 
   if (!input || typeof input !== 'object') throw new Error(`${kind} content must be an object or array`);

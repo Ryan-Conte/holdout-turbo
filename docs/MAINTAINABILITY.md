@@ -18,12 +18,12 @@ Line counts are indicators, not targets. Split a file only when a boundary has a
 
 | Area | Current shape | Next safe boundary |
 | --- | --- | --- |
-| API simulation | `game.service.ts` is about 2,800 lines | Add behavior tests, then extract instance lifecycle, inventory/economy, combat, and enemy AI one subsystem at a time. |
-| Web renderer | `renderer.ts` is about 1,650 lines | Separate terrain/world layers, entity drawing, and transient effects while keeping one render coordinator. |
-| Game client | `GameClient.tsx` is about 1,650 lines after the first panel split | Extract socket/session and input hooks, then inventory/container presentation. Do not move queue timers into leaf components. |
-| Map editor | `MapStudio.tsx` is about 970 lines after its model split | Extract palette, inspector, and canvas viewport components around the existing camera contract. |
-| Shared package | `shared/src/index.ts` is about 750 lines | Move protocol snapshots/events and world constants into modules that are re-exported by `index.ts`. |
-| Engine defaults | `web/lib/game-content.ts` is about 420 lines | Split defaults from sanitizers and add fixture-based compatibility tests before removing legacy fallbacks. |
+| API simulation | `game.service.ts` is about 3,800 lines | Add behavior tests, then extract instance lifecycle, inventory/economy, stations, combat, bots, and enemy AI one subsystem at a time. |
+| Web renderer | `renderer.ts` is about 1,800 lines | Separate terrain/world layers, entity drawing, and transient effects while keeping one render coordinator. |
+| Game client | `GameClient.tsx` is about 1,750 lines | Extract socket/session and input hooks, then inventory/container presentation. Keep queue timers coordinated centrally. |
+| Map editor | `MapStudio.tsx` is about 1,100 lines after its model split | Extract palette, inspector, and canvas viewport components around the existing camera contract. |
+| Shared package | `shared/src/index.ts` is about 875 lines | Move protocol snapshots/events and world constants into modules that are re-exported by `index.ts`. |
+| Engine defaults | `web/lib/game-content.ts` is about 550 lines | Split defaults from sanitizers and add fixture-based compatibility tests before removing legacy fallbacks. |
 
 ## Completed first pass
 
@@ -31,18 +31,20 @@ Line counts are indicators, not targets. Split a file only when a boundary has a
 - `GameClient` remains the owner of sockets and action queues, avoiding duplicated client state.
 - Map editor constants, palette metadata, history cloning, labels, and numeric helpers now live in `map-studio-model.ts`.
 - API runtime entities and instance shapes now live in `game.types.ts`, leaving `GameService` focused on behavior.
-- Root `npm run check` provides one command for workspace typechecks and production builds.
+- Inventory/death-drop transfers, station fuel and cross-system simulation predicates now live in pure `game/rules` modules.
+- Economy/save observability is isolated in `TelemetryService`; runtime item/recipe synchronization is isolated in `ContentService`.
+- Root `npm run check` provides one command for workspace typechecks, production builds and deterministic gameplay tests.
 
-## Verification gap
+## Automated verification
 
-The repository currently has no automated test or spec files. Before a major `GameService` or renderer split, add focused tests for:
+`npm run test:gameplay` compiles the shared/API packages and executes deterministic coverage for:
 
-1. Authored-map conversion, terrain/resource/block compatibility, rotation, and elevation collision.
-2. Stamina exhaustion, inventory transfer, crafting costs, loot ownership, and structure damage policy.
-3. Content-document sanitization and legacy document migration.
-4. Renderer coordinate transforms, sprite frame fallback, and map-editor cursor-to-tile conversion.
+1. Death/disconnect drops and durability-preserving inventory transfers.
+2. Extraction interruption by movement or damage.
+3. Station fuel capacity/consumption and crafting payment.
+4. Quest prerequisite/claim gates, foundation restoration, elevation cliffs and authored-map conversion.
 
-Until those tests exist, every refactor must pass `npm run check` and should avoid mixing behavior changes with file moves.
+Content sanitization and renderer transforms remain useful future coverage, but they no longer block the first service extraction. Every refactor must pass `npm run check` and should avoid mixing unrelated behavior changes with file moves.
 
 ## Refactor rules
 

@@ -11,15 +11,18 @@ datasource db {
 // ── Better Auth ──────────────────────────────────────────────────────────
 
 model User {
-  id            String    @id
-  name          String
-  email         String    @unique
-  emailVerified Boolean   @default(false)
-  image         String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @default(now())
-  sessions      Session[]
-  accounts      Account[]
+  id             String            @id
+  name           String
+  email          String            @unique
+  emailVerified  Boolean           @default(false)
+  image          String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @default(now())
+  sessions       Session[]
+  accounts       Account[]
+  clanMembership ClanMember?
+  clanInvites    ClanInvite[]      @relation("ClanInvitee")
+  worldLease     PlayerWorldLease?
 
   @@map("user")
 }
@@ -71,16 +74,37 @@ model Verification {
 // ── Game ─────────────────────────────────────────────────────────────────
 
 model Profile {
-  userId    String   @id @map("user_id")
-  data      Json // { inv, equipment, skills, quests }
-  money     Int      @default(25)
-  kills     Int      @default(0)
-  deaths    Int      @default(0)
-  admin     Boolean  @default(false) // grants /editor + admin APIs (env ADMIN_EMAILS bootstraps this)
-  hideout   Json? // { storage: InvSlot[], objects: [{type, tx, ty, slots?}] }
-  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  userId      String    @id @map("user_id")
+  data        Json // { inv, equipment, skills, quests }
+  money       Int       @default(25)
+  kills       Int       @default(0)
+  deaths      Int       @default(0)
+  admin       Boolean   @default(false) // grants /editor + admin APIs (env ADMIN_EMAILS bootstraps this)
+  hideout     Json? // { storage: InvSlot[], objects: [{type, tx, ty, slots?}] }
+  mutedUntil  DateTime? @map("muted_until") @db.Timestamptz(6)
+  muteReason  String?   @map("mute_reason") @db.VarChar(160)
+  bannedUntil DateTime? @map("banned_until") @db.Timestamptz(6)
+  banReason   String?   @map("ban_reason") @db.VarChar(160)
+  moderatedBy String?   @map("moderated_by") @db.VarChar(120)
+  updatedAt   DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
 
   @@map("profiles")
+}
+
+// A survivor may be simulated by exactly one regional game server at a time.
+// The connection token changes on reconnect so stale sockets cannot overwrite
+// inventory, currency, or progression after ownership has moved elsewhere.
+model PlayerWorldLease {
+  userId       String   @id @map("user_id")
+  serverKey    String   @map("server_key") @db.VarChar(240)
+  connectionId String   @map("connection_id") @db.VarChar(120)
+  expiresAt    DateTime @map("expires_at") @db.Timestamptz(6)
+  updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@index([serverKey, expiresAt])
+  @@map("player_world_leases")
 }
 
 model Friend {
@@ -91,6 +115,77 @@ model Friend {
 
   @@id([userId, friendId])
   @@map("friends")
+}
+
+// One persistent social group per survivor. Clan hideout data is shared by all
+// members and is simulated by the authoritative game server.
+model Clan {
+  id           String            @id @default(cuid())
+  name         String            @unique @db.VarChar(32)
+  tag          String            @unique @db.VarChar(6)
+  hideout      Json?
+  treasury     Int               @default(0)
+  members      ClanMember[]
+  invites      ClanInvite[]
+  ledger       ClanLedgerEntry[]
+  hideoutLease ClanHideoutLease?
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime          @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("clans")
+}
+
+model ClanLedgerEntry {
+  id          Int      @id @default(autoincrement())
+  clanId      String   @map("clan_id")
+  actorUserId String   @map("actor_user_id")
+  actorName   String   @map("actor_name") @db.VarChar(80)
+  kind        String   @db.VarChar(20)
+  amount      Int
+  balance     Int
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  clan        Clan     @relation(fields: [clanId], references: [id], onDelete: Cascade)
+
+  @@index([clanId, createdAt])
+  @@map("clan_ledger_entries")
+}
+
+// A short renewable lease prevents two independent regional API processes
+// from simulating and overwriting the same shared clan holdout concurrently.
+model ClanHideoutLease {
+  clanId    String   @id @map("clan_id")
+  serverKey String   @map("server_key") @db.VarChar(240)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  clan      Clan     @relation(fields: [clanId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("clan_hideout_leases")
+}
+
+model ClanMember {
+  clanId   String   @map("clan_id")
+  userId   String   @unique @map("user_id")
+  rank     String   @default("member") @db.VarChar(12)
+  joinedAt DateTime @default(now()) @map("joined_at") @db.Timestamptz(6)
+  clan     Clan     @relation(fields: [clanId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([clanId, userId])
+  @@index([clanId, rank])
+  @@map("clan_members")
+}
+
+model ClanInvite {
+  clanId    String   @map("clan_id")
+  userId    String   @map("user_id")
+  invitedBy String   @map("invited_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  clan      Clan     @relation(fields: [clanId], references: [id], onDelete: Cascade)
+  user      User     @relation("ClanInvitee", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([clanId, userId])
+  @@index([userId, createdAt])
+  @@map("clan_invites")
 }
 
 model GameMap {
@@ -120,20 +215,55 @@ model GameContent {
   @@map("game_content")
 }
 
+// Immutable snapshots support one-click rollback and audit who changed live content.
+model GameContentRevision {
+  id        Int      @id @default(autoincrement())
+  kind      String
+  revision  Int
+  data      Json
+  published Boolean  @default(false)
+  createdBy String?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([kind, revision])
+  @@index([kind, createdAt])
+  @@map("game_content_revisions")
+}
+
+// Batched append-only economy events; aggregate counters are also exposed by /health.
+model GameTelemetryEvent {
+  id        Int      @id @default(autoincrement())
+  serverKey String   @map("server_key") @db.VarChar(240)
+  userId    String?  @map("user_id")
+  kind      String   @db.VarChar(60)
+  itemId    String?  @map("item_id") @db.VarChar(60)
+  quantity  Int      @default(0)
+  credits   Int      @default(0)
+  value     Int      @default(0)
+  source    String?  @db.VarChar(60)
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([serverKey, createdAt])
+  @@index([kind, createdAt])
+  @@index([itemId, createdAt])
+  @@map("game_telemetry_events")
+}
+
 model Quest {
-  id           Int      @id @default(autoincrement())
-  name         String
-  desc         String   @default("")
-  kind         String // 'kill' | 'fetch'
-  target       String // EnemyKind for kill, ItemId for fetch
-  count        Int      @default(1)
-  rewardMoney  Int      @default(0)
-  rewardItem   String?
-  rewardQty    Int      @default(1)
-  requiresId   Int? // quest tree: must claim this quest first
-  tier         Int      @default(1) // 1 = outpost trader, 2 = hotzone black-market
-  active       Boolean  @default(true)
-  updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  id          Int      @id @default(autoincrement())
+  name        String
+  desc        String   @default("")
+  kind        String // 'kill' | 'fetch'
+  target      String // EnemyKind for kill, ItemId for fetch
+  count       Int      @default(1)
+  rewardMoney Int      @default(0)
+  rewardItem  String?
+  rewardQty   Int      @default(1)
+  requiresId  Int? // quest tree: must claim this quest first
+  tier        Int      @default(1) // 1 = outpost trader, 2 = hotzone black-market
+  active      Boolean  @default(true)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
 
   @@map("quests")
 }
@@ -148,4 +278,15 @@ model GameServer {
   updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
 
   @@map("game_servers")
+}
+
+// Sparse, authoritative simulation state for one independently hosted world.
+// The published map remains the base; depleted nodes and rerolled variants live here.
+model GameWorldState {
+  serverKey String   @id @map("server_key") @db.VarChar(240)
+  mapId     Int?     @map("map_id")
+  data      Json
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("game_world_state")
 }

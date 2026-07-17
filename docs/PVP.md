@@ -10,12 +10,15 @@ References: Project Zomboid (deep item/condition systems), Zero Sievert (top-dow
   - Vest: light (-15%), military (-30%)
   - Multiplicative with each other, drops on death — Rust-style risk economics.
 - Aim is a projectile sim with per-weapon spread; no hitscan → dodging matters at range.
+- Red-dot and suppressor mods occupy the current global MOD slot; they tighten spread or reduce AI gunshot investigation radius.
+- Weapons, tools, and armor have persisted durability. Use and incoming hits wear equipment; repairs cost scaled materials at the workbench/anvil.
+- Per-viewer range/LOS culling and client fog hide entities and loot behind blockers; a short sense radius preserves close-range audio awareness.
 - Nameplates render only within ~240 px (friends always) — information is positional, like Zero Sievert.
 - Safe zones (trader outposts) create social hubs without combat logging issues: damage suppressed both directions, shooting disabled inside.
 
 ## Planned (in order)
 
-1. **Gun attachments** (Zero Sievert style): items `attach_reddot` (-spread), `attach_suppressor` (smaller aggro/sound radius), `attach_extmag`. Data model prepared: `ItemDef.attachSlots` + per-instance item state will move inventory slots from `{id, qty}` to `{uid, id, qty, mods[]}` — do this in shared first, migrate `profiles.data` lazily.
-2. **Vision cone / fog**: render-side dimming outside a forward cone + server-side snapshot culling (see ANTICHEAT #2) so the view advantage is symmetric.
-3. Durability/condition on weapons & armor (Zomboid-style repair with scrap).
-4. Sound propagation: gunshot events with radius → minimap pings for nearby players.
+1. **Item instances and weapon-specific slots**: migrate inventory entries from stack state to stable UIDs so each gun owns its fitted optic, suppressor, magazine upgrade, and condition. Add `attach_extmag` during this migration instead of extending the global MOD slot.
+2. **Forward vision/readability pass**: consider a soft forward-cone contrast treatment without weakening the authoritative bounded LOS culling already shipped.
+3. **Sound propagation for PvP**: server-authored gunshot events with distance/noise-class pings for nearby players; never reveal the exact shooter coordinate outside the intended information radius.
+4. **Balance telemetry**: record weapon pick rate, extraction rate, hit rate, and armor survival before large TTK changes.

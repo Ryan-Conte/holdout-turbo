@@ -53,8 +53,9 @@ export function terrainKindsFromTiles(tiles: ArrayLike<number>): Record<string, 
 export function resourceKindsFromTiles(tiles: ArrayLike<number>): Record<string, string> {
   const resources: Record<string, string> = {};
   for (let index = 0; index < tiles.length; index++) {
-    const id = tiles[index] === Tile.Tree ? 'tree' : tiles[index] === Tile.Rock ? 'rock'
-      : tiles[index] === Tile.CopperOre ? 'copper_vein' : tiles[index] === Tile.IronOre ? 'iron_vein' : '';
+    const id = tiles[index] === Tile.Tree ? 'tree'
+      : tiles[index] === Tile.Rock || tiles[index] === Tile.CopperOre || tiles[index] === Tile.IronOre ? 'rock'
+        : '';
     if (id) resources[String(index)] = id;
   }
   return resources;
@@ -316,13 +317,15 @@ export function generateMap(seed = (Math.random() * 2 ** 31) | 0): GeneratedMap 
     }
   }
 
-  // wildlife in the wilds: deer & rabbits to hunt, boars that fight back,
-  // wolves prowling the deep forest
+  // Wildlife keeps travel lanes alive: small game flees, territorial animals
+  // punish careless routing, and apex bears make deep forest valuable/risky.
   const wildlife: { kind: EnemyKind; count: number; poiPad: number }[] = [
     { kind: 'deer', count: 8, poiPad: 4 },
     { kind: 'rabbit', count: 10, poiPad: 3 },
     { kind: 'boar', count: 5, poiPad: 5 },
     { kind: 'wolf', count: 4, poiPad: 10 },
+    { kind: 'fox', count: 6, poiPad: 5 },
+    { kind: 'bear', count: 2, poiPad: 14 },
   ];
   for (const w of wildlife) {
     for (let i = 0; i < w.count; i++) {
@@ -503,6 +506,8 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
       case 'rabbit': out.enemySpawns.push({ x: cx, y: cy, kind: 'rabbit' }); break;
       case 'boar': out.enemySpawns.push({ x: cx, y: cy, kind: 'boar' }); break;
       case 'wolf': out.enemySpawns.push({ x: cx, y: cy, kind: 'wolf' }); break;
+      case 'fox': out.enemySpawns.push({ x: cx, y: cy, kind: 'fox' }); break;
+      case 'bear': out.enemySpawns.push({ x: cx, y: cy, kind: 'bear' }); break;
       case 'mob': out.enemySpawns.push({ x: cx, y: cy, kind: o.contentId || 'zombie', respawnMs: o.respawnMs }); break;
       case 'spawn': out.spawns.push({ x: cx, y: cy }); break;
       case 'extract': out.extracts.push({ x: cx, y: cy }); break;

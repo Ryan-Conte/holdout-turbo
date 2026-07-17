@@ -81,6 +81,8 @@ export const MAP_OBJECT_PALETTE: {
   { id: 'rabbit', label: 'Rabbit', group: 'Wildlife', color: '#c8bba4', template: { type: 'rabbit' } },
   { id: 'boar', label: 'Boar', group: 'Wildlife', color: '#69503e', template: { type: 'boar' } },
   { id: 'wolf', label: 'Wolf', group: 'Wildlife', color: '#7b7f85', template: { type: 'wolf' } },
+  { id: 'fox', label: 'Red fox', group: 'Wildlife', color: '#c96f3d', template: { type: 'fox' } },
+  { id: 'bear', label: 'Black bear', group: 'Wildlife', color: '#40382f', template: { type: 'bear' } },
   { id: 'trader', label: 'Outpost trader', group: 'NPCs', color: '#79d078', template: { type: 'trader', name: 'Outpost', r: 8 } },
   { id: 'trader_black', label: 'Black-market trader', group: 'NPCs', color: '#a86fd0', template: { type: 'trader_black' } },
   { id: 'poi_town', label: 'Town zone', group: 'Zones', color: '#c95b4e', template: { type: 'poi_town', name: 'Town', r: 14 } },
@@ -147,7 +149,9 @@ export function cloneAuthoredMap(map: EditorMap): EditorMap {
 }
 
 export function historyLimitForMap(map: EditorMap): number {
-  return map.w * map.h > 1_000_000 ? 8 : MAP_HISTORY_LIMIT;
+  const cells = map.w * map.h;
+  if (cells > 2_000_000) return 4;
+  return cells > 1_000_000 ? 8 : MAP_HISTORY_LIMIT;
 }
 
 export function clampNumber(value: number, min: number, max: number): number {

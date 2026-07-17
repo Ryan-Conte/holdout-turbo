@@ -37,12 +37,13 @@ export type ItemId =
   | 'pistol' | 'smg' | 'shotgun' | 'rifle' | 'bow'
   | 'revolver' | 'carbine' | 'dmr' | 'lmg' | 'prototype_rifle'
   // tools
-  | 'spear' | 'axe' | 'pickaxe' | 'fishing_rod'
+  | 'spear' | 'axe' | 'pickaxe' | 'fishing_rod' | 'torch'
   | 'steel_axe' | 'steel_pickaxe'
   // ammo
   | 'ammo_9mm' | 'ammo_shell' | 'ammo_556' | 'arrow' | 'ammo_44' | 'ammo_762'
   // materials
   | 'cloth' | 'scrap' | 'wood' | 'stone'
+  | 'animal_hide' | 'antler'
   | 'copper_ore' | 'iron_ore' | 'copper_bar' | 'iron_bar'
   // rare valuables (no use — sell them for a fortune / show them off)
   | 'gold_bar' | 'diamond' | 'rolex' | 'data_drive' | 'artifact'
@@ -51,7 +52,7 @@ export type ItemId =
   // food & water
   | 'raw_fish' | 'cooked_fish' | 'raw_meat' | 'cooked_meat' | 'canteen' | 'canteen_full'
   // backpacks
-  | 'backpack_mk2' | 'backpack_mk3'
+  | 'backpack_mk2' | 'backpack_mk3' | 'backpack_mk4'
   // armor
   | 'helmet_scrap' | 'helmet_military' | 'vest_light' | 'vest_military'
   // weapon mods
@@ -94,6 +95,7 @@ export interface ItemDef {
   kg: number;
   stack: number;
   desc: string;
+  spriteId?: string; // published item art; sheet order remains the fallback
   weapon?: WeaponStats;
   melee?: MeleeStats;
   armor?: ArmorStats;
@@ -106,10 +108,30 @@ export interface ItemDef {
   backpackTier?: number;
   place?: BuildType; // placing this item builds this structure
   durability?: number; // max wear for weapons/tools/armor; degrades with use, repairable
+  lightRadius?: number; // world-space illumination radius while this item is equipped
 }
 
+/**
+ * Sanitized item shape delivered by the authoritative server. The authored
+ * engine may introduce IDs that are not part of the compile-time fallback
+ * union, so relationships use strings at this runtime boundary.
+ */
+export interface RuntimeWeaponStats extends Omit<WeaponStats, 'ammo'> {
+  ammo: string;
+}
+
+export interface RuntimeItemDef extends Omit<ItemDef, 'id' | 'weapon' | 'raw' | 'emptyTo' | 'fillFrom'> {
+  id: string;
+  weapon?: RuntimeWeaponStats;
+  raw?: string;
+  emptyTo?: string;
+  fillFrom?: string;
+}
+
+export type RuntimeItemRegistry = Record<string, RuntimeItemDef>;
+
 /** Where an item is repaired, and the scrap/bar cost to fully mend it from broken. */
-export function repairInfo(def: ItemDef): { station: StationKind; scrap: number; bar?: ItemId } | null {
+export function repairInfo(def: ItemDef | RuntimeItemDef): { station: StationKind; scrap: number; bar?: ItemId } | null {
   if (!def.durability) return null;
   if (def.kind === 'weapon') {
     // forged guns need a bar; looted firearms just need scrap and an anvil
@@ -193,6 +215,11 @@ export const ITEMS: Record<ItemId, ItemDef> = {
     { damage: 18, cooldownMs: 650, range: 38, wood: 1, stone: 3 }),
   fishing_rod: tool('fishing_rod', 'Fishing Rod', 1.0, 'Equip, face water and click to fish.',
     { damage: 4, cooldownMs: 800, range: 40, wood: 1, stone: 1 }, 120),
+  torch: {
+    ...tool('torch', 'Hand Torch', 0.6, 'Portable light for dangerous night travel. Equip it to illuminate the area around you.',
+      { damage: 7, cooldownMs: 700, range: 34, wood: 1, stone: 1 }, 100),
+    lightRadius: 150,
+  },
   steel_axe: tool('steel_axe', 'Steel Hatchet', 2.0, 'Forged at an anvil. Chews through forests.',
     { damage: 30, cooldownMs: 600, range: 40, wood: 5, stone: 1 }, 320),
   steel_pickaxe: tool('steel_pickaxe', 'Steel Pickaxe', 2.4, 'Forged at an anvil. Cracks rock and ore fast.',
@@ -211,6 +238,8 @@ export const ITEMS: Record<ItemId, ItemDef> = {
   scrap: material('scrap', 'Scrap Metal', 0.4, 'Rusty metal bits.'),
   wood: material('wood', 'Wood', 0.5, 'Chopped from trees.'),
   stone: material('stone', 'Stone', 0.6, 'Mined from rocks.'),
+  animal_hide: material('animal_hide', 'Cured Hide', 0.35, 'Tough hide from hunted wildlife. Traders and outfitters value it.', 20),
+  antler: material('antler', 'Prized Antler', 0.45, 'An intact trophy from a mature deer. Rare and valuable.', 10),
   copper_ore: material('copper_ore', 'Copper Ore', 0.8, 'From copper-veined rocks. Smelt at a furnace.', 20),
   iron_ore: material('iron_ore', 'Iron Ore', 0.9, 'From iron-veined rocks. Smelt at a furnace.', 20),
   copper_bar: material('copper_bar', 'Copper Bar', 0.6, 'Smelted copper. Ammo and alloys.', 20),
@@ -243,6 +272,7 @@ export const ITEMS: Record<ItemId, ItemDef> = {
   // ── backpacks
   backpack_mk2: backpack('backpack_mk2', 'Scout Backpack', 1.0, 1, '16 slots, 32 kg capacity.'),
   backpack_mk3: backpack('backpack_mk3', 'Raider Backpack', 1.5, 2, '20 slots, 45 kg capacity.'),
+  backpack_mk4: backpack('backpack_mk4', 'Expedition Backpack MK4', 3.0, 3, '32 slots, 80 kg capacity. Reinforced for long raids.'),
 
   // ── armor
   helmet_scrap: armorItem('helmet_scrap', 'Scrap Helmet', 1.0, 'helmet', 0.1, 'Bolted-together head protection. -10% damage.'),
@@ -276,7 +306,7 @@ export const MOD_SPREAD_MULT = 0.65; // red dot
 export const SUPPRESSED_AGGRO_RANGE = 120; // vs default 380
 
 // ── context-menu verb helper (used by the UI so new items just work)
-export function useVerb(def: ItemDef): string | null {
+export function useVerb(def: ItemDef | RuntimeItemDef): string | null {
   if (def.place) return 'PLACE';
   if (def.kind === 'weapon' || def.kind === 'tool') return 'EQUIP';
   if (def.kind === 'armor') return 'WEAR';

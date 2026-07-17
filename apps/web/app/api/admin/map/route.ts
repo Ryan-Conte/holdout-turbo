@@ -17,7 +17,7 @@ import { prisma } from '@/lib/db';
 
 const VALID_OBJECTS = new Set([
   'chest', 'chest_military', 'chest_custom', 'loot', 'zombie', 'military', 'mob',
-  'deer', 'rabbit', 'boar', 'wolf', 'spawn', 'trader', 'trader_black',
+  'deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear', 'spawn', 'trader', 'trader_black',
   'extract', 'poi_town', 'poi_airport', 'poi_outpost', 'poi_hotzone', 'poi_zone',
 ]);
 const ZONE_KINDS = new Set(['town', 'airport', 'outpost', 'wilds', 'hotzone']);
@@ -125,7 +125,7 @@ function cleanMap(input: unknown, terrainDocument: unknown): AuthoredMap {
 export async function GET() {
   const user = await requireAdmin();
   if (!user) return NextResponse.json({ error: 'Admins only' }, { status: 403 });
-  const [draft, published] = await Promise.all([
+  const [draft, published, revisions] = await Promise.all([
     prisma.gameMap.findFirst({
       where: { draft: true },
       orderBy: { updatedAt: 'desc' },
@@ -135,6 +135,12 @@ export async function GET() {
       where: { active: true, draft: false },
       orderBy: { updatedAt: 'desc' },
       select: { id: true, name: true, updatedAt: true },
+    }),
+    prisma.gameMap.findMany({
+      where: { draft: false },
+      orderBy: { updatedAt: 'desc' },
+      take: 30,
+      select: { id: true, name: true, active: true, updatedAt: true },
     }),
   ]);
   const selected = draft ?? (published
@@ -146,6 +152,7 @@ export async function GET() {
   return NextResponse.json({
     map: selected ? { id: selected.id, name: selected.name, data: selected.data, draft: selected.draft } : null,
     published: published ? { id: published.id, name: published.name, updatedAt: published.updatedAt } : null,
+    revisions,
   });
 }
 
@@ -182,4 +189,20 @@ export async function POST(req: Request) {
     return tx.gameMap.create({ data: { name: draft.name, data: data as object, active: true, draft: false } });
   });
   return NextResponse.json({ ok: true, id: row.id, publishedAt: row.updatedAt, note: 'Game servers poll for this revision.' });
+}
+
+export async function PATCH(req: Request) {
+  const user = await requireAdmin();
+  if (!user) return NextResponse.json({ error: 'Admins only' }, { status: 403 });
+  let body: { id?: number };
+  try { body = await req.json(); } catch { return NextResponse.json({ error: 'Invalid body' }, { status: 400 }); }
+  const id = Math.floor(Number(body.id));
+  if (!Number.isFinite(id) || id <= 0) return NextResponse.json({ error: 'Choose a map revision' }, { status: 400 });
+  const revision = await prisma.gameMap.findFirst({ where: { id, draft: false } });
+  if (!revision) return NextResponse.json({ error: 'Map revision not found' }, { status: 404 });
+  await prisma.$transaction(async (tx) => {
+    await tx.gameMap.updateMany({ where: { active: true }, data: { active: false } });
+    await tx.gameMap.update({ where: { id }, data: { active: true, updatedAt: new Date() } });
+  });
+  return NextResponse.json({ ok: true, id, restoredAt: new Date() });
 }

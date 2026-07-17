@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { requireAdmin } from '@/lib/auth';
+import { RevisionControls } from '@/components/admin/RevisionControls';
 
 const sections = [
   ['map', 'World'], ['terrain', 'Terrain'], ['resources', 'Resources'], ['mobs', 'Mobs'], ['animations', 'Animations'], ['sounds', 'Sounds'], ['items', 'Items'], ['recipes', 'Crafting'],
@@ -18,6 +19,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
         <div className="admin-user"><span>ADMIN SESSION</span><b>{user.name}</b><Link href="/">EXIT</Link></div>
       </header>
       <nav className="admin-nav">{sections.map(([slug, label]) => <Link key={slug} href={`/admin/${slug}`}>{label}</Link>)}</nav>
+      <RevisionControls />
       <main className="admin-main">{children}</main>
     </div>
   );

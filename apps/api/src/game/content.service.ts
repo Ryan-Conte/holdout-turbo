@@ -1,22 +1,28 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import {
   DEFAULT_LOOT_TABLES,
+  DEFAULT_RESOURCE_NODES,
   AnimationDocument,
   BlockDocument,
   BuildType,
+  DEFAULT_ENGINE_SETTINGS,
   ENEMY_DEFS,
   EnemyDef,
+  EngineSettingsDocument,
   EngineMobDefinition,
-  ItemId,
   ITEMS,
   LootTableRegistry,
   RECIPES,
-  Recipe,
+  RuntimeGameplayContent,
+  RuntimeItemDef,
+  RuntimeItemRegistry,
+  RuntimeRecipe,
   RuntimeVisualContent,
   ResourceNodeDef,
   SoundDocument,
   SpriteDocument,
   TerrainDocument,
+  Tile,
   TradeEntry,
   TRADER_TIER_STOCK,
   TraderTier,
@@ -24,19 +30,29 @@ import {
 import { DbService } from '../db/db.service';
 
 const POLL_MS = 10_000;
-const CONTENT_KINDS = ['mobs', 'recipes', 'traders', 'loot', 'sprites', 'animations', 'resources', 'sounds', 'blocks', 'terrain'] as const;
+const CONTENT_KINDS = ['items', 'mobs', 'recipes', 'traders', 'loot', 'sprites', 'animations', 'resources', 'sounds', 'blocks', 'terrain', 'settings'] as const;
 const VISUAL_KINDS = new Set<string>(['mobs', 'sprites', 'animations', 'resources', 'sounds', 'blocks', 'terrain']);
+const GAMEPLAY_KINDS = new Set<string>(['items', 'recipes']);
+const FALLBACK_ITEMS = ITEMS as unknown as RuntimeItemRegistry;
+const UNKNOWN_ITEM: RuntimeItemDef = {
+  id: 'unknown', name: 'Unknown item', kind: 'material', kg: 0, stack: 1,
+  desc: 'This item definition is unavailable in the active content revision.',
+};
 
 @Injectable()
 export class ContentService implements OnModuleInit, OnModuleDestroy {
   private readonly log = new Logger('Content');
   private timer: NodeJS.Timeout;
   private mobDefs: Record<string, EnemyDef> = ENEMY_DEFS;
-  private recipeDefs: Recipe[] = RECIPES;
+  private itemDefs: RuntimeItemRegistry = FALLBACK_ITEMS;
+  private recipeDefs: RuntimeRecipe[] = RECIPES;
   private traderDefs: Record<TraderTier, TradeEntry[]> = TRADER_TIER_STOCK;
   private lootDefs: LootTableRegistry = DEFAULT_LOOT_TABLES;
-  private visualDefs: RuntimeVisualContent = { assets: {}, animations: {}, resources: {}, sounds: { presets: {}, actions: {} }, mobSounds: {}, blocks: {}, terrain: {} };
+  private visualDefs: RuntimeVisualContent = { assets: {}, animations: {}, resources: DEFAULT_RESOURCE_NODES, sounds: { presets: {}, actions: {} }, mobSounds: {}, blocks: {}, terrain: {} };
+  private settingsDoc: EngineSettingsDocument = DEFAULT_ENGINE_SETTINGS;
   private visualVersion = 0;
+  private gameplayVersion = 0;
+  private gameplayRevision = 'fallback';
   private publishedDocs: Record<string, unknown> = {};
   private publishedManifest: Record<string, string> = {};
   private refreshing = false;
@@ -73,7 +89,12 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
         else delete this.publishedDocs[kind];
       }
       this.publishedManifest = manifest;
-      this.applyDocuments(this.publishedDocs, force || changedKinds.some((kind) => VISUAL_KINDS.has(kind)));
+      this.gameplayRevision = this.gameplayRevisionFromManifest(manifest);
+      this.applyDocuments(
+        this.publishedDocs,
+        force || changedKinds.some((kind) => VISUAL_KINDS.has(kind)),
+        force || changedKinds.some((kind) => GAMEPLAY_KINDS.has(kind)),
+      );
       await this.db.savePublishedContentCache(this.publishedManifest, this.publishedDocs);
       this.log.log(`Published content cached in memory (${changedKinds.join(', ')})`);
     } finally {
@@ -85,26 +106,42 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     const cached = await this.db.loadPublishedContentCache();
     if (!cached) return false;
     this.publishedManifest = cached.manifest;
+    this.gameplayRevision = this.gameplayRevisionFromManifest(cached.manifest);
     this.publishedDocs = cached.docs;
-    this.applyDocuments(this.publishedDocs, true);
+    this.applyDocuments(this.publishedDocs, true, true);
     this.log.warn('Published content restored from the socket server runtime cache');
     return true;
   }
 
-  private applyDocuments(docs: Record<string, unknown>, rebuildVisuals: boolean) {
+  private applyDocuments(docs: Record<string, unknown>, rebuildVisuals: boolean, rebuildGameplay: boolean) {
     const mobs = docs.mobs && typeof docs.mobs === 'object' && !Array.isArray(docs.mobs)
       ? docs.mobs as Record<string, EngineMobDefinition>
       : {};
     this.mobDefs = { ...ENEMY_DEFS, ...mobs };
 
+    const publishedItems = docs.items && typeof docs.items === 'object' && !Array.isArray(docs.items)
+      ? docs.items as RuntimeItemRegistry
+      : {};
+    const validItems = Object.fromEntries(Object.entries(publishedItems).flatMap(([id, item]) => {
+      if (!item || typeof item !== 'object' || item.id !== id || typeof item.name !== 'string' || typeof item.kind !== 'string') return [];
+      return [[id, item]];
+    })) as RuntimeItemRegistry;
+    this.itemDefs = Object.keys(validItems).length ? { ...FALLBACK_ITEMS, ...validItems } : FALLBACK_ITEMS;
+
     this.recipeDefs = RECIPES;
     if (Array.isArray(docs.recipes)) {
-      const valid = (docs.recipes as Recipe[]).filter((recipe) =>
-        recipe && typeof recipe.id === 'string' && recipe.out?.id in ITEMS && Array.isArray(recipe.cost) &&
-        recipe.cost.every((cost) => cost.id in ITEMS),
-      );
-      this.recipeDefs = valid.length ? valid : RECIPES;
+      const valid = (docs.recipes as RuntimeRecipe[]).filter((recipe) =>
+        recipe && typeof recipe.id === 'string' && Boolean(this.itemDefs[recipe.out?.id]) && Array.isArray(recipe.cost) &&
+        recipe.cost.every((cost) => Boolean(this.itemDefs[cost.id])),
+      ).map((recipe) => recipe.station === 'furnace'
+        ? { ...recipe, cost: recipe.cost.filter((cost) => cost.id !== 'wood') }
+        : recipe);
+      if (valid.length) {
+        const requiredFallbacks = RECIPES.filter((recipe) => recipe.id === 'craft_hand_torch' && !valid.some((entry) => entry.id === recipe.id));
+        this.recipeDefs = [...valid, ...requiredFallbacks];
+      }
     }
+    if (rebuildGameplay) this.gameplayVersion++;
 
     const traders = docs.traders as Record<string, { stock?: TradeEntry[] }> | undefined;
     this.traderDefs = TRADER_TIER_STOCK;
@@ -119,12 +156,31 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     this.lootDefs = DEFAULT_LOOT_TABLES;
     if (loot && typeof loot === 'object' && Object.keys(loot).length) this.lootDefs = { ...DEFAULT_LOOT_TABLES, ...loot };
 
+    const rawSettings = docs.settings && typeof docs.settings === 'object' && !Array.isArray(docs.settings)
+      ? docs.settings as Partial<EngineSettingsDocument>
+      : {};
+    const map = rawSettings.map && typeof rawSettings.map === 'object' ? rawSettings.map : {};
+    const publishing = rawSettings.publishing && typeof rawSettings.publishing === 'object' ? rawSettings.publishing : {};
+    const bots: Partial<EngineSettingsDocument['bots']> = rawSettings.bots && typeof rawSettings.bots === 'object' ? rawSettings.bots : {};
+    this.settingsDoc = {
+      ...DEFAULT_ENGINE_SETTINGS,
+      map: { ...DEFAULT_ENGINE_SETTINGS.map, ...map },
+      publishing: { ...DEFAULT_ENGINE_SETTINGS.publishing, ...publishing },
+      bots: {
+        ...DEFAULT_ENGINE_SETTINGS.bots,
+        ...bots,
+        names: Array.isArray(bots.names) ? bots.names.filter((name): name is string => typeof name === 'string' && Boolean(name)) : DEFAULT_ENGINE_SETTINGS.bots.names,
+      },
+      notes: typeof rawSettings.notes === 'string' ? rawSettings.notes : DEFAULT_ENGINE_SETTINGS.notes,
+    };
+
     if (!rebuildVisuals) return;
     const sprites = docs.sprites as SpriteDocument | undefined;
     const animations = docs.animations as AnimationDocument | undefined;
-    const resources = docs.resources && typeof docs.resources === 'object' && !Array.isArray(docs.resources)
+    const publishedResources = docs.resources && typeof docs.resources === 'object' && !Array.isArray(docs.resources)
       ? docs.resources as Record<string, ResourceNodeDef>
       : {};
+    const resources = Object.keys(publishedResources).length ? publishedResources : DEFAULT_RESOURCE_NODES;
     const sounds = docs.sounds && typeof docs.sounds === 'object' && !Array.isArray(docs.sounds)
       ? docs.sounds as SoundDocument
       : { presets: {}, actions: {} };
@@ -156,9 +212,13 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     this.visualVersion++;
   }
 
+  private gameplayRevisionFromManifest(manifest: Record<string, string>): string {
+    return `items@${manifest.items ?? 'fallback'}|recipes@${manifest.recipes ?? 'fallback'}`;
+  }
+
   private validStock(stock: TradeEntry[] | undefined): TradeEntry[] | null {
     if (!Array.isArray(stock)) return null;
-    const valid = stock.filter((entry) => entry && entry.id in ITEMS && Number.isFinite(entry.buy) && Number.isFinite(entry.sell));
+    const valid = stock.filter((entry) => entry && Boolean(this.itemDefs[entry.id]) && Number.isFinite(entry.buy) && Number.isFinite(entry.sell));
     return valid.length ? valid : null;
   }
 
@@ -180,6 +240,24 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     return id ? this.visualDefs.resources[id] : undefined;
   }
 
+  resourceFamily(resource: ResourceNodeDef | undefined, tile?: number): 'tree' | 'rock' | undefined {
+    if (resource?.respawnFamily === 'tree' || resource?.respawnFamily === 'rock') return resource.respawnFamily;
+    if (resource) return resource.skill === 'woodcutting' ? 'tree' : 'rock';
+    if (tile === Tile.Tree) return 'tree';
+    if (tile === Tile.Rock || tile === Tile.CopperOre || tile === Tile.IronOre) return 'rock';
+    return undefined;
+  }
+
+  resourceVariants(family: 'tree' | 'rock'): { resource: ResourceNodeDef; weight: number }[] {
+    return Object.values(this.visualDefs.resources).flatMap((resource) => {
+      if (this.resourceFamily(resource) !== family) return [];
+      const fallback = resource.id === 'ironwood' ? 6 : resource.id === 'tree' ? 94 : 1;
+      const rawWeight = Number(resource.respawnWeight);
+      const weight = Number.isFinite(rawWeight) ? Math.max(0, Math.min(1_000_000, rawWeight)) : fallback;
+      return weight > 0 ? [{ resource, weight }] : [];
+    });
+  }
+
   block(id: string | undefined) {
     return id ? this.visualDefs.blocks[id] : undefined;
   }
@@ -192,12 +270,41 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     return id ? this.visualDefs.terrain[id] : undefined;
   }
 
-  get recipes(): Recipe[] {
+  item(id: string | undefined): RuntimeItemDef {
+    return id ? this.itemDefs[id] ?? { ...UNKNOWN_ITEM, id, name: id } : UNKNOWN_ITEM;
+  }
+
+  hasItem(id: string | undefined): boolean {
+    return Boolean(id && this.itemDefs[id]);
+  }
+
+  get items(): RuntimeItemRegistry {
+    return this.itemDefs;
+  }
+
+  get recipes(): RuntimeRecipe[] {
     return this.recipeDefs;
+  }
+
+  get gameplay(): RuntimeGameplayContent {
+    return { version: this.gameplayRevision, items: this.itemDefs, recipes: this.recipeDefs };
+  }
+
+  get gameplayVersionNumber(): number {
+    return this.gameplayVersion;
   }
 
   traderStock(tier: TraderTier): TradeEntry[] {
     return this.traderDefs[tier] ?? this.traderDefs[1];
+  }
+
+  estimatedItemValue(id: string): number {
+    let value = 0;
+    for (const stock of Object.values(this.traderDefs)) {
+      const entry = stock.find((candidate) => candidate.id === id);
+      if (entry) value = Math.max(value, entry.sell, entry.buy > 0 ? Math.ceil(entry.buy * .35) : 0);
+    }
+    return value;
   }
 
   get lootTables(): LootTableRegistry {
@@ -206,6 +313,10 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
 
   get visuals(): RuntimeVisualContent {
     return this.visualDefs;
+  }
+
+  get settings(): EngineSettingsDocument {
+    return this.settingsDoc;
   }
 
   get visualsVersion(): number {

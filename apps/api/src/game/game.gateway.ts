@@ -10,7 +10,7 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { EV, InputPayload } from '@holdout/shared';
+import { AdminActionPayload, EV, InputPayload } from '@holdout/shared';
 import { verifyToken } from '../auth/jwt.util';
 import { GameService } from './game.service';
 import { RateLimiter } from './rate-limit';
@@ -28,6 +28,7 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   private readonly tradeLimit = new RateLimiter(6, 12);
   private readonly heavyLimit = new RateLimiter(2, 4); // hideout transitions
   private readonly chatLimit = new RateLimiter(2, 5);
+  private readonly adminLimit = new RateLimiter(5, 10);
   private violations = new Map<string, number>();
 
   @WebSocketServer()
@@ -57,18 +58,28 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
       return;
     }
     try {
-      const init = await this.game.addPlayer(socket.id, claims.sub, claims.username);
+      const init = await this.game.addPlayer(socket.id, claims.sub, claims.username, claims.guest);
       socket.emit(EV.init, init);
     } catch (err) {
       this.log.error(`Join failed for ${claims.username}: ${(err as Error).message}`);
-      socket.emit(EV.toast, 'Failed to join world');
+      await this.game.abandonPlayerAdmission(claims.sub, socket.id, claims.guest);
+      socket.emit(
+        EV.toast,
+        (err as Error).message === 'PROFILE_LEASE_CONFLICT'
+          ? 'This survivor is already active on another relay. Disconnect there or wait up to 45 seconds.'
+          : (err as Error).message === 'WORLD_FULL'
+            ? 'This relay is full. Choose another relay from deployment.'
+          : (err as Error).message === 'PLAYER_BANNED'
+            ? 'This survivor is currently suspended. Check the deployment screen for details.'
+          : 'Failed to join world',
+      );
       socket.disconnect(true);
     }
   }
 
   async handleDisconnect(socket: Socket) {
     this.violations.delete(socket.id);
-    for (const l of [this.inputLimit, this.actionLimit, this.tradeLimit, this.heavyLimit]) l.clear(socket.id);
+    for (const l of [this.inputLimit, this.actionLimit, this.tradeLimit, this.heavyLimit, this.chatLimit, this.adminLimit]) l.clear(socket.id);
     await this.game.removePlayer(socket.id);
   }
 
@@ -179,6 +190,12 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     this.game.questClaim(socket.id, Number(body.id) | 0);
   }
 
+  @SubscribeMessage(EV.stationFuel)
+  onStationFuel(@ConnectedSocket() socket: Socket, @MessageBody() body: { index: number; qty?: number }) {
+    if (!body || !this.allowed(socket, this.actionLimit)) return;
+    this.game.addStationFuel(socket.id, Number(body.index) | 0, Number(body.qty ?? 1));
+  }
+
   @SubscribeMessage(EV.craft)
   onCraft(@ConnectedSocket() socket: Socket, @MessageBody() body: { recipe: string }) {
     if (!body || typeof body.recipe !== 'string' || !this.allowed(socket, this.actionLimit)) return;
@@ -188,7 +205,7 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage(EV.respawn)
   onRespawn(@ConnectedSocket() socket: Socket) {
     if (!this.allowed(socket, this.actionLimit)) return;
-    this.game.respawn(socket.id);
+    void this.game.respawn(socket.id);
   }
 
   @SubscribeMessage(EV.tradeBuy)
@@ -213,5 +230,35 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   onHideoutLeave(@ConnectedSocket() socket: Socket) {
     if (!this.allowed(socket, this.heavyLimit)) return;
     this.game.leaveHideout(socket.id);
+  }
+
+  @SubscribeMessage(EV.clanHideoutEnter)
+  async onClanHideoutEnter(@ConnectedSocket() socket: Socket) {
+    if (!this.allowed(socket, this.heavyLimit)) return;
+    await this.game.enterClanHideout(socket.id);
+  }
+
+  @SubscribeMessage(EV.clanTreasury)
+  async onClanTreasury(@ConnectedSocket() socket: Socket, @MessageBody() body: { amount?: number } | undefined) {
+    if (!body || !this.allowed(socket, this.tradeLimit)) return;
+    await this.game.transferClanTreasury(socket.id, Number(body.amount));
+  }
+
+  @SubscribeMessage(EV.socialRefresh)
+  async onClanRefresh(@ConnectedSocket() socket: Socket) {
+    if (!this.allowed(socket, this.heavyLimit)) return;
+    await this.game.refreshSocial(socket.id);
+  }
+
+  @SubscribeMessage(EV.adminRequest)
+  async onAdminRequest(@ConnectedSocket() socket: Socket) {
+    if (!this.allowed(socket, this.adminLimit)) return;
+    await this.game.adminState(socket.id);
+  }
+
+  @SubscribeMessage(EV.adminAction)
+  async onAdminAction(@ConnectedSocket() socket: Socket, @MessageBody() body: AdminActionPayload) {
+    if (!body || typeof body !== 'object' || !this.allowed(socket, this.adminLimit)) return;
+    await this.game.adminAction(socket.id, body);
   }
 }

@@ -24,8 +24,8 @@ Rendered at 2× world scale (TILE = 32 px world, 16 px art) with `imageSmoothing
 
 ## chars.png (16×16, 2 walk frames per row)
 
-Rows 0-7 are survivor outfit bases; row 8 zombie, row 9 military, row 10 trader.
-Frame 0 = idle, frame 1 = step. The survivor row is selected by `appearance.outfit`. `game/character-appearance.ts` composites skin tone, body silhouette, hair and accent at the same pixel scale, followed by gameplay armor and held items. The pre-deploy creator uses this same compositor, so its live preview matches the world renderer.
+Rows 0-7 are survivor outfit bases; row 8 zombie, row 9 military, row 10 trader, rows 11-14 deer/rabbit/boar/wolf, row 15 fox, and row 16 bear.
+Frame 0 = idle, frame 1 = step. The survivor row is selected by `appearance.outfit`. `game/character-appearance.ts` composites skin tone, body silhouette, hair and accent at the same pixel scale, followed by gameplay armor and held items. The pre-deploy creator, signed-in deployment portrait, and world renderer use this same compositor so the saved survivor stays recognizable across surfaces.
 
 `CharacterAppearance.cosmetics` reserves `head`, `face`, `back` and `badge` asset identifiers. They are visual-only and intentionally separate from helmet/vest gameplay equipment. When real cosmetic art is added, resolve those identifiers to atlas layers in the shared compositor rather than adding creator-only rendering.
 
@@ -37,9 +37,9 @@ Assets with no DB frame data continue using `chars.png`. This allows animation t
 
 ## items.png (16×16)
 
-One icon per `ItemId`, column order defined in `apps/web/game/sprites.ts` (`ITEM_SHEET_ORDER`). Used by both the canvas (held/dropped items) and the DOM UI (CSS sprite backgrounds).
+One icon per `ItemId`, with the canonical column order in shared `ITEM_SPRITE_ORDER` and a renderer alias in `apps/web/game/sprites.ts`. Used by both the canvas (held/dropped items) and the DOM UI (CSS sprite backgrounds).
 
-Adding an item: add to shared `ITEMS`, append to `ITEM_SHEET_ORDER`, add a drawing block in `tools/gen-sprites.mjs` (or edit the PNG), rerun the generator.
+Adding an item: add to shared `ITEMS`, append to `ITEM_SPRITE_ORDER`, add a drawing block in `tools/gen-sprites.mjs` (or author its published DB asset), then rerun the generator for the fallback atlas.
 
 ## Browser pixel studio
 

@@ -4,10 +4,117 @@ import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { DEFAULT_CHARACTER_APPEARANCE, sanitizeCharacterAppearance, type CharacterAppearance } from '@holdout/shared';
 import { CharacterCreator } from '@/components/CharacterCreator';
+import { SurvivorPortrait } from '@/components/SurvivorPortrait';
 import { authClient } from '@/lib/auth-client';
 
 interface GameServerEntry { id: number; name: string; region: string; url: string }
 type Pings = Record<number, number | 'timeout' | undefined>;
+
+interface RelayPickerProps {
+  id: string;
+  label: string;
+  servers: GameServerEntry[];
+  selectedUrl: string;
+  pings: Pings;
+  onPick: (url: string) => void;
+  onRescan: () => void;
+}
+
+function pingTone(ping: number | 'timeout' | undefined) {
+  if (ping === undefined) return 'measuring';
+  if (ping === 'timeout') return 'bad';
+  return ping < 60 ? 'good' : ping < 130 ? 'ok' : 'bad';
+}
+
+function ServerPing({ value }: { value: number | 'timeout' | undefined }) {
+  if (value === undefined) return <span className="ping measuring">SCANNING</span>;
+  if (value === 'timeout') return <span className="ping bad">OFFLINE</span>;
+  return <span className={`ping ${pingTone(value)}`}>{value} ms</span>;
+}
+
+function RelayPicker({ id, label, servers, selectedUrl, pings, onPick, onRescan }: RelayPickerProps) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const selected = servers.find((server) => server.url === selectedUrl) ?? servers[0];
+  const selectedPing = selected ? pings[selected.id] : undefined;
+  const onlineCount = servers.filter((server) => typeof pings[server.id] === 'number').length;
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleServers = normalizedQuery
+    ? servers.filter((server) => `${server.name} ${server.region}`.toLowerCase().includes(normalizedQuery))
+    : servers;
+  const optionsId = `${id}-options`;
+
+  const pick = (url: string) => {
+    onPick(url);
+    setOpen(false);
+    setQuery('');
+  };
+
+  return (
+    <div className={`relay-picker${open ? ' open' : ''}`}>
+      <div className="srv-head">
+        <span>{label}</span>
+        <div className="srv-actions">
+          <small>{servers.length > 0 ? `${onlineCount}/${servers.length} ONLINE` : 'NO RELAYS'}</small>
+          <button type="button" className="srv-refresh" onClick={onRescan}>RESCAN</button>
+        </div>
+      </div>
+      <button
+        type="button"
+        className="relay-current"
+        disabled={!selected}
+        aria-expanded={open}
+        aria-controls={optionsId}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {selected ? (
+          <>
+            <i className={`relay-signal ${pingTone(selectedPing)}`} aria-hidden="true" />
+            <span className="relay-current-copy">
+              <b>{selected.name}</b>
+              <small>{selected.region}</small>
+            </span>
+            <ServerPing value={selectedPing} />
+            <i className="relay-chevron" aria-hidden="true" />
+          </>
+        ) : (
+          <span className="relay-current-copy"><b>NO RELAY AVAILABLE</b><small>Rescan the field network</small></span>
+        )}
+      </button>
+      {open && selected && (
+        <div className="relay-drawer" id={optionsId}>
+          {servers.length > 4 && (
+            <input
+              className="relay-search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="FILTER NAME OR REGION"
+              aria-label="Filter game relays"
+              autoFocus
+            />
+          )}
+          <div className="relay-options" role="listbox" aria-label={label}>
+            {visibleServers.map((server) => (
+              <button
+                type="button"
+                role="option"
+                aria-selected={server.url === selectedUrl}
+                className={`relay-option${server.url === selectedUrl ? ' active' : ''}`}
+                key={server.id}
+                onClick={() => pick(server.url)}
+              >
+                <i className={`relay-signal ${pingTone(pings[server.id])}`} aria-hidden="true" />
+                <span><b>{server.name}</b><small>{server.region}</small></span>
+                <ServerPing value={pings[server.id]} />
+              </button>
+            ))}
+            {visibleServers.length === 0 && <div className="relay-no-results">NO MATCHING RELAYS</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 const FIELD_NOTES = [
   { code: '01', title: 'SCAVENGE', desc: 'Push deeper into the zone for weapons, ore, and prototype hardware.' },
@@ -31,6 +138,7 @@ export default function LandingPage() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [landingView, setLandingView] = useState<'deploy' | 'character'>('deploy');
   const [appearance, setAppearance] = useState<CharacterAppearance>(DEFAULT_CHARACTER_APPEARANCE);
+  const [savedAppearance, setSavedAppearance] = useState<CharacterAppearance>(DEFAULT_CHARACTER_APPEARANCE);
   const [appearanceConfigured, setAppearanceConfigured] = useState(false);
   const [appearanceLoading, setAppearanceLoading] = useState(true);
   const [appearanceSaving, setAppearanceSaving] = useState(false);
@@ -47,6 +155,7 @@ export default function LandingPage() {
   useEffect(() => {
     if (!session?.user) {
       setAppearance(DEFAULT_CHARACTER_APPEARANCE);
+      setSavedAppearance(DEFAULT_CHARACTER_APPEARANCE);
       setAppearanceConfigured(false);
       setAppearanceLoading(isPending);
       setLandingView('deploy');
@@ -59,7 +168,9 @@ export default function LandingPage() {
         if (!res.ok) throw new Error('Could not load survivor profile');
         const data = await res.json() as { appearance?: unknown; configured?: boolean };
         if (cancelled) return;
-        setAppearance(sanitizeCharacterAppearance(data.appearance));
+        const loaded = sanitizeCharacterAppearance(data.appearance);
+        setAppearance(loaded);
+        setSavedAppearance(loaded);
         setAppearanceConfigured(Boolean(data.configured));
       })
       .catch(() => {
@@ -152,6 +263,12 @@ export default function LandingPage() {
     router.push('/play');
   };
 
+  const deployGuest = () => {
+    if (!serverUrl) return;
+    setDeploying(true);
+    router.push(`/play?guest=1&server=${encodeURIComponent(serverUrl)}`);
+  };
+
   const saveAppearance = async () => {
     setAppearanceSaving(true);
     setAppearanceError('');
@@ -163,7 +280,9 @@ export default function LandingPage() {
       });
       if (!res.ok) throw new Error('Could not save profile');
       const data = await res.json() as { appearance?: unknown };
-      setAppearance(sanitizeCharacterAppearance(data.appearance));
+      const saved = sanitizeCharacterAppearance(data.appearance);
+      setAppearance(saved);
+      setSavedAppearance(saved);
       setAppearanceConfigured(true);
       setLandingView('deploy');
     } catch {
@@ -171,13 +290,6 @@ export default function LandingPage() {
     } finally {
       setAppearanceSaving(false);
     }
-  };
-
-  const pingBadge = (id: number) => {
-    const ping = pings[id];
-    if (ping === undefined) return <span className="ping measuring">SCANNING</span>;
-    if (ping === 'timeout') return <span className="ping bad">OFFLINE</span>;
-    return <span className={`ping ${ping < 60 ? 'good' : ping < 130 ? 'ok' : 'bad'}`}>{ping} ms</span>;
   };
 
   const selectedServer = servers.find((server) => server.url === serverUrl);
@@ -191,7 +303,7 @@ export default function LandingPage() {
         saving={appearanceSaving}
         error={appearanceError}
         onChange={setAppearance}
-        onCancel={() => setLandingView('deploy')}
+        onCancel={() => { setAppearance(savedAppearance); setLandingView('deploy'); }}
         onSave={() => void saveAppearance()}
       />
     );
@@ -256,31 +368,25 @@ export default function LandingPage() {
             ) : session?.user ? (
               <>
                 <div className="home-operator">
-                  <div className="home-portrait"><div className="home-sprite survivor" /></div>
+                  <div className="home-portrait"><SurvivorPortrait appearance={appearance} label={`${session.user.name} survivor`} /></div>
                   <div><span>OPERATOR ONLINE</span><b>{session.user.name}</b><small>Clearance verified</small></div>
                 </div>
-                <div className="srv-head">
-                  <span>SELECT RELAY</span>
-                  <button className="srv-refresh" onClick={() => { setPings({}); void measurePings(servers); }}>RESCAN</button>
-                </div>
-                <div className="srv-list">
-                  {servers.map((server) => (
-                    <label className={`srv-row${serverUrl === server.url ? ' active' : ''}`} key={server.id}>
-                      <input type="radio" name="server" checked={serverUrl === server.url} onChange={() => pickServer(server.url)} />
-                      <span className="srv-name">{server.name}</span>
-                      <span className="srv-region">{server.region}</span>
-                      {pingBadge(server.id)}
-                    </label>
-                  ))}
-                  {servers.length === 0 && <div className="home-empty">NO RELAYS REGISTERED</div>}
-                </div>
+                <RelayPicker
+                  id="operator-relay"
+                  label="SELECT RELAY"
+                  servers={servers}
+                  selectedUrl={serverUrl}
+                  pings={pings}
+                  onPick={pickServer}
+                  onRescan={() => { setPings({}); void measurePings(servers); }}
+                />
                 <button className="btn-survivor" disabled={appearanceLoading} onClick={() => { setAppearanceError(''); setLandingView('character'); }}>
                   <span><i className={appearanceConfigured ? 'ready' : ''} />{appearanceConfigured ? 'SURVIVOR READY' : 'PROFILE REQUIRED'}</span>
                   <b>{appearanceLoading ? 'LOADING...' : appearanceConfigured ? 'EDIT APPEARANCE' : 'CREATE SURVIVOR'}</b>
                 </button>
                 {appearanceError && <div className="auth-error">{appearanceError}</div>}
                 <button className="btn-primary deploy-btn" disabled={deploying || appearanceLoading || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'} onClick={deploy}>
-                  <span>{deploying ? 'OPENING CHANNEL...' : appearanceConfigured ? 'DEPLOY TO ZONE' : 'CREATE SURVIVOR TO DEPLOY'}</span>
+                  <span>{deploying ? 'OPENING CHANNEL...' : appearanceConfigured ? 'ENTER HIDEOUT' : 'CREATE SURVIVOR TO CONTINUE'}</span>
                   <b>{selectedServer?.region ?? '--'}</b>
                 </button>
                 <div className="home-console-links">
@@ -310,6 +416,27 @@ export default function LandingPage() {
                 </form>
                 <div className="auth-divider"><span>OR USE EXTERNAL ID</span></div>
                 <a className="btn-steam" href="/api/auth/steam"><span className="steam-mark">S</span> CONTINUE WITH STEAM</a>
+                <div className="auth-divider guest-divider"><span>TRY WITHOUT AN ACCOUNT</span></div>
+                <div className="guest-relay-picker">
+                  <RelayPicker
+                    id="guest-relay"
+                    label="SELECT GUEST RELAY"
+                    servers={servers}
+                    selectedUrl={serverUrl}
+                    pings={pings}
+                    onPick={pickServer}
+                    onRescan={() => { setPings({}); void measurePings(servers); }}
+                  />
+                </div>
+                <button
+                  className="btn-guest"
+                  disabled={deploying || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'}
+                  onClick={deployGuest}
+                >
+                  <span>{deploying ? 'OPENING GUEST CHANNEL...' : 'DROP IN AS GUEST'}</span>
+                  <small>Temporary raid · no chat, community, extraction or saved progress</small>
+                  <b>{selectedServer?.region ?? 'SELECTING RELAY'}</b>
+                </button>
               </>
             )}
           </div>
@@ -321,7 +448,7 @@ export default function LandingPage() {
       <footer className="home-footer">
         <span>HOLDOUT FIELD NETWORK</span>
         <p>Punch trees. Forge steel. Wall in your camp. Trust carefully. Extract.</p>
-        <span>ALL ITEMS AT RISK</span>
+        <span>ALL CARRIED GEAR AT RISK</span>
       </footer>
     </div>
   );

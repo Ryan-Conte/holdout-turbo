@@ -6,7 +6,8 @@
 
 import { ReactNode, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ITEMS, ItemId, skillLevel } from '@holdout/shared';
+import { skillLevel } from '@holdout/shared';
+import { itemDef } from '@/lib/runtime-gameplay';
 
 export function Tip({ tip, children }: { tip: ReactNode; children: ReactNode }) {
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
@@ -39,8 +40,8 @@ export function Tip({ tip, children }: { tip: ReactNode; children: ReactNode }) 
 }
 
 /** Rich item card: name, description and the stats that matter. */
-export function itemTip(id: ItemId, qty = 1, dur?: number): ReactNode {
-  const def = ITEMS[id];
+export function itemTip(id: string, qty = 1, dur?: number): ReactNode {
+  const def = itemDef(id);
   const w = def.weapon;
   const m = def.melee;
   const maxDur = def.durability;

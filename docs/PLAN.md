@@ -9,6 +9,9 @@
 - [x] Character customization: separate pre-deploy creator with body, skin, hair, outfit and accent layers; profile persistence, live preview, network rendering and future cosmetic slots
 - [x] Cliffs (Tile.Cliff): impassable vertical terrain, blocks sight/bullets; editor + sprite
 - [x] Elevation layers: editor height brush, procedural hills/mesas, contour rendering, traversable grades and authoritative steep cliff faces
+- [x] Audit polish: death returns home, disconnect expiry drops gear, damage interrupts timed actions, wear survives transfers, unlocked jobs stay visible, and range/LOS culling covers loot/projectiles
+- [x] Fueled stations: firepits/furnaces store wood heat, persist at home, and consume one charge per cook/smelt
+- [x] Deployment terminal portrait uses the saved layered survivor appearance
 
 ## Milestone B — Game engine /admin  (in progress)
 Admin-only. Everything editable and DB-backed, hot-reloaded over shared defaults.
@@ -23,7 +26,8 @@ Admin-only. Everything editable and DB-backed, hot-reloaded over shared defaults
 - [x] `docs/ENGINE.md`
 - [ ] Runtime dynamic-item registry and client init payload for DB-only item IDs
 - [ ] Published pixel atlas composition for the live renderer
-- [ ] DB-backed block collision/placement rules and trader-specific quest ID lists
+- [x] DB-backed block collision and player-placement rules
+- [ ] Trader-specific quest ID lists (tiers remain the compatibility link)
 
 ### Sequencing notes
 - Content DB is the backbone; do it before the per-kind editors.

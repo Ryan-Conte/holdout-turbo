@@ -34,6 +34,7 @@ interface EngineItem {
   desc: string;
   spriteId?: string;
   durability?: number;
+  lightRadius?: number;
   weapon?: EngineWeaponStats;
   melee?: EngineMeleeStats;
   armor?: { piece: 'helmet' | 'vest'; reduction: number };
@@ -75,6 +76,7 @@ function withKind(item: EngineItem, kind: ItemKind): EngineItem {
     desc: item.desc,
     spriteId: item.spriteId,
     durability: item.durability,
+    lightRadius: item.lightRadius,
   });
   if (kind === 'weapon') next.weapon = { damage: 10, fireRateMs: 400, ammo: 'ammo_9mm', pellets: 1, spread: 0.05, bulletSpeed: 700, range: 500, magSize: 10, reloadMs: 1500 };
   if (kind === 'tool') next.melee = { damage: 10, cooldownMs: 600, range: 38, wood: 1, stone: 1 };
@@ -202,6 +204,7 @@ export function ItemEditor() {
               <label>WEIGHT (KG)<input type="number" min={0} step={0.01} value={item.kg} onChange={(event) => patch({ kg: numericValue(event.target.value, 0) })} /></label>
               <label>MAX STACK<input type="number" min={1} value={item.stack} onChange={(event) => patch({ stack: numericValue(event.target.value, 1) })} /></label>
               <label>MAX DURABILITY<input type="number" min={1} value={item.durability ?? ''} placeholder="Not wearable" onChange={(event) => patch({ durability: optionalNumber(event.target.value) })} /></label>
+              <label>LIGHT RADIUS<input type="number" min={0} max={2000} value={item.lightRadius ?? ''} placeholder="No light" onChange={(event) => patch({ lightRadius: optionalNumber(event.target.value) })} /></label>
               <label>SPRITE ASSET<select value={item.spriteId ?? `item:${selected}`} onChange={(event) => patch({ spriteId: event.target.value })}>
                 {!sprites.includes(item.spriteId ?? `item:${selected}`) && <option value={item.spriteId ?? `item:${selected}`}>{item.spriteId ?? `item:${selected}`} (unpublished)</option>}
                 {sprites.map((sprite) => <option key={sprite}>{sprite}</option>)}

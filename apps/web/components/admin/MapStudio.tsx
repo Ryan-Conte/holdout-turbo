@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AuthoredMap, MapObject, Tile, TILE, type BlockDocument, type EngineBlockDefinition, type ResourceNodeDef, type SpriteDocument, type TerrainDocument } from '@holdout/shared';
 import { CHAR_ROWS, ITEM_INDEX, loadSheets, type Sheets } from '@/game/sprites';
 import {
@@ -28,11 +28,23 @@ import {
   type ViewportSize as Size,
 } from './map-studio-model';
 
+const MAP_OVERVIEW_MAX_SIDE = 1024;
+const MAP_DETAIL_CELL_BUDGET = 50_000;
+const MAP_FALLBACK_CELL_BUDGET = 24_000;
+const MAP_FRAME_INTERVAL_MS = 1000 / 15;
+
+interface MapOverview {
+  canvas: HTMLCanvasElement;
+  mapWidth: number;
+  mapHeight: number;
+}
+
 export function MapStudio() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const minimapRef = useRef<HTMLCanvasElement>(null);
   const minimapBaseRef = useRef<HTMLCanvasElement | null>(null);
+  const overviewRef = useRef<MapOverview | null>(null);
   const pixelFramesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const mapRef = useRef<EditorMap | null>(null);
   const cameraRef = useRef<Camera>({ x: 1600, y: 1600, zoom: 0.5 });
@@ -45,6 +57,7 @@ export function MapStudio() {
   const historyRef = useRef<{ past: EditorMap[]; future: EditorMap[] }>({ past: [], future: [] });
   const fittedRef = useRef(false);
   const inspectorEditingRef = useRef(false);
+  const hoverRef = useRef<{ x: number; y: number } | null>(null);
 
   const [map, setMap] = useState<EditorMap | null>(null);
   const [name, setName] = useState('Custom Map');
@@ -73,6 +86,7 @@ export function MapStudio() {
   const [dirty, setDirty] = useState(false);
   const [status, setStatus] = useState('Loading map and content...');
   const [historyVersion, setHistoryVersion] = useState(0);
+  const [overviewVersion, setOverviewVersion] = useState(0);
   const [minimapVersion, setMinimapVersion] = useState(0);
 
   mapRef.current = map;
@@ -246,6 +260,12 @@ export function MapStudio() {
     ctx.drawImage(sheets.chars, frame * 16, row * 16, 16, 16, x - 16, y - 18, 32, 32);
   }, [sheets]);
 
+  const keepsOreTileSprite = useCallback((tile: number, resourceId: string | undefined) => {
+    if (!resourceId) return false;
+    if (tile !== Tile.CopperOre && tile !== Tile.IronOre) return false;
+    return resources[resourceId]?.tile === Tile.Rock;
+  }, [resources]);
+
   const drawObject = useCallback((ctx: CanvasRenderingContext2D, object: MapObject, index: number, time: number) => {
     const x = object.x * TILE + TILE / 2;
     const y = object.y * TILE + TILE / 2;
@@ -313,8 +333,9 @@ export function MapStudio() {
       const row = id === 'zombie' ? CHAR_ROWS.zombie : id === 'military' ? CHAR_ROWS.military
         : id === 'deer' ? CHAR_ROWS.deer : id === 'rabbit' ? CHAR_ROWS.rabbit
           : id === 'boar' ? CHAR_ROWS.boar : id === 'wolf' ? CHAR_ROWS.wolf
+            : id === 'fox' ? CHAR_ROWS.fox : id === 'bear' ? CHAR_ROWS.bear
             : mobs[id]?.spriteId?.startsWith('character:')
-              ? ({ zombie: 8, military: 9, trader: 10, deer: 11, rabbit: 12, boar: 13, wolf: 14 } as Record<string, number>)[mobs[id].spriteId!.slice(10)] ?? CHAR_ROWS.military
+              ? ({ zombie: 8, military: 9, trader: 10, deer: 11, rabbit: 12, boar: 13, wolf: 14, fox: 15, bear: 16 } as Record<string, number>)[mobs[id].spriteId!.slice(10)] ?? CHAR_ROWS.military
               : CHAR_ROWS.military;
       drawCharacter(ctx, x, y, row, frame);
       if (mobs[id]?.boss) {
@@ -338,7 +359,11 @@ export function MapStudio() {
     const canvas = canvasRef.current;
     if (!canvas || !map) return;
     let animation = 0;
+    let lastFrameAt = -MAP_FRAME_INTERVAL_MS;
     const render = (time: number) => {
+      animation = requestAnimationFrame(render);
+      if (time - lastFrameAt < MAP_FRAME_INTERVAL_MS) return;
+      lastFrameAt = time;
       const dpr = Math.min(2, window.devicePixelRatio || 1);
       const pixelWidth = Math.round(view.width * dpr);
       const pixelHeight = Math.round(view.height * dpr);
@@ -362,11 +387,14 @@ export function MapStudio() {
       const minY = clamp(Math.floor(top / TILE) - 2, 0, map.h - 1);
       const maxX = clamp(Math.ceil(right / TILE) + 2, 0, map.w - 1);
       const maxY = clamp(Math.ceil(bottom / TILE) + 2, 0, map.h - 1);
+      const visibleCellCount = (maxX - minX + 1) * (maxY - minY + 1);
+      const detailed = visibleCellCount <= MAP_DETAIL_CELL_BUDGET;
 
       ctx.save();
       ctx.translate(view.width / 2, view.height / 2);
       ctx.scale(currentCamera.zoom, currentCamera.zoom);
       ctx.translate(-currentCamera.x, -currentCamera.y);
+      if (detailed) {
       for (let ty = minY; ty <= maxY; ty++) for (let tx = minX; tx <= maxX; tx++) {
         const index = ty * map.w + tx;
         const terrain = terrainDefs[map.terrain?.[String(index)] ?? TERRAIN_ID_BY_TILE[map.tiles[index]] ?? 'grass'];
@@ -379,7 +407,7 @@ export function MapStudio() {
       for (let ty = minY; ty <= maxY; ty++) {
         for (let tx = minX; tx <= maxX; tx++) {
           const index = String(ty * map.w + tx);
-          if (!map.resources?.[index]) drawTerrainOverlay(ctx, map.tiles[ty * map.w + tx], tx, ty);
+          if (!map.resources?.[index] || keepsOreTileSprite(map.tiles[ty * map.w + tx], map.resources?.[index])) drawTerrainOverlay(ctx, map.tiles[ty * map.w + tx], tx, ty);
         }
       }
       for (let ty = minY; ty <= maxY; ty++) for (let tx = minX; tx <= maxX; tx++) {
@@ -390,7 +418,9 @@ export function MapStudio() {
         const definition = blockId ? blocks[blockId] : resources[contentId];
         const spriteId = blockId ? blocks[blockId]?.spriteId : resources[contentId]?.spriteId;
         const frame = spriteId ? pixelFramesRef.current.get(spriteId) : undefined;
+        const skipResourceFrame = !blockId && keepsOreTileSprite(map.tiles[Number(index)], contentId);
         if (frame) {
+          if (skipResourceFrame) continue;
           const scale = blockId ? blocks[blockId]?.scale ?? 1 : 1;
           const width = frame.width * 2 * scale; const height = frame.height * 2 * scale;
           if (blockId) {
@@ -426,6 +456,36 @@ export function MapStudio() {
         if (level > east) { ctx.fillStyle = 'rgba(35,30,24,.3)'; ctx.fillRect(x + TILE - 3, y, 3, TILE); }
         ctx.fillStyle = 'rgba(239,221,166,.16)'; ctx.fillRect(x, y, TILE, 2);
       }
+      } else {
+        const overview = overviewRef.current;
+        if (overview && overview.mapWidth === map.w && overview.mapHeight === map.h) {
+          const tileLeft = clamp(left / TILE, 0, map.w);
+          const tileTop = clamp(top / TILE, 0, map.h);
+          const tileRight = clamp(right / TILE, 0, map.w);
+          const tileBottom = clamp(bottom / TILE, 0, map.h);
+          if (tileRight > tileLeft && tileBottom > tileTop) {
+            ctx.drawImage(
+              overview.canvas,
+              tileLeft * overview.canvas.width / map.w,
+              tileTop * overview.canvas.height / map.h,
+              (tileRight - tileLeft) * overview.canvas.width / map.w,
+              (tileBottom - tileTop) * overview.canvas.height / map.h,
+              tileLeft * TILE,
+              tileTop * TILE,
+              (tileRight - tileLeft) * TILE,
+              (tileBottom - tileTop) * TILE,
+            );
+          }
+        } else {
+          const stride = Math.max(1, Math.ceil(Math.sqrt(visibleCellCount / MAP_FALLBACK_CELL_BUDGET)));
+          for (let ty = minY; ty <= maxY; ty += stride) for (let tx = minX; tx <= maxX; tx += stride) {
+            const index = ty * map.w + tx;
+            const terrain = terrainDefs[map.terrain?.[String(index)] ?? TERRAIN_ID_BY_TILE[map.tiles[index]] ?? 'grass'];
+            ctx.fillStyle = terrain?.minimapColor ?? TILE_COLORS[map.tiles[index]] ?? TILE_COLORS[Tile.Grass];
+            ctx.fillRect(tx * TILE, ty * TILE, Math.min(stride, map.w - tx) * TILE, Math.min(stride, map.h - ty) * TILE);
+          }
+        }
+      }
 
       if (showGrid && currentCamera.zoom >= 0.35) {
         ctx.strokeStyle = currentCamera.zoom >= 1 ? 'rgba(8,10,8,.22)' : 'rgba(8,10,8,.12)';
@@ -441,7 +501,30 @@ export function MapStudio() {
         const wy = object.y * TILE + TILE / 2;
         const radius = (object.r ?? 0) * TILE;
         if (wx + radius < left || wx - radius > right || wy + radius < top || wy - radius > bottom) return;
-        drawObject(ctx, object, index, time);
+        if (detailed) {
+          drawObject(ctx, object, index, time);
+          return;
+        }
+        const zone = object.type.startsWith('poi_') || object.type === 'trader';
+        const safe = object.safe ?? (object.type === 'trader' || object.type === 'poi_outpost');
+        const hot = object.hot ?? (object.type === 'poi_airport' || object.type === 'poi_hotzone');
+        if (zone && showZones) {
+          ctx.strokeStyle = safe ? 'rgba(102,221,133,.72)' : hot ? 'rgba(244,99,60,.74)' : 'rgba(216,162,74,.58)';
+          ctx.lineWidth = 1 / currentCamera.zoom;
+          ctx.beginPath();
+          ctx.arc(wx, wy, (object.r ?? (object.type === 'trader' ? 8 : 14)) * TILE, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        const markerSize = 3 / currentCamera.zoom;
+        ctx.fillStyle = object.type === 'spawn' ? '#ffe27a' : object.type === 'extract' ? '#62e593'
+          : safe ? '#78d487' : hot || object.type.startsWith('poi_') ? '#e26c4d' : '#e9dfc3';
+        ctx.fillRect(wx - markerSize / 2, wy - markerSize / 2, markerSize, markerSize);
+        if (showLabels && object.type.startsWith('poi_')) {
+          ctx.font = `bold ${10 / currentCamera.zoom}px Consolas, monospace`;
+          ctx.textAlign = 'center';
+          ctx.fillStyle = '#f0dfb5';
+          ctx.fillText(object.name ?? objectLabel(object, mobs), wx, wy - markerSize);
+        }
       });
 
       if (selectedObject !== null && map.objects[selectedObject]) {
@@ -452,28 +535,88 @@ export function MapStudio() {
         ctx.strokeRect(selected.x * TILE + 2, selected.y * TILE + 2, TILE - 4, TILE - 4);
         ctx.setLineDash([]);
       }
-      if (hover && hover.x >= 0 && hover.y >= 0 && hover.x < map.w && hover.y < map.h) {
+      const currentHover = hoverRef.current;
+      if (currentHover && currentHover.x >= 0 && currentHover.y >= 0 && currentHover.x < map.w && currentHover.y < map.h) {
         const radius = tool.mode === 'terrainDef' || tool.mode === 'elevation' ? brush - 1 : 0;
         ctx.fillStyle = tool.mode === 'erase' ? 'rgba(220,80,62,.22)' : 'rgba(240,216,120,.16)';
         ctx.strokeStyle = tool.mode === 'erase' ? '#e36d58' : '#f0d878';
         ctx.lineWidth = 1.5 / currentCamera.zoom;
-        ctx.fillRect((hover.x - radius) * TILE, (hover.y - radius) * TILE, (radius * 2 + 1) * TILE, (radius * 2 + 1) * TILE);
-        ctx.strokeRect((hover.x - radius) * TILE, (hover.y - radius) * TILE, (radius * 2 + 1) * TILE, (radius * 2 + 1) * TILE);
+        ctx.fillRect((currentHover.x - radius) * TILE, (currentHover.y - radius) * TILE, (radius * 2 + 1) * TILE, (radius * 2 + 1) * TILE);
+        ctx.strokeRect((currentHover.x - radius) * TILE, (currentHover.y - radius) * TILE, (radius * 2 + 1) * TILE, (radius * 2 + 1) * TILE);
       }
       ctx.strokeStyle = '#c9a24e';
       ctx.lineWidth = 2 / currentCamera.zoom;
       ctx.strokeRect(0, 0, map.w * TILE, map.h * TILE);
       ctx.restore();
 
-      animation = requestAnimationFrame(render);
     };
     animation = requestAnimationFrame(render);
     return () => cancelAnimationFrame(animation);
-  }, [blocks, brush, drawObject, drawTerrainOverlay, hover, map, resources, selectedObject, showGrid, terrainDefs, tool.mode, view.height, view.width]);
+  }, [blocks, brush, drawObject, drawTerrainOverlay, map, mobs, resources, selectedObject, showGrid, showLabels, showZones, terrainDefs, tool.mode, view.height, view.width]);
 
   useEffect(() => {
     if (!map) return;
-    const timer = window.setTimeout(() => {
+    let cancelled = false;
+    let timer = window.setTimeout(() => {
+      const scale = Math.min(1, MAP_OVERVIEW_MAX_SIDE / Math.max(map.w, map.h));
+      const width = Math.max(1, Math.round(map.w * scale));
+      const height = Math.max(1, Math.round(map.h * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      const image = ctx.createImageData(width, height);
+      const terrainKinds = map.terrain ?? {};
+      let row = 0;
+      const buildChunk = () => {
+        if (cancelled) return;
+        const endRow = Math.min(height, row + 32);
+        for (let py = row; py < endRow; py++) {
+          const y = Math.min(map.h - 1, Math.floor((py + 0.5) * map.h / height));
+          for (let px = 0; px < width; px++) {
+            const x = Math.min(map.w - 1, Math.floor((px + 0.5) * map.w / width));
+            const index = y * map.w + x;
+            const terrain = terrainDefs[terrainKinds[String(index)] ?? TERRAIN_ID_BY_TILE[map.tiles[index]] ?? 'grass'];
+            const color = terrain?.minimapColor ?? TILE_COLORS[map.tiles[index]] ?? TILE_COLORS[Tile.Grass];
+            const numeric = /^#[0-9a-f]{6}$/i.test(color) ? Number.parseInt(color.slice(1), 16) : 0x527741;
+            const elevationBoost = (map.elevations[index] ?? 0) * 13;
+            const pixel = (py * width + px) * 4;
+            image.data[pixel] = Math.min(255, (numeric >> 16) + elevationBoost);
+            image.data[pixel + 1] = Math.min(255, ((numeric >> 8) & 0xff) + elevationBoost);
+            image.data[pixel + 2] = Math.min(255, (numeric & 0xff) + elevationBoost);
+            image.data[pixel + 3] = 255;
+          }
+        }
+        row = endRow;
+        if (row < height) {
+          timer = window.setTimeout(buildChunk, 0);
+          return;
+        }
+        ctx.putImageData(image, 0, 0);
+        const overlayScaleX = width / map.w;
+        const overlayScaleY = height / map.h;
+        ctx.fillStyle = '#d9b85e';
+        for (const rawIndex of Object.keys(map.resources ?? {})) {
+          const index = Number(rawIndex);
+          ctx.fillRect((index % map.w) * overlayScaleX, Math.floor(index / map.w) * overlayScaleY, 1, 1);
+        }
+        ctx.fillStyle = '#69b7c9';
+        for (const rawIndex of Object.keys(map.blocks ?? {})) {
+          const index = Number(rawIndex);
+          ctx.fillRect((index % map.w) * overlayScaleX, Math.floor(index / map.w) * overlayScaleY, 1, 1);
+        }
+        overviewRef.current = { canvas, mapWidth: map.w, mapHeight: map.h };
+        setOverviewVersion((version) => version + 1);
+      };
+      buildChunk();
+    }, 120);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [map, terrainDefs]);
+
+  useEffect(() => {
+    const overview = overviewRef.current;
+    if (!map || !overview || overview.mapWidth !== map.w || overview.mapHeight !== map.h) return;
     const width = 210;
     const height = 150;
     const base = document.createElement('canvas');
@@ -481,25 +624,13 @@ export function MapStudio() {
     base.height = height;
     const ctx = base.getContext('2d');
     if (!ctx) return;
-    ctx.fillStyle = '#0a0b09'; ctx.fillRect(0, 0, width, height);
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = '#0a0b09';
+    ctx.fillRect(0, 0, width, height);
     const scale = Math.min(width / map.w, height / map.h);
     const ox = (width - map.w * scale) / 2;
     const oy = (height - map.h * scale) / 2;
-    const mapWidth = Math.max(1, Math.ceil(map.w * scale));
-    const mapHeight = Math.max(1, Math.ceil(map.h * scale));
-    for (let py = 0; py < mapHeight; py++) {
-      for (let px = 0; px < mapWidth; px++) {
-        const x = Math.min(map.w - 1, Math.floor((px + .5) * map.w / mapWidth));
-        const y = Math.min(map.h - 1, Math.floor((py + .5) * map.h / mapHeight));
-        const index = y * map.w + x;
-        ctx.fillStyle = TILE_COLORS[map.tiles[index]] ?? TILE_COLORS[Tile.Grass];
-        const authoredTerrain = terrainDefs[map.terrain?.[String(index)] ?? TERRAIN_ID_BY_TILE[map.tiles[index]] ?? 'grass'];
-        if (authoredTerrain) ctx.fillStyle = authoredTerrain.minimapColor;
-        ctx.fillRect(Math.floor(ox) + px, Math.floor(oy) + py, 1, 1);
-        const level = map.elevations[index] ?? 0;
-        if (level) { ctx.fillStyle = `rgba(247,222,162,${level * .13})`; ctx.fillRect(Math.floor(ox) + px, Math.floor(oy) + py, 1, 1); }
-      }
-    }
+    ctx.drawImage(overview.canvas, ox, oy, map.w * scale, map.h * scale);
     for (const object of map.objects) {
       ctx.fillStyle = object.type === 'spawn' ? '#ffe27a' : object.type === 'extract' ? '#62e593'
         : object.type.startsWith('poi_') ? '#e26c4d' : '#e9dfc3';
@@ -507,9 +638,7 @@ export function MapStudio() {
     }
     minimapBaseRef.current = base;
     setMinimapVersion((version) => version + 1);
-    }, 80);
-    return () => window.clearTimeout(timer);
-  }, [map, terrainDefs]);
+  }, [map?.h, map?.objects, map?.w, overviewVersion]);
 
   useEffect(() => {
     const canvas = minimapRef.current;
@@ -603,7 +732,9 @@ export function MapStudio() {
             const x = point.x + dx; const y = point.y + dy;
             if (x >= 0 && y >= 0 && x < source.w && y < source.h) {
               const index = y * source.w + x;
-              tiles[index] = tool.tile;
+              const currentTile = tiles[index];
+              const rockFamily = currentTile === Tile.Rock || currentTile === Tile.CopperOre || currentTile === Tile.IronOre;
+              tiles[index] = tool.tile === Tile.Tree ? Tile.Tree : rockFamily ? currentTile : Tile.Rock;
               resourceKinds[String(index)] = tool.id;
               delete blockKinds[String(index)];
               delete blockRotations[String(index)];
@@ -683,6 +814,7 @@ export function MapStudio() {
 
   const onPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const point = screenToTile(event.clientX, event.clientY);
+    hoverRef.current = { x: point.x, y: point.y };
     setHover({ x: point.x, y: point.y });
     const interaction = interactionRef.current;
     if (!interaction || interaction.pointerId !== event.pointerId) return;
@@ -745,13 +877,24 @@ export function MapStudio() {
     return data.id;
   };
 
-  const validationErrors = map ? [
+  const validationErrors = useMemo(() => map ? [
     ...map.objects.filter((object) => object.type === 'mob' && !mobs[object.contentId ?? '']).map((object) => `Unknown mob: ${object.contentId}`),
     ...map.objects.filter((object) => object.type === 'chest_custom' && !loot[object.lootTable ?? '']).map((object) => `Unknown loot table: ${object.lootTable}`),
     ...Object.values(map.resources ?? {}).filter((id) => !resources[id]).map((id) => `Unknown resource: ${id}`),
     ...Object.values(map.terrain ?? {}).filter((id) => !terrainDefs[id]).map((id) => `Unknown terrain: ${id}`),
     ...Object.values(map.blocks ?? {}).filter((id) => !blocks[id]).map((id) => `Unknown block: ${id}`),
-  ] : [];
+  ] : [], [blocks, loot, map, mobs, resources, terrainDefs]);
+
+  const worldStats = useMemo(() => {
+    const stats = { spawns: 0, extracts: 0, mobs: 0, chests: 0 };
+    for (const object of map?.objects ?? []) {
+      if (object.type === 'spawn') stats.spawns++;
+      if (object.type === 'extract') stats.extracts++;
+      if (['zombie', 'military', 'deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear', 'mob'].includes(object.type)) stats.mobs++;
+      if (object.type.startsWith('chest')) stats.chests++;
+    }
+    return stats;
+  }, [map?.objects]);
 
   const publish = async () => {
     if (validationErrors.length) { setStatus(`Publish blocked: ${validationErrors[0]}`); return; }
@@ -874,7 +1017,7 @@ export function MapStudio() {
           {palette === 'terrain' ? (
             <div className="map-resource-palette"><div className="map-section-title">DB TERRAIN LIBRARY</div><p>Every cell is a published terrain ID. Pixel art, traversal, swimming, collision, sight, bullets, footsteps and minimap color come from its database definition.</p><div className="map-tool-list">{Object.entries(terrainDefs).map(([id, terrain]) => <button key={id} className={tool.mode === 'terrainDef' && tool.id === id ? 'active' : ''} onClick={() => setTool({ mode: 'terrainDef', id })}><i style={{ background: terrain.minimapColor }} />{terrain.name}<small>{terrain.spriteId} / {terrain.moveMultiplier}x speed</small></button>)}</div><label className="map-range">BRUSH <b>{brush}x{brush}</b><input type="range" min={1} max={5} value={brush} onChange={(event) => setBrush(Number(event.target.value))} /></label></div>
           ) : palette === 'resources' ? (
-            <div className="map-resource-palette"><div className="map-section-title">RESOURCE VARIANTS</div><p>Paint a published node definition. Health, drops, art, respawn and sounds come from the engine.</p><div className="map-tool-list">{Object.entries(resources).map(([id, resource]) => <button key={id} className={tool.mode === 'resource' && tool.id === id ? 'active' : ''} onClick={() => setTool({ mode: 'resource', id, tile: resource.tile as Tile })}><i style={{ background: resource.skill === 'woodcutting' ? '#42653b' : '#777a75' }} />{resource.name}<small>{resource.maxHits} HP / {resource.drops.length} drops</small></button>)}</div><label className="map-range">BRUSH <b>{brush}x{brush}</b><input type="range" min={1} max={5} value={brush} onChange={(event) => setBrush(Number(event.target.value))} /></label></div>
+            <div className="map-resource-palette"><div className="map-section-title">RESOURCE VARIANTS</div><p>Paint a published tree or rock variant. Copper and iron are still rock-family tiles, so they keep their ore look and respawn rules.</p><div className="map-tool-list">{Object.entries(resources).map(([id, resource]) => <button key={id} className={tool.mode === 'resource' && tool.id === id ? 'active' : ''} onClick={() => setTool({ mode: 'resource', id, tile: resource.tile as Tile })}><i style={{ background: resource.skill === 'woodcutting' ? '#42653b' : '#777a75' }} />{resource.name}<small>{resource.maxHits} HP / {resource.drops.length} drops</small></button>)}</div><label className="map-range">BRUSH <b>{brush}x{brush}</b><input type="range" min={1} max={5} value={brush} onChange={(event) => setBrush(Number(event.target.value))} /></label></div>
           ) : palette === 'blocks' ? (
             <div className="map-resource-palette"><div className="map-section-title">ENGINE BLOCKS</div><p>Player-buildable kits and authored world blocks share this catalog. Pixel art, collision, bullets, sight, health, drops and sounds come from each block definition.</p>{tool.mode === 'block' ? <button className="map-library-add" onClick={() => setTool({ ...tool, rotation: (tool.rotation + 1) % 4 })}>ROTATE 90° · R · {tool.rotation * 90}°</button> : null}<div className="map-tool-list">{Object.entries(blocks).sort(([, a], [, b]) => Number(Boolean(b.playerPlacement)) - Number(Boolean(a.playerPlacement)) || a.name.localeCompare(b.name)).map(([id, block]) => <button key={id} className={tool.mode === 'block' && tool.id === id ? 'active' : ''} onClick={() => setTool({ mode: 'block', id, rotation: 0 })}><i style={{ background: block.playerPlacement ? '#b28c42' : block.collision.move ? '#8f6c38' : '#66775d' }} />{block.name}<small>{block.playerPlacement ? 'PLAYER BUILDABLE / ' : ''}{block.spriteId} / {block.destructible ? `${block.maxHp} HP` : 'INDESTRUCTIBLE'}</small></button>)}</div><label className="map-range">BRUSH <b>{brush}x{brush}</b><input type="range" min={1} max={5} value={brush} onChange={(event) => setBrush(Number(event.target.value))} /></label></div>
           ) : palette === 'elevation' ? (
@@ -899,7 +1042,7 @@ export function MapStudio() {
             onPointerMove={onPointerMove}
             onPointerUp={endPointer}
             onPointerCancel={endPointer}
-            onPointerLeave={() => setHover(null)}
+            onPointerLeave={() => { hoverRef.current = null; setHover(null); }}
             onContextMenu={(event) => event.preventDefault()}
             onWheel={(event) => {
               event.preventDefault();
@@ -964,10 +1107,10 @@ export function MapStudio() {
               <div className="map-size-inputs"><input type="number" min={MIN_SIZE} max={MAX_SIZE} value={pendingW} onChange={(event) => setPendingW(Number(event.target.value))} /><span>x</span><input type="number" min={MIN_SIZE} max={MAX_SIZE} value={pendingH} onChange={(event) => setPendingH(Number(event.target.value))} /></div>
               <button onClick={applySize}>RESIZE WORLD</button>
               <div className="map-world-stats">
-                <div><span>SPAWNS</span><b>{map.objects.filter((object) => object.type === 'spawn').length}</b></div>
-                <div><span>EXTRACTS</span><b>{map.objects.filter((object) => object.type === 'extract').length}</b></div>
-                <div><span>MOBS</span><b>{map.objects.filter((object) => ['zombie', 'military', 'deer', 'rabbit', 'boar', 'wolf', 'mob'].includes(object.type)).length}</b></div>
-                <div><span>CHESTS</span><b>{map.objects.filter((object) => object.type.startsWith('chest')).length}</b></div>
+                <div><span>SPAWNS</span><b>{worldStats.spawns}</b></div>
+                <div><span>EXTRACTS</span><b>{worldStats.extracts}</b></div>
+                <div><span>MOBS</span><b>{worldStats.mobs}</b></div>
+                <div><span>CHESTS</span><b>{worldStats.chests}</b></div>
               </div>
               <div className="map-revision-card"><span>LIVE REVISION</span><b>#{publishedId ?? 'NONE'}</b><small>Published worlds reload when empty.</small></div>
               <div className={`map-validation${validationErrors.length ? ' has-errors' : ''}`}><b>{validationErrors.length ? 'PUBLISH BLOCKERS' : 'VALIDATION READY'}</b>{validationErrors.length ? validationErrors.slice(0, 5).map((error, index) => <span key={`${index}:${error}`}>{error}</span>) : <span>All custom content references resolve.</span>}</div>

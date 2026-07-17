@@ -5,3 +5,4 @@ dist/
 .env
 .env.local
 *.tsbuildinfo
+.codex-dev*.log

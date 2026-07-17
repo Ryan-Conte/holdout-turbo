@@ -98,6 +98,31 @@ export const ORE_YIELD: Partial<Record<Tile, ItemId>> = {
 export const COPPER_CHANCE = 0.14;
 export const IRON_CHANCE = 0.08;
 
+/** Built-in resource behavior used when no engine document has been published yet. */
+export const DEFAULT_RESOURCE_NODES: Record<string, import('./engine').ResourceNodeDef> = {
+  tree: {
+    id: 'tree', name: 'Common tree', tile: Tile.Tree, depletedTile: Tile.Stump,
+    maxHits: 6, respawnMs: NODE_RESPAWN_MS, skill: 'woodcutting', respawnFamily: 'tree', respawnWeight: 94,
+    spriteId: 'resource:tree', hitSound: 'chop', breakSound: 'tree_fall',
+    drops: [{ itemId: 'wood', min: 2, max: 3, chance: 1, when: 'hit' }],
+  },
+  ironwood: {
+    id: 'ironwood', name: 'Ironwood tree', tile: Tile.Tree, depletedTile: Tile.Stump,
+    maxHits: 14, respawnMs: 480_000, skill: 'woodcutting', respawnFamily: 'tree', respawnWeight: 6,
+    spriteId: 'resource:ironwood', hitSound: 'wood_heavy', breakSound: 'tree_crack',
+    drops: [
+      { itemId: 'wood', min: 3, max: 5, chance: 1, when: 'hit' },
+      { itemId: 'iron_ore', min: 1, max: 2, chance: 0.35, when: 'depleted' },
+    ],
+  },
+  rock: {
+    id: 'rock', name: 'Stone outcrop', tile: Tile.Rock, depletedTile: Tile.Rubble,
+    maxHits: 8, respawnMs: NODE_RESPAWN_MS, skill: 'mining', respawnFamily: 'rock', respawnWeight: 1,
+    spriteId: 'resource:rock', hitSound: 'mine', breakSound: 'rock_break',
+    drops: [{ itemId: 'stone', min: 2, max: 3, chance: 1, when: 'hit' }],
+  },
+};
+
 // ─── Items ──────────────────────────────────────────────────────────────────
 // The item registry lives in ./items (category builders, easy to extend).
 export * from './items';
@@ -108,6 +133,7 @@ export const BACKPACKS: BackpackTier[] = [
   { name: 'Field Satchel', slots: 12, maxKg: 20 },
   { name: 'Scout Backpack', slots: 16, maxKg: 32 },
   { name: 'Raider Backpack', slots: 20, maxKg: 45 },
+  { name: 'Expedition Backpack MK4', slots: 32, maxKg: 80 },
 ];
 
 // ─── Crafting ───────────────────────────────────────────────────────────────
@@ -122,6 +148,19 @@ export interface Recipe {
   station?: StationKind; // craftable only near that placed structure (hidden elsewhere)
 }
 
+/** Runtime recipes can reference sanitized DB-authored item IDs. */
+export interface RuntimeRecipe extends Omit<Recipe, 'out' | 'cost'> {
+  out: { id: string; qty: number };
+  cost: { id: string; qty: number }[];
+}
+
+/** Versioned gameplay catalog used by both simulation and presentation. */
+export interface RuntimeGameplayContent {
+  version: string;
+  items: import('./items').RuntimeItemRegistry;
+  recipes: RuntimeRecipe[];
+}
+
 // Station philosophy:
 //  · hand (no station): primitive survival + basic base pieces — always visible
 //  · workbench: proper tools, gear, advanced build kits
@@ -133,6 +172,7 @@ export const RECIPES: Recipe[] = [
   { id: 'craft_bow', cat: 'survival', out: { id: 'bow', qty: 1 }, cost: [{ id: 'wood', qty: 6 }, { id: 'cloth', qty: 3 }] },
   { id: 'craft_arrows', cat: 'survival', out: { id: 'arrow', qty: 6 }, cost: [{ id: 'wood', qty: 3 }, { id: 'stone', qty: 1 }] },
   { id: 'craft_bandage', cat: 'medical', out: { id: 'bandage', qty: 1 }, cost: [{ id: 'cloth', qty: 2 }] },
+  { id: 'craft_hand_torch', cat: 'survival', out: { id: 'torch', qty: 1 }, cost: [{ id: 'wood', qty: 1 }, { id: 'cloth', qty: 1 }] },
   { id: 'craft_firepit', cat: 'build', out: { id: 'kit_firepit', qty: 1 }, cost: [{ id: 'wood', qty: 6 }, { id: 'stone', qty: 4 }] },
   { id: 'craft_workbench', cat: 'build', out: { id: 'kit_workbench', qty: 1 }, cost: [{ id: 'wood', qty: 8 }, { id: 'scrap', qty: 4 }] },
   { id: 'craft_floor_wood', cat: 'build', out: { id: 'kit_floor_wood', qty: 4 }, cost: [{ id: 'wood', qty: 4 }] },
@@ -150,14 +190,15 @@ export const RECIPES: Recipe[] = [
   { id: 'craft_vest_light', cat: 'gear', out: { id: 'vest_light', qty: 1 }, cost: [{ id: 'cloth', qty: 8 }, { id: 'scrap', qty: 4 }], station: 'workbench' },
   { id: 'craft_backpack_mk2', cat: 'gear', out: { id: 'backpack_mk2', qty: 1 }, cost: [{ id: 'cloth', qty: 6 }, { id: 'scrap', qty: 4 }], station: 'workbench' },
   { id: 'craft_backpack_mk3', cat: 'gear', out: { id: 'backpack_mk3', qty: 1 }, cost: [{ id: 'cloth', qty: 10 }, { id: 'scrap', qty: 8 }, { id: 'wood', qty: 4 }], station: 'workbench' },
+  { id: 'craft_backpack_mk4', cat: 'gear', out: { id: 'backpack_mk4', qty: 1 }, cost: [{ id: 'cloth', qty: 24 }, { id: 'scrap', qty: 20 }, { id: 'iron_bar', qty: 10 }, { id: 'animal_hide', qty: 8 }], station: 'workbench' },
   { id: 'craft_furnace', cat: 'build', out: { id: 'kit_furnace', qty: 1 }, cost: [{ id: 'stone', qty: 12 }, { id: 'scrap', qty: 6 }], station: 'workbench' },
   { id: 'craft_anvil', cat: 'build', out: { id: 'kit_anvil', qty: 1 }, cost: [{ id: 'iron_bar', qty: 4 }, { id: 'stone', qty: 8 }], station: 'workbench' },
   { id: 'craft_chest', cat: 'build', out: { id: 'kit_chest', qty: 1 }, cost: [{ id: 'wood', qty: 10 }, { id: 'stone', qty: 4 }], station: 'workbench' },
   { id: 'craft_wall', cat: 'build', out: { id: 'kit_wall', qty: 2 }, cost: [{ id: 'wood', qty: 6 }, { id: 'stone', qty: 2 }], station: 'workbench' },
   { id: 'craft_door', cat: 'build', out: { id: 'kit_door', qty: 1 }, cost: [{ id: 'wood', qty: 5 }, { id: 'scrap', qty: 2 }], station: 'workbench' },
   // ── furnace: smelting only
-  { id: 'smelt_copper', cat: 'smelt', out: { id: 'copper_bar', qty: 1 }, cost: [{ id: 'copper_ore', qty: 2 }, { id: 'wood', qty: 1 }], station: 'furnace' },
-  { id: 'smelt_iron', cat: 'smelt', out: { id: 'iron_bar', qty: 1 }, cost: [{ id: 'iron_ore', qty: 2 }, { id: 'wood', qty: 2 }], station: 'furnace' },
+  { id: 'smelt_copper', cat: 'smelt', out: { id: 'copper_bar', qty: 1 }, cost: [{ id: 'copper_ore', qty: 2 }], station: 'furnace' },
+  { id: 'smelt_iron', cat: 'smelt', out: { id: 'iron_bar', qty: 1 }, cost: [{ id: 'iron_ore', qty: 2 }], station: 'furnace' },
   // ── anvil: weapons, ammo, attachments
   { id: 'craft_steel_axe', cat: 'forge', out: { id: 'steel_axe', qty: 1 }, cost: [{ id: 'iron_bar', qty: 2 }, { id: 'wood', qty: 2 }], station: 'anvil' },
   { id: 'craft_steel_pickaxe', cat: 'forge', out: { id: 'steel_pickaxe', qty: 1 }, cost: [{ id: 'iron_bar', qty: 2 }, { id: 'wood', qty: 2 }], station: 'anvil' },
@@ -284,6 +325,8 @@ export const TRADER_STOCK: TradeEntry[] = [
   { id: 'scrap', buy: 8, sell: 3 },
   { id: 'wood', buy: 3, sell: 1 },
   { id: 'stone', buy: 3, sell: 1 },
+  { id: 'animal_hide', buy: 10, sell: 4 },
+  { id: 'torch', buy: 12, sell: 3 },
   // base-building kits — credits are a shortcut past the grind
   { id: 'kit_floor_wood', buy: 5, sell: 1 },
   { id: 'kit_floor_stone', buy: 5, sell: 1 },
@@ -311,10 +354,13 @@ export const TRADER_STOCK_T2: TradeEntry[] = [
   { id: 'prototype_rifle', buy: 0, sell: 1400 },
   { id: 'helmet_military', buy: 340, sell: 130 },
   { id: 'vest_military', buy: 520, sell: 210 },
+  { id: 'backpack_mk4', buy: 2500, sell: 350 },
   { id: 'attach_reddot', buy: 160, sell: 55 },
   { id: 'attach_suppressor', buy: 220, sell: 75 },
   { id: 'copper_bar', buy: 14, sell: 5 },
   { id: 'iron_bar', buy: 20, sell: 8 },
+  { id: 'animal_hide', buy: 12, sell: 5 },
+  { id: 'antler', buy: 0, sell: 38 },
   // the whole point: rare finds sell for a fortune here
   { id: 'gold_bar', buy: 0, sell: 420 },
   { id: 'diamond', buy: 0, sell: 900 },
@@ -333,8 +379,8 @@ export const TRADER_TIER_STOCK: Record<TraderTier, TradeEntry[]> = {
 export type InvSlot = { id: ItemId; qty: number; dur?: number } | null;
 
 /** Current durability of a slot (falls back to the item's max when unset/legacy). */
-export function slotDur(s: NonNullable<InvSlot>): number {
-  const max = ITEMS[s.id].durability;
+export function slotDur(s: NonNullable<InvSlot>, items: import('./items').RuntimeItemRegistry = ITEMS): number {
+  const max = items[s.id]?.durability;
   if (max === undefined) return Infinity;
   return s.dur ?? max;
 }
@@ -350,9 +396,9 @@ export interface Equipment {
   mod: ItemId | null; // weapon mod (red dot / suppressor)
 }
 
-export function invWeight(inv: Inventory): number {
+export function invWeight(inv: Inventory, items: import('./items').RuntimeItemRegistry = ITEMS): number {
   let kg = 0;
-  for (const s of inv.slots) if (s) kg += ITEMS[s.id].kg * s.qty;
+  for (const s of inv.slots) if (s) kg += (items[s.id]?.kg ?? 0) * s.qty;
   return Math.round(kg * 100) / 100;
 }
 
@@ -360,16 +406,16 @@ export function invCapacity(inv: Inventory): BackpackTier {
   return BACKPACKS[Math.min(inv.backpack, BACKPACKS.length - 1)];
 }
 
-export function armorMultiplier(eq: Equipment): number {
+export function armorMultiplier(eq: Equipment, items: import('./items').RuntimeItemRegistry = ITEMS): number {
   let m = 1;
-  if (eq.helmet && ITEMS[eq.helmet].armor) m *= 1 - ITEMS[eq.helmet].armor!.reduction;
-  if (eq.vest && ITEMS[eq.vest].armor) m *= 1 - ITEMS[eq.vest].armor!.reduction;
+  if (eq.helmet && items[eq.helmet]?.armor) m *= 1 - items[eq.helmet].armor!.reduction;
+  if (eq.vest && items[eq.vest]?.armor) m *= 1 - items[eq.vest].armor!.reduction;
   return m;
 }
 
 // ─── Enemies ────────────────────────────────────────────────────────────────
 
-export type KnownEnemyKind = 'zombie' | 'military' | 'deer' | 'rabbit' | 'boar' | 'wolf';
+export type KnownEnemyKind = 'zombie' | 'military' | 'deer' | 'rabbit' | 'boar' | 'wolf' | 'fox' | 'bear';
 export type EnemyKind = KnownEnemyKind | (string & {});
 
 /** flee = runs from players (huntable) · melee = chases and bites · ranged = keeps distance and shoots */
@@ -394,6 +440,9 @@ export const ENEMY_DEFS: Record<KnownEnemyKind, EnemyDef> = {
   // boars are neutral: tiny aggro radius, but fight back hard when damaged
   boar: { behavior: 'melee', maxHp: 70, speed: 150, aggroRange: 60, attackRange: 30, damage: 14, attackMs: 800, name: 'boar' },
   wolf: { behavior: 'melee', maxHp: 45, speed: 175, aggroRange: 300, attackRange: 28, damage: 12, attackMs: 700, name: 'wolf' },
+  fox: { behavior: 'flee', maxHp: 20, speed: 190, aggroRange: 230, attackRange: 0, damage: 0, attackMs: 0, name: 'red fox' },
+  // bears ignore distant survivors, but become a serious close-range threat.
+  bear: { behavior: 'melee', maxHp: 180, speed: 135, aggroRange: 75, attackRange: 34, damage: 24, attackMs: 1050, name: 'black bear' },
 };
 
 export interface EnemySnap {
@@ -423,7 +472,7 @@ export interface PoiSnap {
   hot?: boolean; // high-loot area: rare chests, harder quests, black-market trader
 }
 
-export type InstanceKind = 'world' | 'hideout';
+export type InstanceKind = 'world' | 'hideout' | 'clan_hideout';
 
 export interface CharacterAppearance {
   body: number;
@@ -504,6 +553,19 @@ export interface PlayerSnap {
   hitAt?: number;
   look?: number; // chosen character sprite row
   appearance?: CharacterAppearance;
+  /** Verified server-side role marker. Never accepted from client payloads. */
+  admin?: boolean;
+  /** Ephemeral trial survivor; never accepted from client state. */
+  guest?: boolean;
+}
+
+/** Server-authorized ally positions may bypass LOS for tactical map rendering only. */
+export interface MapPlayerSnap {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  relation: 'friend' | 'clan' | 'admin';
 }
 
 export interface ProjectileSnap { id: number; x: number; y: number; angle: number }
@@ -516,7 +578,7 @@ export interface ContainerSnap {
   looted: boolean;
 }
 
-export interface GroundItemSnap { id: string; x: number; y: number; item: ItemId; qty: number }
+export interface GroundItemSnap { id: string; x: number; y: number; item: ItemId; qty: number; dur?: number }
 
 export interface WorldInit {
   kind: InstanceKind;
@@ -531,6 +593,7 @@ export interface WorldInit {
   extracts: { x: number; y: number }[]; // extraction beacons — hold E to go home with your loot
   exit: { x: number; y: number } | null; // hideout exit mat
   ownHideout: boolean; // true when this is YOUR hideout (enables building)
+  canDemolish: boolean; // personal owner or clan owner/officer
   unders: Record<number, number>; // tile index → floor tile beneath a placed station
   elevations: number[];
   elevationRuns?: number[]; // compact [value,count] pairs; used when elevations is empty
@@ -540,14 +603,22 @@ export interface WorldInit {
   blockKinds: Record<string, string>; // tile index -> published world-block definition
   blockRotations: Record<string, number>; // tile index -> clockwise quarter turns (0-3)
   openDoors: number[]; // currently open block indexes
+  stationFuel: Record<number, number>; // fueled firepits/furnaces; positive entries only
+  gameplay: RuntimeGameplayContent; // authoritative items + recipes for this content revision
   visuals: import('./engine').RuntimeVisualContent;
   you: string;
+  /** Temporary session with no persistence, community actions, chat, or hideout. */
+  guest: boolean;
+  /** Whether the current socket may open the in-game moderation console. */
+  admin: boolean;
 }
 
 export interface StateSnap {
   t: number;
   day: number; // 0..1, 0 = midnight
+  population: number; // stable instance population; does not vary with LOS culling
   players: PlayerSnap[];
+  mapPlayers: MapPlayerSnap[];
   enemies: EnemySnap[];
   projectiles: ProjectileSnap[];
   containers: ContainerSnap[];
@@ -558,11 +629,13 @@ export interface InventoryUpdate {
   inv: Inventory;
   equipped: number | null;
   equipment: Equipment;
+  armorDur: Partial<Record<'helmet' | 'vest', number>>;
   hp: number;
   kills: number;
   deaths: number;
   money: number;
   skills: Skills;
+  quests: QuestStatus[]; // all currently unlocked jobs, for the persistent tracker
   mag: number; // rounds loaded in the equipped weapon (0 when none/melee)
   reloading: boolean;
   nearWorkbench: boolean;
@@ -606,14 +679,64 @@ export interface HitSnap {
   soundId?: string;
 }
 
-/** `under` = the floor tile a station sits on (kept for rendering + demolish restore) */
-export interface TileUpdate { i: number; tile: number; under?: number }
+/** `under` = a station's floor; `resourceId` changes the live resource variant. */
+export interface TileUpdate { i: number; tile: number; under?: number; resourceId?: string | null }
+export interface StationFuelUpdate { i: number; fuel: number }
 
 export interface EntityDeathSnap { x: number; y: number; target: string; fallbackRow: number }
 export interface BlockUpdate { i: number; blockId?: string; rotation?: number; open?: boolean }
 export interface TradeOpen { stock: TradeEntry[]; money: number; quests: QuestStatus[]; tier: TraderTier }
 
-export interface ChatMsg { id: string; name: string; text: string }
+export interface ChatMsg { id: string; name: string; text: string; channel?: 'local' | 'clan'; admin?: boolean }
+
+export interface AdminPlayerSummary {
+  id: string;
+  name: string;
+  instanceId: string;
+  instanceName: string;
+  instanceKind: InstanceKind;
+  tileX: number;
+  tileY: number;
+  hp: number;
+  maxHp: number;
+  dead: boolean;
+  connected: boolean;
+  admin: boolean;
+  guest: boolean;
+  protected: boolean;
+  mutedUntil: number;
+}
+
+export interface AdminSanctionSummary {
+  userId: string;
+  name: string;
+  bannedUntil: number;
+  banReason: string;
+  mutedUntil: number;
+  muteReason: string;
+}
+
+export interface AdminPanelState {
+  server: string;
+  protected: boolean;
+  players: AdminPlayerSummary[];
+  sanctions: AdminSanctionSummary[];
+}
+
+export type AdminActionPayload =
+  | { type: 'give_item'; targetId: string; itemId: string; quantity: number }
+  | { type: 'goto'; targetId: string }
+  | { type: 'bring'; targetId: string }
+  | { type: 'send_home'; targetId: string }
+  | { type: 'heal'; targetId: string }
+  | { type: 'kick'; targetId: string; reason?: string }
+  | { type: 'mute'; targetId: string; minutes: number; reason?: string }
+  | { type: 'ban'; targetId: string; minutes: number; reason?: string }
+  | { type: 'clear_mute'; targetUserId: string }
+  | { type: 'clear_ban'; targetUserId: string }
+  | { type: 'teleport'; tileX: number; tileY: number }
+  | { type: 'protection'; enabled: boolean }
+  | { type: 'announce'; message: string };
 
 export const EV = {
   // client → server
@@ -633,6 +756,9 @@ export const EV = {
   tradeBuy: 'c:trade:buy',
   tradeSell: 'c:trade:sell',
   hideoutEnter: 'c:hideout:enter',
+  clanHideoutEnter: 'c:clan:hideout:enter',
+  clanTreasury: 'c:clan:treasury',
+  socialRefresh: 'c:social:refresh',
   hideoutLeave: 'c:hideout:leave',
   reload: 'c:reload',
   build: 'c:build',
@@ -641,6 +767,9 @@ export const EV = {
   look: 'c:look', // pick your character's appearance
   chat: 'c:chat',
   questClaim: 'c:quest:claim',
+  stationFuel: 'c:station:fuel', // add carried wood to an open firepit/furnace
+  adminRequest: 'c:admin:request',
+  adminAction: 'c:admin:action',
   // server → client
   init: 's:init',
   state: 's:state',
@@ -656,19 +785,29 @@ export const EV = {
   chatMsg: 's:chat',
   action: 's:action',
   station: 's:station', // opened a placed structure (firepit/furnace/workbench)
+  stationFuelUpdate: 's:station:fuel', // broadcast so firelight follows authoritative fuel
+  clanTreasuryUpdate: 's:clan:treasury',
+  gameplay: 's:gameplay', // hot-reloaded versioned items and recipes
   visuals: 's:visuals', // hot-reloaded pixel frames and entity animation profiles
   entityDeath: 's:entity-death',
   block: 's:block',
+  adminState: 's:admin:state',
 } as const;
 
 /** payload of EV.station */
-export interface StationOpen { type: BuildType }
+export interface StationOpen {
+  type: BuildType;
+  index?: number;
+  fuel?: number;
+  maxFuel?: number;
+  fuelPerWood?: number;
+}
 
 // ─── Authored maps (editor) ────────────────────────────────────────────────
 
 export type MapObjectType =
   | 'chest' | 'chest_military' | 'loot' | 'zombie' | 'military'
-  | 'deer' | 'rabbit' | 'boar' | 'wolf'
+  | 'deer' | 'rabbit' | 'boar' | 'wolf' | 'fox' | 'bear'
   | 'chest_custom' | 'mob'
   | 'spawn' | 'trader' | 'trader_black' | 'extract'
   | 'poi_town' | 'poi_airport' | 'poi_outpost' | 'poi_hotzone' | 'poi_zone';
@@ -833,6 +972,9 @@ export const NIGHT_AGGRO_MULT = 1.6; // zombies & wolves see further in the dark
 export const NIGHT_SPEED_MULT = 1.2; // zombies shamble faster at night
 export const EXTRACT_TIME_MS = 5000; // hold still at a beacon to extract
 export const HOME_REST_HP_PER_S = 2; // resting at your base heals fast
+export const STATION_FUEL_MAX = 40;
+export const STATION_FUEL_PER_WOOD = 4;
+export const STATION_FUEL_PER_ACTION = 1;
 
 // ── stamina — sprinting and heavy actions cost it
 export const STAMINA_MAX = 100;
@@ -859,5 +1001,8 @@ export const CRAFT_TIME_MS = 1200; // crafting is a timed action — queueable c
 export const HIDEOUT_W = 26; // roomy grass field — enough to build a real base
 export const HIDEOUT_H = 20;
 export const HIDEOUT_STORAGE_SLOTS = 12;
+export const CLAN_HOLDOUT_W = 42;
+export const CLAN_HOLDOUT_H = 30;
+export const CLAN_HOLDOUT_STORAGE_SLOTS = 24;
 export const NAMEPLATE_RANGE = 240;
 export const STARTING_MONEY = 25;

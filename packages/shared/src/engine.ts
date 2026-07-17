@@ -33,6 +33,7 @@ export const ITEM_SPRITE_ORDER: readonly ItemId[] = [
   'steel_axe', 'steel_pickaxe', 'ammo_44', 'ammo_762',
   'copper_ore', 'iron_ore', 'copper_bar', 'iron_bar',
   'gold_bar', 'diamond', 'rolex', 'data_drive', 'artifact', 'kit_anvil', 'kit_bed',
+  'torch', 'animal_hide', 'antler', 'backpack_mk4',
 ];
 
 export interface LootEntry {
@@ -116,6 +117,9 @@ export interface ResourceNodeDef {
   maxHits: number;
   respawnMs: number;
   skill: 'woodcutting' | 'mining';
+  /** Variants in the same family are selected by weight whenever a node regrows. */
+  respawnFamily?: 'tree' | 'rock';
+  respawnWeight?: number;
   spriteId?: string;
   hitSound?: string;
   breakSound?: string;
@@ -203,6 +207,40 @@ export interface RuntimeVisualContent {
   terrain: TerrainDocument;
 }
 
+export interface EngineBotSettings {
+  count: number;
+  respawnMs: number;
+  playerAggroChance: number;
+  buildChance: number;
+  names: string[];
+}
+
+export interface EngineSettingsDocument {
+  map: {
+    minSize: number;
+    maxSize: number;
+  };
+  publishing: {
+    contentPollMs: number;
+    questPollMs: number;
+  };
+  bots: EngineBotSettings;
+  notes: string;
+}
+
+export const DEFAULT_ENGINE_SETTINGS: EngineSettingsDocument = {
+  map: { minSize: 20, maxSize: 2000 },
+  publishing: { contentPollMs: 10_000, questPollMs: 60_000 },
+  bots: {
+    count: 0,
+    respawnMs: 25_000,
+    playerAggroChance: 0.42,
+    buildChance: 0.38,
+    names: [],
+  },
+  notes: 'Global tuning values are introduced here as their runtime systems are migrated.',
+};
+
 export const DEFAULT_PIXEL_PALETTE = [
   '#00000000', '#16191bff', '#353b3fff', '#697176ff', '#b6b2a1ff', '#eee7d2ff',
   '#3d5b35ff', '#6f8d4dff', '#9eb56cff', '#654533ff', '#9a6745ff', '#cf9a62ff',
@@ -266,8 +304,12 @@ export const DEFAULT_LOOT_TABLES: LootTableRegistry = {
     { id: 'scrap', weight: 19, min: 1, max: 3 }, { id: 'helmet_military', weight: 6, min: 1, max: 1 },
     { id: 'vest_military', weight: 4, min: 1, max: 1 },
   ]),
-  deer: table('deer', 'Deer drops', 2, 2, [{ id: 'raw_meat', weight: 70, min: 2, max: 3 }, { id: 'cloth', weight: 30, min: 1, max: 2 }]),
-  rabbit: table('rabbit', 'Rabbit drops', 1, 1, [{ id: 'raw_meat', weight: 75, min: 1, max: 1 }, { id: 'cloth', weight: 25, min: 1, max: 1 }]),
-  boar: table('boar', 'Boar drops', 2, 2, [{ id: 'raw_meat', weight: 70, min: 3, max: 4 }, { id: 'cloth', weight: 30, min: 1, max: 3 }]),
-  wolf: table('wolf', 'Wolf drops', 2, 2, [{ id: 'raw_meat', weight: 55, min: 1, max: 2 }, { id: 'cloth', weight: 45, min: 2, max: 3 }]),
+  deer: table('deer', 'Deer drops', 2, 3, [
+    { id: 'raw_meat', weight: 60, min: 2, max: 4 }, { id: 'animal_hide', weight: 32, min: 1, max: 2 }, { id: 'antler', weight: 8, min: 1, max: 1 },
+  ]),
+  rabbit: table('rabbit', 'Rabbit drops', 1, 2, [{ id: 'raw_meat', weight: 75, min: 1, max: 1 }, { id: 'animal_hide', weight: 25, min: 1, max: 1 }]),
+  boar: table('boar', 'Boar drops', 2, 3, [{ id: 'raw_meat', weight: 72, min: 3, max: 5 }, { id: 'animal_hide', weight: 28, min: 1, max: 2 }]),
+  wolf: table('wolf', 'Wolf drops', 2, 3, [{ id: 'raw_meat', weight: 58, min: 1, max: 3 }, { id: 'animal_hide', weight: 42, min: 1, max: 3 }]),
+  fox: table('fox', 'Fox drops', 1, 2, [{ id: 'raw_meat', weight: 38, min: 1, max: 1 }, { id: 'animal_hide', weight: 62, min: 1, max: 2 }]),
+  bear: table('bear', 'Bear drops', 3, 4, [{ id: 'raw_meat', weight: 65, min: 3, max: 6 }, { id: 'animal_hide', weight: 35, min: 2, max: 4 }]),
 };
