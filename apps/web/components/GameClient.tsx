@@ -37,6 +37,7 @@ import {
   Tile,
   TileUpdate,
   TradeOpen,
+  WorldEventSnap,
   WorldInit,
   decodeByteRuns,
   decodeTerrainRuns,
@@ -150,6 +151,7 @@ export default function GameClient() {
   const socketRef = useRef<Socket | null>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const snapRef = useRef<StateSnap | null>(null);
+  const worldEventSignatureRef = useRef('');
   const initRef = useRef<WorldInit | null>(null);
   const youRef = useRef<string>('');
   const motionSamplesRef = useRef<MotionSample[]>([]);
@@ -229,6 +231,7 @@ export default function GameClient() {
   const [feed, setFeed] = useState<(KillFeedEntry & { id: number })[]>([]);
   const [dead, setDead] = useState<string | null>(null);
   const [online, setOnline] = useState(0);
+  const [worldEvents, setWorldEvents] = useState<WorldEventSnap[]>([]);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [location, setLocation] = useState<string | null>(null);
   const [prompt, setPrompt] = useState<string | null>(null);
@@ -692,6 +695,8 @@ export default function GameClient() {
         motionSamplesRef.current = [];
         seenProjectiles.current.clear();
         snapRef.current = null;
+        worldEventSignatureRef.current = '';
+        setWorldEvents([]);
         predictedPosRef.current = null;
         predictionCorrectionRef.current = { x: 0, y: 0 };
         pendingInputsRef.current = [];
@@ -728,6 +733,15 @@ export default function GameClient() {
       socket.on(EV.state, (s: StateSnap) => {
         const receivedAt = performance.now();
         snapRef.current = s;
+        const nextEvents = s.events ?? [];
+        const eventSignature = nextEvents
+          .map((event) => `${event.id}:${event.type}:${event.expiresAt}:${Math.floor(event.x / TILE)},${Math.floor(event.y / TILE)}`)
+          .sort()
+          .join('|');
+        if (eventSignature !== worldEventSignatureRef.current) {
+          worldEventSignatureRef.current = eventSignature;
+          setWorldEvents(nextEvents);
+        }
         motionSamplesRef.current = appendMotionSample(motionSamplesRef.current, captureMotionSample(s, receivedAt));
         setOnline(s.population ?? s.players.length);
         const you = s.players.find((p) => p.id === youRef.current);
@@ -1391,6 +1405,7 @@ export default function GameClient() {
         projectiles,
         containers: snap.containers,
         ground: snap.ground,
+        events: snap.events ?? [],
         floats,
         bubbles: bubblesRef.current,
         youId: youRef.current,
@@ -1466,6 +1481,7 @@ export default function GameClient() {
         youId: youRef.current,
         friendNames: tacticalFriendNames,
         clanNames: tacticalClanNames,
+        events: snap.events ?? [],
       };
       if (mm && you) {
         renderer.drawMinimap(mm.getContext('2d')!, MINIMAP_SIZE, mapView, {
@@ -1544,7 +1560,9 @@ export default function GameClient() {
             bestD = d;
             bestPos = { x: c.x, y: c.y };
             bestPrompt =
-              c.kind === 'bag' ? 'Search loot bag'
+              c.event === 'supply_drop' ? 'Open supply drop'
+              : c.event === 'boss_reward' ? 'Claim boss reward cache'
+              : c.kind === 'bag' ? 'Search loot bag'
               : c.kind === 'crate' ? (c.looted ? 'Search crate (empty)' : 'Search supply crate')
               : c.kind === 'storage' ? 'Open stash'
               : c.looted ? 'Open chest (empty)' : 'Open chest';
@@ -1606,7 +1624,7 @@ export default function GameClient() {
     const cont = containerRef.current;
     if (d.zone === 'inv') {
       if (zone === 'inv' && index !== d.index) emit(EV.invMove, { from: d.index, to: index });
-      else if (zone === 'cont' && cont) {
+      else if (zone === 'cont' && cont && !cont.readOnly) {
         emit(EV.containerPut, { id: cont.id, slot: d.index, target: index }); // drop onto this exact slot
       } else if (zone === 'weapon') {
         const kind = itemDef(d.item).kind;
@@ -1619,7 +1637,7 @@ export default function GameClient() {
         else pushToast(`That does not fit the ${zone.toUpperCase()} slot`);
       }
     } else if (d.zone === 'cont' && cont) {
-      if (zone === 'cont') emit(EV.containerMove, { id: cont.id, from: d.index, to: index }); // reorder inside the chest
+      if (zone === 'cont' && !cont.readOnly) emit(EV.containerMove, { id: cont.id, from: d.index, to: index }); // reorder inside the chest
       else enqueueLoot(d.index); // dragged out to your backpack — take it
     } else if (d.zone === 'helmet' || d.zone === 'vest' || d.zone === 'mod') {
       if (zone === 'inv' || zone === 'weapon') emit(EV.unequipArmor, { piece: d.zone });
@@ -1657,7 +1675,7 @@ export default function GameClient() {
       case 'unequip': emit(EV.unequipArmor, { piece: m.zone }); break;
       case 'drop1': emit(EV.invDrop, { slot: m.index, qty: 1 }); break;
       case 'dropall': emit(EV.invDrop, { slot: m.index, qty: m.qty }); break;
-      case 'store': if (cont) emit(EV.containerPut, { id: cont.id, slot: m.index }); break;
+      case 'store': if (cont && !cont.readOnly) emit(EV.containerPut, { id: cont.id, slot: m.index }); break;
       case 'take': if (cont) enqueueLoot(m.index); break;
       case 'repair': emit(EV.repair, { slot: m.index }); break;
     }
@@ -1787,7 +1805,7 @@ export default function GameClient() {
         onMouseDown={(e) => {
           if (!s) return;
           // shift-click: quick-deposit into whatever container is open
-          if (e.shiftKey && containerRef.current) {
+          if (e.shiftKey && containerRef.current && !containerRef.current.readOnly) {
             e.preventDefault();
             emit(EV.containerPut, { id: containerRef.current.id, slot: i });
             return;
@@ -1892,6 +1910,23 @@ export default function GameClient() {
           onViewportChange={updateWorldMapView}
           onClose={() => only(null)}
         />
+      )}
+
+      {connected && worldEvents.length > 0 && !anyPanel && initRef.current?.kind === 'world' && (
+        <div className="world-events" aria-label="Active world events">
+          <div className="world-events-title">LIVE EVENTS <span>{touchMode ? 'OPEN MAP' : 'M · MAP'}</span></div>
+          {worldEvents.map((event) => {
+            const me = snapRef.current?.players.find((player) => player.id === youRef.current);
+            const distance = me ? Math.max(1, Math.round(Math.hypot(event.x - me.x, event.y - me.y) / TILE)) : null;
+            const minutes = Math.max(1, Math.ceil((event.expiresAt - Date.now()) / 60_000));
+            return (
+              <div key={event.id} className={`world-event-row ${event.type}`}>
+                <i>{event.type === 'supply_drop' ? 'D' : 'B'}</i>
+                <span><b>{event.name}</b><small>SECTOR {Math.floor(event.x / TILE)},{Math.floor(event.y / TILE)}{distance ? ` · ${distance} tiles` : ''} · {minutes}m</small></span>
+              </div>
+            );
+          })}
+        </div>
       )}
 
       {location && <div className="location-banner" key={location}>{location.toUpperCase()}</div>}
@@ -2115,7 +2150,7 @@ export default function GameClient() {
             </div>
             <div className="item-desc">
               Drag to move · right-click for options · double-click to use
-              {container ? ' · shift-click to deposit' : ''}
+              {container ? (container.readOnly ? ' · event cache is loot-only' : ' · shift-click to deposit') : ''}
             </div>
           </section>
 
@@ -2158,7 +2193,7 @@ export default function GameClient() {
 
           {container && (
             <section className="gear-col">
-              <h3>{container.storage ? 'STASH' : container.id.startsWith('b') ? 'LOOT BAG' : 'STORAGE'}</h3>
+              <h3>{container.storage ? 'STASH' : container.readOnly ? 'SUPPLY DROP' : container.id.startsWith('b') ? 'LOOT BAG' : 'STORAGE'}</h3>
               <div className="slot-grid">
                 {container.slots.map((s, i) => {
                   const looting = !!action && action.kind === 'loot' && action.container === container.id && action.slot === i;
@@ -2227,7 +2262,7 @@ export default function GameClient() {
               <>
                 {verb && <button onClick={() => ctxAction(def.place ? 'place' : 'use')}>{verb}</button>}
                 {rep && worn && <button onClick={() => ctxAction('repair')}>REPAIR</button>}
-                {container && <button onClick={() => ctxAction('store')}>{container.storage ? 'STASH' : 'STORE'}</button>}
+                {container && !container.readOnly && <button onClick={() => ctxAction('store')}>{container.storage ? 'STASH' : 'STORE'}</button>}
                 <button onClick={() => ctxAction('drop1')}>DROP 1</button>
                 <button onClick={() => ctxAction('dropall')}>DROP ALL</button>
               </>

@@ -191,6 +191,8 @@ export function WorldMapOverlay({
           <span><i className="danger" />HIGH-LOOT ZONE</span>
           <span><i className="extract" />EXTRACTION</span>
           <span><i className="trader" />TRADER</span>
+          <span><i className="drop" />SUPPLY DROP</span>
+          <span><i className="boss" />BOSS HUNT</span>
         </footer>
       </section>
     </div>

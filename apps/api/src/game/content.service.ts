@@ -236,6 +236,16 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     return typeof value === 'string' && value ? value : kind;
   }
 
+  /** Published boss records are preferred by roaming boss-hunt events. */
+  bossKinds(): string[] {
+    return Object.entries(this.mobDefs).flatMap(([id, definition]) =>
+      (definition as Partial<EngineMobDefinition>).boss === true &&
+      definition.behavior !== 'flee'
+        ? [id]
+        : [],
+    );
+  }
+
   resource(id: string | undefined): ResourceNodeDef | undefined {
     return id ? this.visualDefs.resources[id] : undefined;
   }

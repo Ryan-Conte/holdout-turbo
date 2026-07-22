@@ -495,6 +495,30 @@ input { font-family: inherit; }
   text-shadow: 0 1px 2px #000;
 }
 
+.world-events {
+  position: absolute;
+  z-index: 4;
+  top: 12px;
+  left: 50%;
+  width: min(320px, 42vw);
+  padding: 7px;
+  transform: translateX(-50%);
+  border: 1px solid rgba(101, 111, 92, .85);
+  background: rgba(8, 10, 7, .9);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+  pointer-events: none;
+}
+.world-events-title { display: flex; justify-content: space-between; margin: 0 2px 5px; color: #d8c26a; font: 8px var(--font-mono); letter-spacing: 1.8px; }
+.world-events-title span { color: #747c69; letter-spacing: .6px; }
+.world-event-row { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 7px; align-items: center; padding: 5px 6px; border-top: 1px solid rgba(85, 91, 71, .48); }
+.world-event-row i { width: 21px; height: 21px; display: grid; place-items: center; border: 1px solid currentColor; border-radius: 50%; font: 700 10px var(--font-mono); font-style: normal; }
+.world-event-row span { min-width: 0; }
+.world-event-row b, .world-event-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
+.world-event-row b { color: #d9dccb; font-size: 9px; letter-spacing: .8px; }
+.world-event-row small { margin-top: 2px; color: #7f8775; font-size: 7px; }
+.world-event-row.supply_drop i { color: #65d9e8; background: rgba(101, 217, 232, .1); }
+.world-event-row.boss i { color: #f16a5a; background: rgba(241, 106, 90, .1); }
+
 /* Full-region tactical map */
 .world-map-overlay {
   position: absolute;
@@ -659,6 +683,8 @@ input { font-family: inherit; }
 .world-map-legend i.danger { color: #f05a3a; }
 .world-map-legend i.extract { color: #5ff08a; transform: rotate(45deg); }
 .world-map-legend i.trader { color: #d8c26a; background: #d8c26a; }
+.world-map-legend i.drop { color: #65d9e8; border-radius: 50%; background: rgba(101, 217, 232, .25); }
+.world-map-legend i.boss { color: #f05a4a; border-radius: 50%; background: rgba(240, 90, 74, .25); }
 
 @keyframes world-map-enter {
   from { opacity: 0; transform: scale(0.985); }
@@ -3447,6 +3473,12 @@ input { font-family: inherit; }
 
   .hotkey-bar { display: none; }
   .minimap-wrap { display: none; }
+  .world-events { top: max(7px, env(safe-area-inset-top)); width: min(250px, 38vw); padding: 4px; }
+  .world-events-title { margin-bottom: 2px; font-size: 6px; }
+  .world-event-row { grid-template-columns: 18px minmax(0, 1fr); gap: 4px; padding: 3px 4px; }
+  .world-event-row i { width: 17px; height: 17px; font-size: 8px; }
+  .world-event-row b { font-size: 7px; }
+  .world-event-row small { font-size: 6px; }
   .hud {
     left: max(10px, env(safe-area-inset-left));
     top: max(9px, env(safe-area-inset-top));

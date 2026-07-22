@@ -152,6 +152,10 @@ import {
   adminText,
   adminTileCoordinate,
 } from "./rules/admin.rules";
+import {
+  randomEventDelay,
+  randomEventType,
+} from "./rules/random-event.rules";
 import { TelemetryService } from "./telemetry.service";
 import type {
   Enemy,
@@ -160,6 +164,7 @@ import type {
   GroundItem,
   NodeRespawnState,
   Projectile,
+  RandomWorldEvent,
   ResourceFamily,
   ServerBotState,
   ServerPlayer,
@@ -177,6 +182,9 @@ const SNAPSHOT_VIEW_RANGE = 1100;
 const PLAYER_LEASE_TTL_SECONDS = 45;
 const PLAYER_LEASE_HEARTBEAT_MS = 15_000;
 const CHEST_RESTOCK_MS = 20 * 60_000;
+const MAX_RANDOM_EVENTS = 2;
+const SUPPLY_DROP_TTL_MS = 12 * 60_000;
+const BOSS_EVENT_TTL_MS = 18 * 60_000;
 const configuredPlayerCapacity = Number(
   process.env.MAX_PLAYERS_PER_SERVER ?? 200,
 );
@@ -853,6 +861,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       nodeRespawns: [],
       enemyRespawns: [],
       lastGroundSpawn: 0,
+      randomEvents: new Map(),
+      nextRandomEventAt:
+        kind === "world"
+          ? Date.now() + randomEventDelay(this.rnd, true)
+          : Number.POSITIVE_INFINITY,
       players: 0,
       structures: new Map(),
     };
@@ -1081,6 +1094,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       nodeRespawns: [],
       enemyRespawns: [],
       lastGroundSpawn: 0,
+      randomEvents: new Map(),
+      nextRandomEventAt: Number.POSITIVE_INFINITY,
       players: 0,
       hideout,
       structures: new Map(),
@@ -2700,6 +2715,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         id: best.id,
         slots: best.slots,
         storage: best.kind === "storage",
+        readOnly: Boolean(best.eventId),
       } satisfies ContainerContents);
       return;
     }
@@ -3085,7 +3101,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
     if (c.kind === "storage") this.persistHideout(inst);
     if (c.slots.every((s) => !s)) {
-      if (c.kind === "bag") {
+      if (c.eventId && c.eventKind === "supply_drop") {
+        inst.containers.delete(c.id);
+        inst.randomEvents.delete(c.eventId);
+        this.io?.to(inst.id).emit(EV.containerGone, c.id);
+        this.io
+          ?.to(inst.id)
+          .emit(EV.toast, `SUPPLY DROP secured by ${p.name}`);
+      } else if (c.kind === "bag") {
         inst.containers.delete(c.id);
         this.io?.to(inst.id).emit(EV.containerGone, c.id);
       } else if (c.kind !== "storage") {
@@ -3097,6 +3120,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       id: c.id,
       slots: inst.containers.has(c.id) ? c.slots : [],
       storage: c.kind === "storage",
+      readOnly: Boolean(c.eventId),
     });
   }
 
@@ -3105,7 +3129,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     containerId: string,
   ): Container | null {
     const c = this.inst(p).containers.get(containerId);
-    if (!c || c.kind === "bag") return null;
+    if (!c || c.kind === "bag" || c.eventId) return null;
     if (Math.hypot(c.x - p.x, c.y - p.y) > INTERACT_RANGE * 1.5) return null;
     return c;
   }
@@ -5135,6 +5159,190 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
 
   // ── simulation ────────────────────────────────────────────────────────────
 
+  private findRandomEventPoint(inst: Instance): { x: number; y: number } | null {
+    for (let attempt = 0; attempt < 240; attempt++) {
+      const tx = 2 + Math.floor(this.rnd() * Math.max(1, inst.w - 4));
+      const ty = 2 + Math.floor(this.rnd() * Math.max(1, inst.h - 4));
+      const x = (tx + 0.5) * TILE;
+      const y = (ty + 0.5) * TILE;
+      if (
+        this.isSafeAt(inst, x, y) ||
+        this.inWater(inst, { x, y }) ||
+        this.isBlocked(inst, x, y, 18) ||
+        [...inst.randomEvents.values()].some(
+          (event) => Math.hypot(event.x - x, event.y - y) < 14 * TILE,
+        )
+      )
+        continue;
+      let crowded = false;
+      for (const player of this.players.values()) {
+        if (
+          player.instanceId === inst.id &&
+          !player.dead &&
+          Math.hypot(player.x - x, player.y - y) < 9 * TILE
+        ) {
+          crowded = true;
+          break;
+        }
+      }
+      if (!crowded) return { x, y };
+    }
+    return null;
+  }
+
+  private recordRandomEventLoot(
+    slots: InvSlot[],
+    source: string,
+    eventId: string,
+  ) {
+    for (const slot of slots) {
+      if (!slot) continue;
+      this.telemetry.record({
+        kind: "item_spawned",
+        itemId: slot.id,
+        quantity: slot.qty,
+        value: this.content.estimatedItemValue(slot.id) * slot.qty,
+        source,
+        metadata: { eventId },
+      });
+    }
+  }
+
+  private startSupplyDrop(
+    inst: Instance,
+    eventId: string,
+    point: { x: number; y: number },
+    now: number,
+  ): RandomWorldEvent {
+    const containerId = `a${this.nextId++}`;
+    const slots = [
+      ...rollChest(this.rnd, "rare", this.content.lootTables),
+      ...rollChest(this.rnd, "military", this.content.lootTables),
+    ];
+    inst.containers.set(containerId, {
+      id: containerId,
+      x: point.x,
+      y: point.y,
+      kind: "crate",
+      tier: "rare",
+      slots,
+      restockAt: null,
+      eventId,
+      eventKind: "supply_drop",
+    });
+    this.recordRandomEventLoot(slots, "random_event_supply_drop", eventId);
+    return {
+      id: eventId,
+      type: "supply_drop",
+      name: "SUPPLY DROP",
+      x: point.x,
+      y: point.y,
+      radius: 80,
+      startedAt: now,
+      expiresAt: now + SUPPLY_DROP_TTL_MS,
+      containerId,
+    };
+  }
+
+  private startBossHunt(
+    inst: Instance,
+    eventId: string,
+    point: { x: number; y: number },
+    now: number,
+  ): RandomWorldEvent | null {
+    const publishedBosses = this.content.bossKinds();
+    const kind = publishedBosses.length
+      ? publishedBosses[Math.floor(this.rnd() * publishedBosses.length)]
+      : this.rnd() < 0.5
+        ? "bear"
+        : "military";
+    const enemyId = this.spawnEnemy(inst, point.x, point.y, kind, 0);
+    if (!enemyId) return null;
+    const enemy = inst.enemies.get(enemyId)!;
+    const definition = this.content.enemy(kind);
+    const published = publishedBosses.includes(kind);
+    enemy.maxHp = Math.max(
+      published ? 360 : 480,
+      Math.round(definition.maxHp * (published ? 1.5 : 3)),
+    );
+    enemy.hp = enemy.maxHp;
+    enemy.eventId = eventId;
+    enemy.bossName = definition.name.toUpperCase();
+    enemy.damageMult = published ? 1.2 : 1.45;
+    enemy.speedMult = 1.08;
+    enemy.aggroMult = 1.5;
+    return {
+      id: eventId,
+      type: "boss",
+      name: `HUNT: ${enemy.bossName}`,
+      x: point.x,
+      y: point.y,
+      radius: 150,
+      startedAt: now,
+      expiresAt: now + BOSS_EVENT_TTL_MS,
+      enemyId,
+    };
+  }
+
+  private updateRandomEvents(inst: Instance, now: number) {
+    for (const event of [...inst.randomEvents.values()]) {
+      if (event.enemyId) {
+        const enemy = inst.enemies.get(event.enemyId);
+        if (enemy) {
+          event.x = enemy.x;
+          event.y = enemy.y;
+        }
+      }
+      if (now < event.expiresAt) continue;
+      if (event.containerId) {
+        inst.containers.delete(event.containerId);
+        this.io?.to(inst.id).emit(EV.containerGone, event.containerId);
+      }
+      if (event.enemyId) inst.enemies.delete(event.enemyId);
+      inst.randomEvents.delete(event.id);
+      this.io
+        ?.to(inst.id)
+        .emit(EV.toast, `${event.name} expired - the opportunity is gone`);
+    }
+
+    const hasActiveSurvivor = [...this.players.values()].some(
+      (player) =>
+        player.instanceId === inst.id &&
+        !this.isBot(player) &&
+        player.loggedOutAt === null,
+    );
+    if (
+      !hasActiveSurvivor ||
+      inst.randomEvents.size >= MAX_RANDOM_EVENTS ||
+      now < inst.nextRandomEventAt
+    )
+      return;
+
+    const point = this.findRandomEventPoint(inst);
+    if (!point) {
+      inst.nextRandomEventAt = now + 30_000;
+      return;
+    }
+    const eventId = `we${this.nextId++}`;
+    const type = randomEventType(this.rnd);
+    const event = type === "supply_drop"
+      ? this.startSupplyDrop(inst, eventId, point, now)
+      : this.startBossHunt(inst, eventId, point, now);
+    inst.nextRandomEventAt = now + randomEventDelay(this.rnd);
+    if (!event) return;
+    inst.randomEvents.set(event.id, event);
+    const sector = `${Math.floor(event.x / TILE)},${Math.floor(event.y / TILE)}`;
+    this.io
+      ?.to(inst.id)
+      .emit(
+        EV.toast,
+        type === "supply_drop"
+          ? `SUPPLY DROP landed in sector ${sector} - open the map to track it`
+          : `${event.name} spotted in sector ${sector} - high-tier loot on defeat`,
+      );
+    this.log.log(`Random event ${event.id} started: ${event.name} at ${sector}`);
+  }
+
   private tick() {
     const now = Date.now();
     const dt = Math.min(0.1, (now - this.lastTick) / 1000);
@@ -5361,6 +5569,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const night = isNight(day);
     for (const inst of this.instances.values()) {
       if (inst.kind === "world") {
+        this.updateRandomEvents(inst, now);
         this.updateNightHorde(inst, now, day, night);
         this.updateEnemies(inst, dt, now, night);
         // chest restock
@@ -5976,9 +6185,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const def = this.content.enemy(e.kind);
       // the dark belongs to the dead (and the wolves)
       const hunter = e.kind === "zombie" || e.kind === "wolf";
-      const aggro = def.aggroRange * (night && hunter ? NIGHT_AGGRO_MULT : 1);
+      const aggro =
+        def.aggroRange *
+        (e.aggroMult ?? 1) *
+        (night && hunter ? NIGHT_AGGRO_MULT : 1);
       const speed =
-        def.speed * (night && e.kind === "zombie" ? NIGHT_SPEED_MULT : 1);
+        def.speed *
+        (e.speedMult ?? 1) *
+        (night && e.kind === "zombie" ? NIGHT_SPEED_MULT : 1);
       let target = e.targetSid ? this.players.get(e.targetSid) : undefined;
       // sight memory: refresh while the target is visible; hidden targets are
       // only hunted at their last-seen spot, and forgotten after a few seconds
@@ -6093,8 +6307,9 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
           } else if (seen && now >= e.nextAttackAt) {
             e.nextAttackAt = now + def.attackMs;
             e.lastAttackAt = now;
-            this.damagePlayer(target, def.damage, `a ${def.name}`, null, null);
-            this.hitFx(inst, target.x, target.y, def.damage, "player");
+            const damage = Math.max(1, Math.round(def.damage * (e.damageMult ?? 1)));
+            this.damagePlayer(target, damage, `a ${e.bossName ?? def.name}`, null, null);
+            this.hitFx(inst, target.x, target.y, damage, "player");
           }
         } else {
           if (dist > def.attackRange) {
@@ -6133,7 +6348,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
               angle: a,
               traveled: 0,
               range: 480,
-              damage: def.damage,
+              damage: Math.max(1, Math.round(def.damage * (e.damageMult ?? 1))),
               owner: e.id,
               ownerKind: e.kind,
               weapon: "rifle",
@@ -6232,7 +6447,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     inst.enemies.delete(e.id);
     if (attacker) {
       attacker.kills++;
-      this.toast(attacker.sid, `☠ ${this.content.enemy(e.kind).name} down`);
+      this.toast(attacker.sid, `☠ ${e.bossName ?? this.content.enemy(e.kind).name} down`);
       // kill-quest progress (locked quests don't tick — take them first)
       for (const def of this.quests) {
         if (
@@ -6251,11 +6466,21 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       }
       this.pushInventory(attacker);
     }
-    const drops = rollEnemyDrop(
-      this.rnd,
-      this.content.enemyLootTable(e.kind),
-      this.content.lootTables,
-    );
+    const drops = e.eventId
+      ? [
+          ...rollNamed(
+            this.rnd,
+            this.content.enemyLootTable(e.kind),
+            this.content.lootTables,
+          ),
+          ...rollChest(this.rnd, "rare", this.content.lootTables),
+          ...rollChest(this.rnd, "rare", this.content.lootTables),
+        ]
+      : rollEnemyDrop(
+          this.rnd,
+          this.content.enemyLootTable(e.kind),
+          this.content.lootTables,
+        );
     if (drops.length > 0) {
       const id = `b${this.nextId++}`;
       inst.containers.set(id, {
@@ -6266,7 +6491,21 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         tier: "normal",
         slots: drops,
         restockAt: null,
+        ...(e.eventId ? { eventKind: "boss_reward" as const } : {}),
       });
+      if (e.eventId)
+        this.recordRandomEventLoot(drops, "random_event_boss_reward", e.eventId);
+    }
+    if (e.eventId) {
+      const event = inst.randomEvents.get(e.eventId);
+      inst.randomEvents.delete(e.eventId);
+      if (event)
+        this.io
+          ?.to(inst.id)
+          .emit(
+            EV.toast,
+            `${event.name} defeated${attacker ? ` by ${attacker.name}` : ""} - reward cache dropped`,
+          );
     }
     this.nightHordeIds.delete(e.id);
     if (e.respawnMs > 0)
@@ -6394,8 +6633,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             if (!this.isSafeAt(inst, target.x, target.y)) {
               const shooter =
                 pr.ownerKind === null ? this.players.get(pr.owner) : undefined;
+              const enemyShooter =
+                pr.ownerKind !== null ? inst.enemies.get(pr.owner) : undefined;
               const killerName = pr.ownerKind
-                ? `a ${this.content.enemy(pr.ownerKind).name}`
+                ? `a ${enemyShooter?.bossName ?? this.content.enemy(pr.ownerKind).name}`
                 : (shooter?.name ?? "?");
               this.hitFx(
                 inst,
@@ -6594,12 +6835,25 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         moving: e.moving,
         attackAt: now - e.lastAttackAt < 1000 ? e.lastAttackAt : 0,
         hitAt: now - e.lastHitAt < 1000 ? e.lastHitAt : 0,
+        ...(e.eventId && e.bossName
+          ? { boss: { eventId: e.eventId, name: e.bossName } }
+          : {}),
       }),
     );
     const base = {
       t: now,
       day: (now % DAY_LENGTH_MS) / DAY_LENGTH_MS,
       population: allPlayers.length,
+      events: [...inst.randomEvents.values()].map((event) => ({
+        id: event.id,
+        type: event.type,
+        name: event.name,
+        x: event.x,
+        y: event.y,
+        radius: event.radius,
+        startedAt: event.startedAt,
+        expiresAt: event.expiresAt,
+      })),
     };
     const allProjectiles = inst.projectiles.map((pr) => ({
       id: pr.id,
@@ -6616,6 +6870,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         y: c.y,
         kind: c.kind,
         looted: c.slots.every((s) => !s),
+        ...(c.eventKind ? { event: c.eventKind } : {}),
       }),
     );
     const allGround = [...inst.ground.values()].map(

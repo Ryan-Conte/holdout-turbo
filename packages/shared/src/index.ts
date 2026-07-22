@@ -456,6 +456,8 @@ export interface EnemySnap {
   moving: boolean;
   attackAt?: number;
   hitAt?: number;
+  /** Present only for a server-authored world-event boss. */
+  boss?: { eventId: string; name: string };
 }
 
 // ─── POIs / instances ───────────────────────────────────────────────────────
@@ -585,9 +587,25 @@ export interface ContainerSnap {
   y: number;
   kind: 'chest' | 'bag' | 'crate' | 'storage';
   looted: boolean;
+  /** Special presentation for ephemeral server-authored event loot. */
+  event?: 'supply_drop' | 'boss_reward';
 }
 
 export interface GroundItemSnap { id: string; x: number; y: number; item: ItemId; qty: number; dur?: number }
+
+export type WorldEventType = 'supply_drop' | 'boss';
+
+/** Public objective marker for a live, server-authoritative regional event. */
+export interface WorldEventSnap {
+  id: string;
+  type: WorldEventType;
+  name: string;
+  x: number;
+  y: number;
+  radius: number;
+  startedAt: number;
+  expiresAt: number;
+}
 
 export interface WorldInit {
   kind: InstanceKind;
@@ -632,6 +650,8 @@ export interface StateSnap {
   projectiles: ProjectileSnap[];
   containers: ContainerSnap[];
   ground: GroundItemSnap[];
+  /** Regional objectives are intentionally visible relay-wide, independent of LOS. */
+  events: WorldEventSnap[];
 }
 
 export interface InventoryUpdate {
@@ -665,7 +685,7 @@ export interface InventoryUpdate {
  *  on the exact slot being taken. */
 export interface ActionSnap { label: string; ms: number; kind?: string; container?: string; slot?: number }
 
-export interface ContainerContents { id: string; slots: InvSlot[]; storage?: boolean }
+export interface ContainerContents { id: string; slots: InvSlot[]; storage?: boolean; readOnly?: boolean }
 
 export interface InputPayload {
   up: boolean;

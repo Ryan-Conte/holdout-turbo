@@ -31,6 +31,6 @@
 1. Item instances + weapon-specific attachment slots, including extended magazines (see `docs/PVP.md`).
 2. Client prediction/reconciliation plus broader movement/combat integration coverage (`docs/ANTICHEAT.md`, `docs/MAINTAINABILITY.md`).
 3. Engine v2 follow-up: sprite atlas composition, building stamps, validation reports and multi-map rotation.
-4. Wandering trader and regional dynamic events; night-only horde surges are shipped.
+4. Wandering trader; regional supply drops, boss hunts and night-only horde surges are shipped.
 5. Base raiding rules for world structures (decay tuning, offline protection).
 6. Real art to replace generated sprite templates (`docs/ART.md`).

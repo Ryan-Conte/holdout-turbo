@@ -17,6 +17,7 @@ import {
   RuntimeVisualContent,
   RuntimeGameplayContent,
   RuntimeItemRegistry,
+  WorldEventSnap,
   EntityAnimationState,
   TILE,
   Tile,
@@ -70,6 +71,7 @@ export interface WorldView {
   projectiles: ProjectileSnap[];
   containers: ContainerSnap[];
   ground: GroundItemSnap[];
+  events: WorldEventSnap[];
   floats: DamageFloat[];
   bubbles: Map<string, { text: string; at: number }>; // playerId -> chat bubble (at = performance.now ms)
   youId: string;
@@ -1121,6 +1123,7 @@ export class Renderer {
     }
 
     for (const g of view.ground) this.drawGroundItem(ctx, g, view.time);
+    for (const event of view.events) this.drawWorldEvent(ctx, event, view.time);
     for (const c of view.containers) this.drawContainer(ctx, c);
 
     // aim line for your own equipped gun (Zero Sievert style)
@@ -1585,6 +1588,7 @@ export class Renderer {
       youId: string;
       friendNames: Set<string>;
       clanNames: Set<string>;
+      events: WorldEventSnap[];
     },
     options: MinimapRenderOptions = {},
   ) {
@@ -1689,6 +1693,34 @@ export class Renderer {
       }
       ctx.fillText(label, x, y - marker - 4);
     }
+    for (const event of view.events) {
+      const { x, y } = point(event.x, event.y);
+      const supply = event.type === 'supply_drop';
+      const pulse = 0.5 + Math.sin(Date.now() / 280) * 0.5;
+      const marker = (detailed ? 7 : 4) * markerScale;
+      ctx.save();
+      ctx.strokeStyle = supply ? '#65d9e8' : '#f05a4a';
+      ctx.fillStyle = supply ? 'rgba(101, 217, 232, 0.2)' : 'rgba(240, 90, 74, 0.2)';
+      ctx.lineWidth = detailed ? 2 : 1.5;
+      ctx.beginPath();
+      ctx.arc(x, y, marker + pulse * 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = supply ? '#b9f4f7' : '#ffd0c8';
+      ctx.font = `700 ${detailed ? 11 : 8}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(supply ? 'D' : 'B', x, y + 0.5);
+      if (detailed) {
+        ctx.textBaseline = 'alphabetic';
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(5, 7, 5, 0.92)';
+        ctx.strokeText(event.name, x, y - marker - 8);
+        ctx.fillStyle = supply ? '#9eeaf0' : '#ff9b8d';
+        ctx.fillText(event.name, x, y - marker - 8);
+      }
+      ctx.restore();
+    }
     if (detailed) {
       for (const tr of this.traders) {
         const { x, y } = point(tr.x, tr.y);
@@ -1731,6 +1763,43 @@ export class Renderer {
 
   // ── entity painters ─────────────────────────────────────────────────────
 
+  private drawWorldEvent(
+    ctx: CanvasRenderingContext2D,
+    event: WorldEventSnap,
+    time: number,
+  ) {
+    const pulse = 0.5 + Math.sin(time * 4.5 + hashStr(event.id)) * 0.5;
+    const supply = event.type === 'supply_drop';
+    ctx.save();
+    ctx.strokeStyle = supply
+      ? `rgba(101, 217, 232, ${0.38 + pulse * 0.38})`
+      : `rgba(240, 90, 74, ${0.38 + pulse * 0.38})`;
+    ctx.fillStyle = supply
+      ? 'rgba(101, 217, 232, 0.07)'
+      : 'rgba(240, 90, 74, 0.07)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([7, 6]);
+    ctx.beginPath();
+    ctx.arc(event.x, event.y, 25 + pulse * 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (supply) {
+      const gradient = ctx.createLinearGradient(event.x, event.y - 70, event.x, event.y - 5);
+      gradient.addColorStop(0, 'rgba(101, 217, 232, 0)');
+      gradient.addColorStop(1, `rgba(101, 217, 232, ${0.28 + pulse * 0.22})`);
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.moveTo(event.x - 10, event.y - 70);
+      ctx.lineTo(event.x + 10, event.y - 70);
+      ctx.lineTo(event.x + 4, event.y - 5);
+      ctx.lineTo(event.x - 4, event.y - 5);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
   private drawContainer(ctx: CanvasRenderingContext2D, c: ContainerSnap) {
     const { x, y } = c;
     const tx = Math.floor(x / TILE); const ty = Math.floor(y / TILE);
@@ -1752,16 +1821,16 @@ export class Renderer {
     } else if (c.kind === "crate") {
       ctx.fillStyle = "rgba(0,0,0,0.25)";
       ctx.fillRect(x - 12, y + 6, 24, 5);
-      ctx.fillStyle = c.looted ? "#565b4d" : "#47563a";
+      ctx.fillStyle = c.looted ? "#565b4d" : c.event === 'supply_drop' ? "#376874" : "#47563a";
       ctx.fillRect(x - 12, y - 9, 24, 17);
-      ctx.fillStyle = c.looted ? "#63685a" : "#576a45";
+      ctx.fillStyle = c.looted ? "#63685a" : c.event === 'supply_drop' ? "#4b8792" : "#576a45";
       ctx.fillRect(x - 12, y - 9, 24, 5);
       ctx.strokeStyle = "#20281a";
       ctx.strokeRect(x - 12.5, y - 9.5, 25, 18);
       ctx.fillStyle = "#d8d2b8";
       ctx.font = "8px monospace";
       ctx.textAlign = "center";
-      ctx.fillText("★", x, y + 2);
+      ctx.fillText(c.event === 'supply_drop' ? "D" : "★", x, y + 2);
     } else if (c.kind === "storage") {
       ctx.fillStyle = "rgba(0,0,0,0.3)";
       ctx.fillRect(x - 13, y + 7, 26, 5);
@@ -1776,11 +1845,11 @@ export class Renderer {
     } else {
       ctx.fillStyle = "rgba(0,0,0,0.25)";
       ctx.fillRect(x - 8, y + 5, 16, 4);
-      ctx.fillStyle = "#403a30";
+      ctx.fillStyle = c.event === 'boss_reward' ? "#6f4c29" : "#403a30";
       ctx.beginPath();
       ctx.arc(x, y, 9, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = "#524a3d";
+      ctx.fillStyle = c.event === 'boss_reward' ? "#9b7136" : "#524a3d";
       ctx.beginPath();
       ctx.arc(x - 2, y - 2, 5, 0, Math.PI * 2);
       ctx.fill();
@@ -2115,6 +2184,16 @@ export class Renderer {
     const bodyX = e.dx + pose.x;
     const bodyY = e.dy + pose.y;
     const shadowWidth = e.kind === 'rabbit' ? 6 : e.kind === 'bear' ? 12 : animalRow !== undefined ? 10 : 9;
+    if (e.boss) {
+      const pulse = 0.5 + Math.sin(time * 5 + seed) * 0.5;
+      ctx.strokeStyle = `rgba(240, 90, 74, ${0.38 + pulse * 0.42})`;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.arc(e.dx, e.dy + 4, 21 + pulse * 4, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     ctx.fillStyle = "rgba(0,0,0,0.27)";
     ctx.beginPath();
     ctx.ellipse(e.dx, e.dy + 13, shadowWidth * pose.shadowScale, 3 * pose.shadowScale, 0, 0, Math.PI * 2);
@@ -2123,6 +2202,7 @@ export class Renderer {
     ctx.save();
     ctx.translate(bodyX, bodyY);
     ctx.rotate(pose.lean);
+    if (e.boss) ctx.scale(1.25, 1.25);
     if (this.facesLeft(e.id, e.angle)) ctx.scale(-1, 1);
     if (hitElapsed < 120) ctx.filter = 'brightness(1.8) saturate(0.45)';
     const custom = this.drawEngineSprite(ctx, `mob:${e.kind}`, state, elapsed, seed, 0, 0);
@@ -2134,16 +2214,26 @@ export class Renderer {
     if (e.kind === "military")
       this.drawHeldItem(ctx, bodyX, bodyY, "rifle", e.angle, null);
 
-    if (e.hp < e.maxHp) {
-      const hpw = 20;
+    if (e.hp < e.maxHp || e.boss) {
+      const hpw = e.boss ? 46 : 20;
+      if (e.boss) {
+        ctx.font = '700 8px monospace';
+        ctx.textAlign = 'center';
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+        ctx.strokeText(e.boss.name, e.dx, e.dy - 31);
+        ctx.fillStyle = '#ffb0a2';
+        ctx.fillText(e.boss.name, e.dx, e.dy - 31);
+      }
       ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(e.dx - hpw / 2, e.dy - 21, hpw, 2.5);
+      ctx.fillRect(e.dx - hpw / 2, e.dy - (e.boss ? 27 : 21), hpw, e.boss ? 4 : 2.5);
       ctx.fillStyle =
-        e.kind === "zombie" ? "#7fa062"
+        e.boss ? "#db4d3f"
+        : e.kind === "zombie" ? "#7fa062"
         : e.kind === "wolf" || e.kind === "bear" ? "#a04040"
         : animalRow !== undefined ? "#c8a878"
         : "#c07a4a";
-      ctx.fillRect(e.dx - hpw / 2, e.dy - 21, (hpw * e.hp) / e.maxHp, 2.5);
+      ctx.fillRect(e.dx - hpw / 2, e.dy - (e.boss ? 27 : 21), (hpw * e.hp) / e.maxHp, e.boss ? 4 : 2.5);
     }
   }
 

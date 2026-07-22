@@ -12,6 +12,14 @@ const { consumeFuel, planFuelAddition } = require('../dist/game/rules/station.ru
 const { canBuildClanHideout, canDemolishClanHideout, canManageClan, isClanRank } = require('../dist/game/rules/clan.rules.js');
 const { adminItemQuantity, adminSanctionMinutes, adminText, adminTileCoordinate } = require('../dist/game/rules/admin.rules.js');
 const {
+  RANDOM_EVENT_INITIAL_MAX_MS,
+  RANDOM_EVENT_INITIAL_MIN_MS,
+  RANDOM_EVENT_MAX_MS,
+  RANDOM_EVENT_MIN_MS,
+  randomEventDelay,
+  randomEventType,
+} = require('../dist/game/rules/random-event.rules.js');
+const {
   actionInterruptedByDamage,
   actionInterruptedByMovement,
   clanHideoutExitTarget,
@@ -107,6 +115,15 @@ test('admin inputs are bounded and control characters are stripped', () => {
   assert.equal(adminTileCoordinate(12.9, 20), 12);
   assert.equal(adminTileCoordinate(99, 20), 19);
   assert.equal(adminTileCoordinate('nope', 20), null);
+});
+
+test('random world events use bounded cadence and deterministic weighted selection', () => {
+  assert.equal(randomEventDelay(() => 0, true), RANDOM_EVENT_INITIAL_MIN_MS);
+  assert.equal(randomEventDelay(() => 1, true), RANDOM_EVENT_INITIAL_MAX_MS);
+  assert.equal(randomEventDelay(() => 0), RANDOM_EVENT_MIN_MS);
+  assert.equal(randomEventDelay(() => 1), RANDOM_EVENT_MAX_MS);
+  assert.equal(randomEventType(() => 0.549), 'supply_drop');
+  assert.equal(randomEventType(() => 0.55), 'boss');
 });
 
 test('crafting costs are deterministic and do not accept partial payment', () => {

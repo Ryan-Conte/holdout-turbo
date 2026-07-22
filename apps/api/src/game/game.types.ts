@@ -123,6 +123,11 @@ export interface Enemy {
   respawnMs: number;
   lastAttackAt: number;
   lastHitAt: number;
+  eventId?: string;
+  bossName?: string;
+  damageMult?: number;
+  speedMult?: number;
+  aggroMult?: number;
 }
 
 export interface GameContainer {
@@ -134,6 +139,21 @@ export interface GameContainer {
   slots: InvSlot[];
   restockAt: number | null;
   lootTable?: string;
+  eventId?: string;
+  eventKind?: 'supply_drop' | 'boss_reward';
+}
+
+export interface RandomWorldEvent {
+  id: string;
+  type: 'supply_drop' | 'boss';
+  name: string;
+  x: number;
+  y: number;
+  radius: number;
+  startedAt: number;
+  expiresAt: number;
+  containerId?: string;
+  enemyId?: string;
 }
 
 export interface GroundItem {
@@ -213,6 +233,8 @@ export interface GameInstance {
   nodeRespawns: NodeRespawnState[];
   enemyRespawns: { x: number; y: number; kind: EnemyKind; at: number; respawnMs?: number }[];
   lastGroundSpawn: number;
+  randomEvents: Map<string, RandomWorldEvent>;
+  nextRandomEventAt: number;
   players: number;
   hideout?: HideoutData;
   structures: Map<number, { type: BuildType; hp: number; expiresAt: number; under?: number }>;
