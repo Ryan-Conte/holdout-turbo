@@ -218,10 +218,18 @@ export function PixelEditor() {
 
   const importSource = async () => {
     if (!asset?.source) return;
+    const count = asset.source.frames ?? 1;
+    if (
+      !window.confirm(
+        `Import ${count} placeholder frame${count === 1 ? "" : "s"} from ${asset.source.sheet}.png? This will replace all ${frames.length} editable frame${frames.length === 1 ? "" : "s"} currently in ${asset.name}.`,
+      )
+    ) {
+      setStatus(`Placeholder import cancelled for ${asset.name}`);
+      return;
+    }
     const image = new Image();
     image.src = `/sprites/${asset.source.sheet}.png`;
     await image.decode();
-    const count = asset.source.frames ?? 1;
     const imported: string[][] = [];
     for (let sourceFrame = 0; sourceFrame < count; sourceFrame++) {
       const scratch = window.document.createElement("canvas");

@@ -49,7 +49,7 @@ import {
 import { DamageFloat, RenderEnemy, RenderPlayer, Renderer } from '@/game/renderer';
 import { Tip, itemTip } from '@/components/Tooltip';
 import { loadSheets } from '@/game/sprites';
-import { initSfx, isMuted, sfx, startAmbient, toggleMute } from '@/game/sfx';
+import { initSfx, isMuted, sfx, startAmbient, stopAmbient, toggleMute } from '@/game/sfx';
 import { authClient } from '@/lib/auth-client';
 import { CookingPanel } from '@/components/game/CookingPanel';
 import { CraftingPanel } from '@/components/game/CraftingPanel';
@@ -273,6 +273,14 @@ export default function GameClient() {
   useEffect(() => {
     initSfx();
     setMuted(isMuted());
+    const unlockAmbient = () => startAmbient();
+    window.addEventListener('pointerdown', unlockAmbient, { once: true });
+    window.addEventListener('keydown', unlockAmbient, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlockAmbient);
+      window.removeEventListener('keydown', unlockAmbient);
+      stopAmbient();
+    };
   }, []);
 
   useEffect(() => { containerRef.current = container; }, [container]);

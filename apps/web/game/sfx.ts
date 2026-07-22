@@ -74,35 +74,91 @@ function configured(actionOrPreset: string, vol = 1): boolean {
   return true;
 }
 
-let ambientNodes: { src: AudioBufferSourceNode; gain: GainNode } | null = null;
+type AmbientGraph = {
+  master: GainNode;
+  sources: Array<AudioBufferSourceNode | OscillatorNode>;
+};
+
+let ambientNodes: AmbientGraph | null = null;
+
+function ambientNoise(ac: AudioContext, seconds: number, channels: number, smoothing: number, drive: number) {
+  const buffer = ac.createBuffer(channels, Math.ceil(ac.sampleRate * seconds), ac.sampleRate);
+  for (let channel = 0; channel < channels; channel++) {
+    const data = buffer.getChannelData(channel);
+    let value = 0;
+    for (let i = 0; i < data.length; i++) {
+      value = value * smoothing + (Math.random() * 2 - 1) * (1 - smoothing);
+      data[i] = Math.max(-1, Math.min(1, value * drive));
+    }
+  }
+  return buffer;
+}
 
 export function startAmbient() {
   const ac = audio();
   if (!ac || ambientNodes) return;
-  const seconds = 4;
-  const buffer = ac.createBuffer(1, ac.sampleRate * seconds, ac.sampleRate);
-  const data = buffer.getChannelData(0);
-  let last = 0;
-  for (let i = 0; i < data.length; i++) {
-    last = (last + (Math.random() * 2 - 1) * 0.02) * 0.98;
-    data[i] = last * 3;
-  }
-  const src = ac.createBufferSource();
-  src.buffer = buffer;
-  src.loop = true;
-  const filter = ac.createBiquadFilter();
-  filter.type = 'lowpass';
-  filter.frequency.value = 320;
-  const gain = ac.createGain();
-  gain.gain.value = 0.05;
-  src.connect(filter).connect(gain).connect(ac.destination);
-  src.start();
-  ambientNodes = { src, gain };
+
+  const now = ac.currentTime;
+  const master = ac.createGain();
+  master.gain.setValueAtTime(0.0001, now);
+  master.gain.exponentialRampToValueAtTime(1, now + 1.8);
+  master.connect(ac.destination);
+
+  // A wide, gently moving wind layer keeps the open world from feeling
+  // digitally silent without masking footsteps or distant combat cues.
+  const wind = ac.createBufferSource();
+  wind.buffer = ambientNoise(ac, 9.7, 2, 0.88, 2.2);
+  wind.loop = true;
+  const windHighpass = ac.createBiquadFilter();
+  windHighpass.type = 'highpass';
+  windHighpass.frequency.value = 70;
+  const windLowpass = ac.createBiquadFilter();
+  windLowpass.type = 'lowpass';
+  windLowpass.frequency.value = 1050;
+  windLowpass.Q.value = 0.55;
+  const windGain = ac.createGain();
+  windGain.gain.value = 0.055;
+  wind.connect(windHighpass).connect(windLowpass).connect(windGain).connect(master);
+
+  // A quieter low-frequency bed gives the ambience weight on headphones and
+  // small speakers. Its mismatched loop length prevents an obvious repetition.
+  const rumble = ac.createBufferSource();
+  rumble.buffer = ambientNoise(ac, 7.1, 1, 0.992, 7.5);
+  rumble.loop = true;
+  const rumbleFilter = ac.createBiquadFilter();
+  rumbleFilter.type = 'lowpass';
+  rumbleFilter.frequency.value = 210;
+  const rumbleGain = ac.createGain();
+  rumbleGain.gain.value = 0.032;
+  rumble.connect(rumbleFilter).connect(rumbleGain).connect(master);
+
+  // Very slow modulation creates soft gusts instead of a fixed noise floor.
+  const gust = ac.createOscillator();
+  gust.type = 'sine';
+  gust.frequency.value = 0.065;
+  const gustDepth = ac.createGain();
+  gustDepth.gain.value = 0.016;
+  gust.connect(gustDepth).connect(windGain.gain);
+
+  wind.start(now);
+  rumble.start(now);
+  gust.start(now);
+  ambientNodes = { master, sources: [wind, rumble, gust] };
 }
 
 export function stopAmbient() {
-  try { ambientNodes?.src.stop(); } catch { /* already stopped */ }
+  const graph = ambientNodes;
+  if (!graph) return;
   ambientNodes = null;
+  const ac = ctx;
+  const now = ac?.currentTime ?? 0;
+  graph.master.gain.cancelScheduledValues(now);
+  graph.master.gain.setValueAtTime(Math.max(0.0001, graph.master.gain.value), now);
+  graph.master.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+  for (const source of graph.sources) {
+    try { source.stop(now + 0.3); } catch { /* already stopped */ }
+  }
+  window.setTimeout(() => graph.master.disconnect(), 350);
 }
 
 export const sfx = {

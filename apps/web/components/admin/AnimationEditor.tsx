@@ -265,6 +265,12 @@ export function AnimationEditor() {
   const importSourceFrames = async () => {
     if (!selectedAsset) return;
     const frameCount = fallbackSourceFrameCount(selectedAsset);
+    if (selectedAsset.source && customFrames.length > 0 && !window.confirm(
+      `Reimport ${frameCount} placeholder frame${frameCount === 1 ? '' : 's'} from ${selectedAsset.source.sheet}.png? This will replace all ${customFrames.length} editable frame${customFrames.length === 1 ? '' : 's'} currently in ${selectedAsset.name}.`,
+    )) {
+      setStatus(`Placeholder import cancelled for ${selectedAsset.name}`);
+      return;
+    }
     const imported: string[][] = [];
     if (selectedAsset.source) {
       const image = await loadSheet(selectedAsset.source.sheet);
@@ -475,7 +481,8 @@ export function AnimationEditor() {
                 onPointerUp={(event) => { lastPixelRef.current = -1; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }}
                 onContextMenu={(event) => event.preventDefault()}
               />
-              {customFrames.length === 0 ? <button className="animation-import-art" disabled={!selectedAsset} onClick={() => void importSourceFrames()}>{selectedAsset?.source ? 'IMPORT PLACEHOLDER FRAMES TO EDIT' : 'CREATE EDITABLE FRAME'}</button> : <>
+              {selectedAsset?.source ? <button className="animation-import-art" onClick={() => void importSourceFrames()}>{customFrames.length ? 'REIMPORT PLACEHOLDER FRAMES (OVERWRITES ART)' : 'IMPORT PLACEHOLDER FRAMES TO EDIT'}</button> : customFrames.length === 0 ? <button className="animation-import-art" disabled={!selectedAsset} onClick={() => void importSourceFrames()}>CREATE EDITABLE FRAME</button> : null}
+              {customFrames.length > 0 ? <>
                 <div className="animation-pixel-tools">
                   {(['pencil', 'eraser', 'fill', 'dropper'] as PixelTool[]).map((tool) => <button key={tool} className={pixelTool === tool ? 'active' : ''} onClick={() => setPixelTool(tool)}>{tool.toUpperCase()}</button>)}
                   <button onClick={undoPixel}>UNDO</button>
@@ -483,7 +490,7 @@ export function AnimationEditor() {
                 </div>
                 <div className="animation-color-row"><input type="color" value={pickerRgb} onChange={(event) => setPixelColor(`${event.target.value}${pixelColor.slice(7, 9) || 'ff'}`)} /><input value={pixelColor} onChange={(event) => setPixelColor(event.target.value)} onBlur={() => setPixelColor(validRgba(pixelColor))} /></div>
                 <div className="animation-mini-palette">{sprites.palette.slice(0, 18).map((color) => <button key={color} className={validRgba(pixelColor) === color ? 'active' : ''} style={{ background: color }} onClick={() => setPixelColor(color)} title={color} />)}</div>
-              </>}
+              </> : null}
             </aside>
           </div>
 
