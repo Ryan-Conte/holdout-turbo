@@ -114,12 +114,28 @@ type DragZone = 'inv' | 'cont' | 'helmet' | 'vest' | 'mod' | 'weapon';
 interface DragState { zone: DragZone; index: number; item: ItemId; qty: number }
 interface CtxMenu { x: number; y: number; zone: DragZone; index: number; item: ItemId; qty: number }
 interface PendingPredictedInput { seq: number; at: number; input: InputPayload }
+type MovementDirections = Pick<InputPayload, 'up' | 'down' | 'left' | 'right'>;
 
 const MAX_PENDING_INPUTS = 80;
 const HARD_RECONCILE_DISTANCE = TILE * 4;
+const TOUCH_MOVE_DIRECTION_THRESHOLD = 0.22;
 
 function movementIntentKey(input: InputPayload): string {
   return `${Number(Boolean(input.up))}${Number(Boolean(input.down))}${Number(Boolean(input.left))}${Number(Boolean(input.right))}${Number(Boolean(input.sprint))}`;
+}
+
+function localMovementDirections(
+  keyboard: MovementDirections,
+  touch: { x: number; y: number },
+  locked: boolean,
+): MovementDirections {
+  if (locked) return { up: false, down: false, left: false, right: false };
+  return {
+    up: keyboard.up || touch.y < -TOUCH_MOVE_DIRECTION_THRESHOLD,
+    down: keyboard.down || touch.y > TOUCH_MOVE_DIRECTION_THRESHOLD,
+    left: keyboard.left || touch.x < -TOUCH_MOVE_DIRECTION_THRESHOLD,
+    right: keyboard.right || touch.x > TOUCH_MOVE_DIRECTION_THRESHOLD,
+  };
 }
 
 export default function GameClient() {
@@ -142,7 +158,6 @@ export default function GameClient() {
   const touchMoveRef = useRef({ x: 0, y: 0, active: false, sprint: false });
   const touchAimRef = useRef({ x: 1, y: 0, hasDirection: false, firing: false });
   const mouse = useRef({ x: 0, y: 0, down: false });
-  const mouseSeenRef = useRef(false);
   const sendInputNowRef = useRef<() => void>(() => undefined);
   const inputSeqRef = useRef(0);
   const lastInputRef = useRef<InputPayload>({ up: false, down: false, left: false, right: false, angle: 0, shoot: false });
@@ -1049,7 +1064,6 @@ export default function GameClient() {
     const onMouseMove = (e: MouseEvent) => {
       mouse.current.x = e.clientX;
       mouse.current.y = e.clientY;
-      mouseSeenRef.current = true;
       const touchGenerated = (e as MouseEvent & { sourceCapabilities?: { firesTouchEvents?: boolean } }).sourceCapabilities?.firesTouchEvents === true;
       if (!touchGenerated) touchAimRef.current.hasDirection = false;
       if (dragRef.current) setDragPos({ x: e.clientX, y: e.clientY });
@@ -1143,12 +1157,7 @@ export default function GameClient() {
         : Math.atan2(mouse.current.y - window.innerHeight / 2, mouse.current.x - window.innerWidth / 2);
       // menus freeze you in place (and stop attacks)
       const locked = panelsOpenRef.current;
-      const dirs = locked ? { up: false, down: false, left: false, right: false } : {
-        up: keys.current.up || touchMove.y < -0.22,
-        down: keys.current.down || touchMove.y > 0.22,
-        left: keys.current.left || touchMove.x < -0.22,
-        right: keys.current.right || touchMove.x > 0.22,
-      };
+      const dirs = localMovementDirections(keys.current, touchMove, locked);
       const moving = !locked && (dirs.up || dirs.down || dirs.left || dirs.right);
       const input: InputPayload = {
         ...dirs,
@@ -1244,15 +1253,13 @@ export default function GameClient() {
         if (!predictedPosRef.current) predictedPosRef.current = { x: self.x, y: self.y };
         if (!self.dead) {
           const locked = panelsOpenRef.current;
+          const localDirections = localMovementDirections(keys.current, touchMoveRef.current, locked);
           const beforePrediction = predictedPosRef.current;
           const predicted = predictMovement(beforePrediction, {
-            up: !locked && keys.current.up,
-            down: !locked && keys.current.down,
-            left: !locked && keys.current.left,
-            right: !locked && keys.current.right,
+            ...localDirections,
             angle: lastInputRef.current.angle,
             shoot: false,
-            sprint: !locked && sprintRef.current,
+            sprint: !locked && (sprintRef.current || touchMoveRef.current.sprint),
           }, dt);
           const velocityBlend = 1 - Math.exp(-18 * dt);
           const rawVelocity = dt > 0
@@ -1292,13 +1299,12 @@ export default function GameClient() {
       const players: RenderPlayer[] = snap.players.map((p) => {
         if (p.id === youRef.current && predictedPosRef.current) {
           const locked = panelsOpenRef.current;
-          const localDx = locked ? 0 : (keys.current.right ? 1 : 0) - (keys.current.left ? 1 : 0);
-          const localDy = locked ? 0 : (keys.current.down ? 1 : 0) - (keys.current.up ? 1 : 0);
+          const localDirections = localMovementDirections(keys.current, touchMoveRef.current, locked);
+          const localDx = (localDirections.right ? 1 : 0) - (localDirections.left ? 1 : 0);
+          const localDy = (localDirections.down ? 1 : 0) - (localDirections.up ? 1 : 0);
           const moving = !p.dead && Boolean(localDx || localDy);
-          const angle = mouseSeenRef.current
-            ? Math.atan2(mouse.current.y - window.innerHeight / 2, mouse.current.x - window.innerWidth / 2)
-            : p.angle;
-          const facing = moving ? Math.atan2(localDy, localDx) : mouse.current.down ? angle : p.facing;
+          const angle = lastInputRef.current.angle ?? p.angle;
+          const facing = moving ? Math.atan2(localDy, localDx) : lastInputRef.current.shoot ? angle : p.facing;
           return {
             ...p,
             x: predictedPosRef.current.x,
