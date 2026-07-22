@@ -212,6 +212,15 @@ export class Renderer {
   private stationFuel: Map<number, number>;
   private gameplayItems: RuntimeItemRegistry = ITEMS as unknown as RuntimeItemRegistry;
 
+  /** Keep roughly the same useful field of view from phones through desktop. */
+  fitViewport(width: number, height: number) {
+    const safeWidth = Math.max(320, Number.isFinite(width) ? width : 320);
+    const safeHeight = Math.max(240, Number.isFinite(height) ? height : 240);
+    const horizontalZoom = safeWidth / (TILE * 22);
+    const verticalZoom = safeHeight / (TILE * 11);
+    this.zoom = Math.max(0.9, Math.min(2, horizontalZoom, verticalZoom));
+  }
+
   constructor(
     private tiles: Uint8Array,
     private w: number,
@@ -241,10 +250,21 @@ export class Renderer {
     this.unders = new Map(Object.entries(unders).map(([k, v]) => [Number(k), v]));
     if (this.elevations.length !== w * h) this.elevations = new Uint8Array(w * h);
     this.buildVisualFrames();
-    this.mapCanvas = w <= 512 && h <= 512 ? document.createElement("canvas") : null;
-    if (this.mapCanvas) {
-      this.mapCanvas.width = w * TILE;
-      this.mapCanvas.height = h * TILE;
+    // iOS Safari silently produces a blank/invalid 2D canvas when a world-sized
+    // cache exceeds its dimension or pixel budget. Only cache genuinely small
+    // instances; large worlds are drawn from the visible tile window each frame.
+    const mapPixelWidth = w * TILE;
+    const mapPixelHeight = h * TILE;
+    const canCacheWholeMap = mapPixelWidth <= 4096
+      && mapPixelHeight <= 4096
+      && mapPixelWidth * mapPixelHeight <= 16_777_216;
+    if (canCacheWholeMap) {
+      const candidate = document.createElement('canvas');
+      candidate.width = mapPixelWidth;
+      candidate.height = mapPixelHeight;
+      this.mapCanvas = candidate.getContext('2d') ? candidate : null;
+    } else {
+      this.mapCanvas = null;
     }
     this.miniCanvas = document.createElement("canvas");
     this.nightCanvas = document.createElement("canvas");
@@ -764,6 +784,7 @@ export class Renderer {
     ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
     const frame = terrain ? this.visualFrames.get(terrain.spriteId)?.[0] : undefined;
     if (frame) ctx.drawImage(frame, tx * TILE, ty * TILE, TILE, TILE);
+    else this.drawBaseTile(ctx, tx, ty);
   }
 
   private drawFoundationLayer(ctx: CanvasRenderingContext2D, tx: number, ty: number) {

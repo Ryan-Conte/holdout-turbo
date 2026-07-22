@@ -685,7 +685,9 @@ export default function GameClient() {
         const elevations = init.elevations.length === cellCount ? Uint8Array.from(init.elevations) : decodeByteRuns(init.elevationRuns, cellCount, 0);
         sfx.applyContent(visuals.sounds);
         const terrainKinds = { ...decodeTerrainRuns(init.terrainRuns, cellCount), ...(init.terrainKinds ?? {}) };
-        rendererRef.current = new Renderer(tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {}, elevations, visuals, terrainKinds, init.resourceKinds ?? {}, init.blockKinds ?? {}, init.blockRotations ?? {}, init.openDoors ?? [], init.stationFuel ?? {}, init.gameplay, (soundId, volume) => sfx.play(soundId, volume));
+        const renderer = new Renderer(tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {}, elevations, visuals, terrainKinds, init.resourceKinds ?? {}, init.blockKinds ?? {}, init.blockRotations ?? {}, init.openDoors ?? [], init.stationFuel ?? {}, init.gameplay, (soundId, volume) => sfx.play(soundId, volume));
+        renderer.fitViewport(window.innerWidth, window.innerHeight);
+        rendererRef.current = renderer;
         updateWorldMapView({ centerX: init.width / 2, centerY: init.height / 2, zoom: WORLD_MAP_DEFAULT_ZOOM });
         motionSamplesRef.current = [];
         seenProjectiles.current.clear();
@@ -1235,6 +1237,7 @@ export default function GameClient() {
     const resize = () => {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
+      rendererRef.current?.fitViewport(canvas.width, canvas.height);
     };
     resize();
     window.addEventListener('resize', resize);

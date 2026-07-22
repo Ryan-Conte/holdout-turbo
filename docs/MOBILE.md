@@ -35,9 +35,17 @@ Every player-facing feature must satisfy this checklist before it is considered 
 
 - Reserve the lower-left and lower-right corners for the two sticks. Do not place alerts, dialogs or inventory controls under them.
 - Keep the hotbar centered at the bottom and the utility bar in the upper-right safe area.
+- Camera zoom must fit the usable viewport rather than assuming the desktop `2x` scale. The play renderer targets about 22 horizontal by 11 vertical tiles, clamped from `0.9x` to `2x`, so Safari browser chrome does not leave tablet players with a five-tile-high view.
 - The compact mobile HUD shows survival/combat essentials. The minimap, objective list, kill feed and redundant status chips may be hidden; the full map and panels remain accessible through the utility bar.
 - Full-screen panels should use internal scrolling and 44px controls. Inventory uses horizontally scrollable equipment columns so slot sizes remain usable instead of shrinking to illegibility.
 - Portrait is a blocked transitional state, not an alternative gameplay layout.
+
+## Safari canvas limits
+
+- Never allocate a full-world canvas based only on tile dimensions. iOS Safari may return a blank or unusable context when either dimension exceeds 4096 pixels or total area exceeds 16,777,216 pixels.
+- Whole-map prerendering is limited to that conservative dimension and pixel budget. Larger worlds draw only the visible tile window each frame.
+- Every authored terrain cell must retain the checked-in tile sheet as a fallback when its published database frame is absent or temporarily unavailable. A missing runtime frame must never become a black world.
+- Keep the main game canvas at CSS-pixel resolution unless a measured device-pixel-ratio change also includes an explicit memory budget; a full Retina backing store can exceed mobile canvas memory quickly.
 
 ## Regression matrix
 
@@ -48,6 +56,7 @@ Run the web typecheck/build and manually verify at least:
 | 390x844, coarse pointer | Portrait gate blocks the game and offers landscape/fullscreen retry. |
 | 844x390, coarse pointer | Both sticks, action cluster and utility controls fit safe areas without overlap. |
 | 667x375, coarse pointer | HUD remains readable; panels scroll and **Back to zone** stays reachable. |
+| 1024x360, Safari-like landscape | Terrain remains textured and the responsive camera shows roughly 22x11 tiles despite browser chrome. |
 | 1440x900, fine pointer | Desktop keyboard/mouse HUD is unchanged and mobile controls are hidden. |
 
 Also verify simultaneous left/right stick capture, movement release on panel open or app blur, aim/fire release, interact/reload/heal, chat keyboard behavior, inventory touch actions, map pan/zoom controls, and rotation during an active session.
