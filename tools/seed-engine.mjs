@@ -131,7 +131,7 @@ const sprites = {
       width: 16,
       height: 16,
       pixels: [],
-      source: { sheet: "chars", col: 0, row, frames: 2 },
+      source: { sheet: "chars", col: 0, row, frames: 4 },
     })),
     {
       id: "character:brute",
@@ -139,7 +139,7 @@ const sprites = {
       width: 16,
       height: 16,
       pixels: [],
-      source: { sheet: "chars", col: 0, row: 8, frames: 2 },
+      source: { sheet: "chars", col: 0, row: 8, frames: 4 },
     },
     resourceAsset("tree", "Common tree", 10, 32, 32),
     resourceAsset("ironwood", "Ironwood tree", 10, 32, 32),
@@ -200,9 +200,9 @@ const sprites = {
 
 const defaultClips = {
   idle: { frames: [0], frameMs: 500, loop: true },
-  walk: { frames: [0, 1], frameMs: 125, loop: true },
-  attack: { frames: [1, 0], frameMs: 110, loop: false },
-  hit: { frames: [1, 0], frameMs: 90, loop: false },
+  walk: { frames: [1, 2, 3, 2], frameMs: 105, loop: true },
+  attack: { frames: [0, 1, 2, 0], frameMs: 90, loop: false },
+  hit: { frames: [3, 0], frameMs: 80, loop: false },
   death: { frames: [1], frameMs: 400, loop: false },
 };
 

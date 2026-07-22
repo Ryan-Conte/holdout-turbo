@@ -41,8 +41,13 @@ function assetFrames(asset?: PixelAsset): string[][] {
   return Array.isArray(asset.pixels) && asset.pixels.length === size ? [asset.pixels] : [];
 }
 
+function fallbackSourceFrameCount(asset?: PixelAsset): number {
+  const configured = asset?.source?.frames ?? 1;
+  return asset?.source?.sheet === 'chars' ? Math.max(4, configured) : configured;
+}
+
 function availableFrames(asset?: PixelAsset): number {
-  return Math.max(1, assetFrames(asset).length || asset?.source?.frames || 1);
+  return Math.max(1, assetFrames(asset).length || fallbackSourceFrameCount(asset));
 }
 
 function loadSheet(sheet: string): Promise<HTMLImageElement> {
@@ -78,7 +83,7 @@ async function drawAssetFrame(canvas: HTMLCanvasElement, asset: PixelAsset | und
   }
   if (!asset?.source) return;
   const image = await loadSheet(asset.source.sheet);
-  const sourceFrame = Math.max(0, Math.min((asset.source.frames ?? 1) - 1, frameIndex));
+  const sourceFrame = Math.max(0, Math.min(fallbackSourceFrameCount(asset) - 1, frameIndex));
   context.drawImage(
     image,
     (asset.source.col + sourceFrame) * 16,
@@ -259,7 +264,7 @@ export function AnimationEditor() {
 
   const importSourceFrames = async () => {
     if (!selectedAsset) return;
-    const frameCount = selectedAsset.source?.frames ?? 1;
+    const frameCount = fallbackSourceFrameCount(selectedAsset);
     const imported: string[][] = [];
     if (selectedAsset.source) {
       const image = await loadSheet(selectedAsset.source.sheet);

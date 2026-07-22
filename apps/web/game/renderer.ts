@@ -2,7 +2,6 @@ import {
   BLOCKS_BULLET,
   BLOCKS_MOVE,
   DEFAULT_TERRAIN_ID_BY_TILE,
-  DEFAULT_CHARACTER_APPEARANCE,
   ContainerSnap,
   EntityDeathSnap,
   EnemySnap,
@@ -22,7 +21,6 @@ import {
   TILE,
   Tile,
 } from "@holdout/shared";
-import { drawCharacterAppearance } from "./character-appearance";
 import { CHAR_ROWS, ITEM_INDEX, Sheets } from "./sprites";
 import { runtimePixelVisible } from "@/lib/runtime-visuals";
 
@@ -46,11 +44,15 @@ function hashStr(s: string): number {
 export interface RenderPlayer extends PlayerSnap {
   dx: number;
   dy: number;
+  vx: number;
+  vy: number;
 }
 
 export interface RenderEnemy extends EnemySnap {
   dx: number;
   dy: number;
+  vx: number;
+  vy: number;
 }
 
 export interface DamageFloat {
@@ -109,6 +111,12 @@ interface Flash {
   angle: number;
   t0: number;
 }
+interface ProjectileImpact {
+  x: number;
+  y: number;
+  angle: number;
+  t0: number;
+}
 interface FallingTree {
   tx: number;
   ty: number;
@@ -121,6 +129,7 @@ interface Corpse {
   row: number;
   target?: string;
   t0: number;
+  dir: number;
 }
 
 interface NightLight {
@@ -172,6 +181,8 @@ export class Renderer {
 
   private particles: Particle[] = [];
   private flashes: Flash[] = [];
+  private projectileImpacts: ProjectileImpact[] = [];
+  private retiredProjectiles = new Map<number, number>();
   // LOS fog cache: recomputed when the player crosses a tile or the map changes
   private fogKey = "";
   private fogVersion = 0;
@@ -187,6 +198,10 @@ export class Renderer {
   private predictedShots: { angle: number; t0: number }[] = [];
   private localMeleeAt = -Infinity;
   private localMeleeSuppressUntil = -Infinity;
+  private doorProgress = new Map<number, number>();
+  private facingDirections = new Map<string, -1 | 1>();
+  private motionTransitions = new Map<string, { moving: boolean; changedAt: number }>();
+  private reducedMotion = false;
 
   private unders: Map<number, number>;
   private visualFrames = new Map<string, HTMLCanvasElement[]>();
@@ -219,6 +234,8 @@ export class Renderer {
     private onSound?: (soundId: string, volume: number) => void,
   ) {
     this.openDoors = new Set(initialOpenDoors);
+    this.doorProgress = new Map(initialOpenDoors.map((index) => [index, 1]));
+    this.reducedMotion = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
     this.stationFuel = new Map(Object.entries(initialStationFuel).map(([key, fuel]) => [Number(key), Math.max(0, Number(fuel) || 0)]));
     if (gameplay?.items) this.gameplayItems = { ...(ITEMS as unknown as RuntimeItemRegistry), ...gameplay.items };
     this.unders = new Map(Object.entries(unders).map(([k, v]) => [Number(k), v]));
@@ -278,7 +295,10 @@ export class Renderer {
     else delete this.blockRotations[String(index)];
     if (!blockId || open === false) this.openDoors.delete(index);
     else if (open === true) this.openDoors.add(index);
-    if (!blockId) this.stationFuel.delete(index);
+    if (!blockId) {
+      this.stationFuel.delete(index);
+      this.doorProgress.delete(index);
+    }
     const context = this.miniCanvas.getContext('2d');
     if (!context) return;
     const x = index % this.w; const y = Math.floor(index / this.w);
@@ -320,6 +340,7 @@ export class Renderer {
       row: death.fallbackRow,
       target: death.target,
       t0: this.lastTime,
+      dir: hash2(Math.floor(death.x), Math.floor(death.y)) < 0.5 ? -1 : 1,
     });
     this.burst(death.x, death.y, ["#a83232", "#7c1f1f"], 12, 70);
     if (death.target.startsWith('mob:')) {
@@ -334,7 +355,7 @@ export class Renderer {
     if (clip?.keyframes?.length) {
       const keyframes = clip.keyframes;
       const totalMs = keyframes.reduce((sum, keyframe) => sum + Math.max(16, keyframe.durationMs), 0);
-      const shifted = Math.max(0, elapsedMs + (clip.loop === false ? 0 : seed * 17));
+      const shifted = Math.max(0, elapsedMs + (clip.loop === false || state === 'walk' ? 0 : seed * 17));
       const phase = clip.loop === false ? Math.min(totalMs - 1, shifted) : shifted % totalMs;
       let elapsed = 0;
       let at = keyframes.length - 1;
@@ -354,10 +375,71 @@ export class Renderer {
       return Math.max(0, Math.min(totalFrames - 1, keyframes[at].frame));
     }
     const sequence = clip?.frames?.length ? clip.frames : state === 'walk' ? [0, 1] : [0];
-    const phaseMs = clip?.loop === false ? elapsedMs : elapsedMs + seed * 17;
+    const phaseMs = clip?.loop === false || state === 'walk' ? elapsedMs : elapsedMs + seed * 17;
     const step = Math.max(0, Math.floor(phaseMs / Math.max(16, clip?.frameMs ?? 125)));
     const at = clip?.loop === false ? Math.min(sequence.length - 1, step) : step % sequence.length;
     return Math.max(0, Math.min(totalFrames - 1, sequence[at] ?? 0));
+  }
+
+  private sheetAnimationFrame(target: string, state: EntityAnimationState, elapsedMs: number, seed: number): number {
+    if (state === 'walk') {
+      const clip = this.visuals.animations?.[target]?.clips?.walk;
+      const frameMs = Math.max(55, clip?.frameMs ?? 105);
+      const step = Math.floor(Math.max(0, elapsedMs) / frameMs);
+      return [1, 2, 3, 2][step % 4];
+    }
+    return this.animationFrame(target, state, elapsedMs, seed, 4);
+  }
+
+  private facesLeft(id: string, angle: number): boolean {
+    const horizontal = Math.cos(angle);
+    let direction = this.facingDirections.get(id);
+    if (!direction) direction = horizontal < 0 ? -1 : 1;
+    else if (direction === 1 && horizontal < -0.14) direction = -1;
+    else if (direction === -1 && horizontal > 0.14) direction = 1;
+    this.facingDirections.set(id, direction);
+    return direction === -1;
+  }
+
+  private motionPose(id: string, moving: boolean, time: number, seed: number, vx: number, vy: number, hitElapsed = Infinity) {
+    const previous = this.motionTransitions.get(id);
+    if (!previous || previous.moving !== moving) this.motionTransitions.set(id, { moving, changedAt: time });
+    const transition = this.motionTransitions.get(id)!;
+    const transitionAge = Math.max(0, time - transition.changedAt);
+    const speed = Math.hypot(vx, vy);
+
+    if (this.reducedMotion) {
+      const hitShake = hitElapsed < 150 ? Math.sin(hitElapsed * 0.13) * (1 - hitElapsed / 150) : 0;
+      return { x: hitShake, y: 0, shadowScale: 1, lean: 0, animationElapsedMs: moving ? transitionAge * 1000 : time * 1000 };
+    }
+
+    const cadence = Math.min(12, 8.2 + speed * 0.018);
+    const phase = moving
+      ? transitionAge * cadence
+      : time * cadence + (seed % 997) * 0.031;
+    const moveBlend = moving ? easeOutCubic(Math.min(1, transitionAge / 0.14)) : 0;
+    const stride = Math.sin(phase);
+    const bob = moving
+      ? (1 - Math.cos(phase * 2)) * 0.68 * moveBlend
+      : Math.sin(time * 2.1 + (seed % 211) * 0.07) * 0.2;
+    const sway = moving ? stride * 0.55 * moveBlend : 0;
+    const startLean = moving && transitionAge < 0.18
+      ? Math.sin((transitionAge / 0.18) * Math.PI) * 0.026
+      : 0;
+    const stopSettle = !moving && transitionAge < 0.22
+      ? Math.sin((transitionAge / 0.22) * Math.PI * 2) * (1 - transitionAge / 0.22) * 0.7
+      : 0;
+    const hitShake = hitElapsed < 180 ? Math.sin(hitElapsed * 0.12) * (1 - hitElapsed / 180) * 1.8 : 0;
+    const directionLean = moving && speed > 1
+      ? Math.max(-0.025, Math.min(0.025, vx / 5000)) * moveBlend
+      : 0;
+    return {
+      x: sway + hitShake,
+      y: -bob + stopSettle,
+      shadowScale: Math.max(0.86, 1 - bob * 0.045),
+      lean: startLean * Math.sign(vx || Math.cos(phase)) + directionLean,
+      animationElapsedMs: moving ? transitionAge * 1000 : time * 1000,
+    };
   }
 
   private drawResourceSprite(ctx: CanvasRenderingContext2D, spriteId: string | undefined, x: number, y: number, shakeX: number): boolean {
@@ -376,11 +458,12 @@ export class Renderer {
       const width = frame.width * 2 * block.scale;
       const height = frame.height * 2 * block.scale;
       const quarterTurn = ((rotation % 4) + 4) % 4;
-      const renderedHeight = quarterTurn % 2 ? width : height;
+      const angle = quarterTurn * Math.PI / 2;
+      const renderedHeight = Math.abs(Math.sin(angle)) * width + Math.abs(Math.cos(angle)) * height;
       ctx.imageSmoothingEnabled = false;
       ctx.save();
       ctx.translate(x, y - renderedHeight / 2 - block.offsetY);
-      ctx.rotate(quarterTurn * Math.PI / 2);
+      ctx.rotate(angle);
       ctx.drawImage(frame, -width / 2, -height / 2, width, height);
       ctx.restore();
       return;
@@ -849,6 +932,16 @@ export class Renderer {
 
   /** Server hit event → shakes, particles. */
   hitFx(h: HitSnap) {
+    if (h.projectileId !== undefined) {
+      const now = this.lastTime || performance.now() / 1000;
+      this.retiredProjectiles.set(h.projectileId, now + 0.25);
+      this.projectileImpacts.push({
+        x: h.x,
+        y: h.y,
+        angle: h.projectileAngle ?? 0,
+        t0: now,
+      });
+    }
     if (h.kind === "node") {
       const tx = Math.floor(h.x / TILE);
       const ty = Math.floor(h.y / TILE);
@@ -892,6 +985,9 @@ export class Renderer {
     this.lastTime = view.time;
 
     const you = view.players.find((p) => p.id === view.youId);
+    const activeEntities = new Set([...view.players.map((player) => player.id), ...view.enemies.map((enemy) => enemy.id)]);
+    for (const id of this.motionTransitions.keys()) if (!activeEntities.has(id)) this.motionTransitions.delete(id);
+    for (const id of this.facingDirections.keys()) if (!activeEntities.has(id)) this.facingDirections.delete(id);
     let camX = you ? you.dx : (this.w * TILE) / 2;
     let camY = you ? you.dy : (this.h * TILE) / 2;
     // recoil kick: nudge the camera opposite the last shot
@@ -927,11 +1023,25 @@ export class Renderer {
         this.drawVisibleGround(ctx, minX, minY, maxX, maxY);
       }
     }
+    if (!this.reducedMotion) {
+      this.drawAmbientTerrain(
+        ctx,
+        Math.max(0, Math.floor(sx / TILE)),
+        Math.max(0, Math.floor(sy / TILE)),
+        Math.min(this.w - 1, Math.ceil((sx + sw) / TILE)),
+        Math.min(this.h - 1, Math.ceil((sy + sh) / TILE)),
+        view.time,
+      );
+    }
 
     // muzzle flashes + gunfeel from newly-seen projectiles
     const seen = new Set<number>();
     const predictedBursts: number[] = [];
+    for (const [id, expiresAt] of this.retiredProjectiles) {
+      if (expiresAt <= view.time) this.retiredProjectiles.delete(id);
+    }
     for (const pr of view.projectiles) {
+      if (this.retiredProjectiles.has(pr.id)) continue;
       seen.add(pr.id);
       if (!this.prevProj.has(pr.id)) {
         const nearYou = Boolean(you && Math.hypot(pr.x - you.dx, pr.y - you.dy) < 120);
@@ -982,6 +1092,7 @@ export class Renderer {
           row: hashStr(p.name) % CHAR_ROWS.survivorCount,
           target: 'player',
           t0: view.time,
+          dir: hashStr(p.id) % 2 ? -1 : 1,
         });
         this.burst(p.dx, p.dy, ["#a83232", "#7c1f1f"], 14, 80);
       }
@@ -1012,17 +1123,17 @@ export class Renderer {
     // corpses under everything alive
     this.corpses = this.corpses.filter((c) => view.time - c.t0 < 2);
     for (const c of this.corpses) {
-      const age = (view.time - c.t0) / 2;
+      const elapsed = view.time - c.t0;
+      const fall = easeOutCubic(Math.min(1, elapsed / 0.34));
+      const fade = Math.max(0, Math.min(1, (elapsed - 1.15) / 0.85));
       ctx.save();
-      ctx.globalAlpha = 0.8 * (1 - age);
+      ctx.globalAlpha = 0.88 * (1 - fade);
+      ctx.translate(c.x, c.y + fall * 6);
+      ctx.rotate(c.dir * fall * Math.PI / 2);
       const custom = c.target
-        ? this.drawEngineSprite(ctx, c.target, 'death', (view.time - c.t0) * 1000, 0, c.x, c.y)
+        ? this.drawEngineSprite(ctx, c.target, 'death', elapsed * 1000, 0, 0, 0)
         : false;
-      if (!custom) {
-        ctx.translate(c.x, c.y + 6);
-        ctx.rotate(Math.PI / 2);
-        this.blitChar(ctx, c.row, 0, -16, -16);
-      }
+      if (!custom) this.blitChar(ctx, c.row, 0, -16, -16);
       ctx.restore();
     }
 
@@ -1117,14 +1228,35 @@ export class Renderer {
           const cx = tx * TILE + TILE / 2;
           const by = ty * TILE + TILE;
           const index = ty * this.w + tx;
-          const rotation = (this.blockRotations[String(index)] ?? 0) + (this.openDoors.has(index) && block.playerPlacement?.buildType === 'door' ? 1 : 0);
+          let door = this.doorProgress.get(index) ?? (this.openDoors.has(index) ? 1 : 0);
+          if (block.playerPlacement?.buildType === 'door') {
+            const target = this.openDoors.has(index) ? 1 : 0;
+            door += (target - door) * (1 - Math.exp(-13 * dt));
+            if (Math.abs(target - door) < 0.002) door = target;
+            this.doorProgress.set(index, door);
+          } else {
+            door = 0;
+            this.doorProgress.delete(index);
+          }
+          const rotation = (this.blockRotations[String(index)] ?? 0) + door;
           drawables.push({ y: by, fn: () => this.drawWorldBlock(ctx, blockId, cx, by, rotation) });
+        }
+        const stationKind = block?.playerPlacement?.buildType
+          ?? (t === Tile.Torch ? 'torch' : t === Tile.Firepit ? 'firepit' : t === Tile.Furnace ? 'furnace' : undefined);
+        if (
+          (stationKind === 'torch' || stationKind === 'firepit' || stationKind === 'furnace')
+          && (stationKind === 'torch' || (this.stationFuel.get(ty * this.w + tx) ?? 0) > 0)
+        ) {
+          const cx = tx * TILE + TILE / 2;
+          const by = ty * TILE + TILE;
+          drawables.push({ y: by + 0.01, fn: () => this.drawStationFx(ctx, stationKind, cx, by, view.time, ty * this.w + tx) });
         }
       }
 
     this.falling = this.falling.filter((f) => view.time - f.t0 < 0.7);
     for (const f of this.falling) {
       const t01 = (view.time - f.t0) / 0.7;
+      const fall = easeInCubic(Math.min(1, t01));
       const cx = f.tx * TILE + TILE / 2;
       const by = f.ty * TILE + TILE - 2;
       drawables.push({
@@ -1134,8 +1266,8 @@ export class Renderer {
             ctx,
             cx,
             by,
-            f.dir * t01 * t01 * (Math.PI / 2),
-            1 - t01 * t01,
+            f.dir * fall * (Math.PI / 2),
+            1 - fall * 0.92,
           ),
       });
     }
@@ -1163,7 +1295,25 @@ export class Renderer {
     drawables.sort((a, b) => a.y - b.y);
     for (const d of drawables) d.fn();
 
-    for (const pr of view.projectiles) this.drawProjectile(ctx, pr);
+    for (const pr of view.projectiles) {
+      if (!this.retiredProjectiles.has(pr.id)) this.drawProjectile(ctx, pr);
+    }
+
+    // Close the tracer at the authoritative collision point instead of holding
+    // its final network sample while the hit effect is already playing.
+    this.projectileImpacts = this.projectileImpacts.filter((impact) => view.time - impact.t0 < 0.1);
+    for (const impact of this.projectileImpacts) {
+      const age = Math.max(0, view.time - impact.t0);
+      ctx.save();
+      ctx.translate(impact.x, impact.y);
+      ctx.rotate(impact.angle);
+      ctx.globalAlpha = 1 - age / 0.1;
+      ctx.fillStyle = "#fff3bd";
+      ctx.fillRect(-10, -1, 10, 2);
+      ctx.fillStyle = "#e5a640";
+      ctx.fillRect(-3, -2, 3, 4);
+      ctx.restore();
+    }
 
     // flashes
     this.flashes = this.flashes.filter((f) => view.time - f.t0 < 0.08);
@@ -1207,13 +1357,19 @@ export class Renderer {
           }
       }
       ctx.save();
-      ctx.fillStyle = "rgba(6, 8, 12, 0.42)";
+      ctx.beginPath();
       for (const i of this.fogBlocked) {
         const tx = i % this.w;
         const ty = Math.floor(i / this.w);
         if (tx < tMinX || tx > tMaxX || ty < tMinY || ty > tMaxY) continue;
-        ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+        ctx.rect(tx * TILE, ty * TILE, TILE, TILE);
       }
+      ctx.filter = 'blur(4px)';
+      ctx.fillStyle = "rgba(6, 8, 12, 0.31)";
+      ctx.fill();
+      ctx.filter = 'none';
+      ctx.fillStyle = "rgba(6, 8, 12, 0.13)";
+      ctx.fill();
       ctx.restore();
     }
 
@@ -1512,11 +1668,13 @@ export class Renderer {
       }
       ctx.fillText(label, x, y - marker - 4);
     }
-    for (const tr of this.traders) {
-      const { x, y } = point(tr.x, tr.y);
-      const marker = detailed ? 4 : 1.5;
-      ctx.fillStyle = "#d8c26a";
-      ctx.fillRect(x - marker, y - marker, marker * 2, marker * 2);
+    if (detailed) {
+      for (const tr of this.traders) {
+        const { x, y } = point(tr.x, tr.y);
+        const marker = 4;
+        ctx.fillStyle = "#d8c26a";
+        ctx.fillRect(x - marker, y - marker, marker * 2, marker * 2);
+      }
     }
     for (const ex of this.extracts) {
       const { x, y } = point(ex.x, ex.y);
@@ -1537,17 +1695,16 @@ export class Renderer {
       const isYou = p.id === view.youId;
       const isFriend = view.friendNames.has(p.name);
       const isClan = view.clanNames.has(p.name);
-      ctx.fillStyle = isYou ? "#f0d878" : isClan ? "#68bfe8" : isFriend ? "#78d878" : "#e8e8e8";
+      if (!isYou && !isFriend && !isClan) continue;
+      ctx.fillStyle = isYou ? "#f0d878" : isClan ? "#68bfe8" : "#78d878";
       ctx.beginPath();
       ctx.arc(x, y, detailed ? (isYou ? 6 : 4) : (isYou ? 2.5 : 1.8), 0, Math.PI * 2);
       ctx.fill();
-      if (isYou || isFriend || isClan) {
-        ctx.strokeStyle = isYou ? 'rgba(240, 216, 120, 0.55)' : isClan ? 'rgba(104, 191, 232, 0.75)' : "rgba(120, 216, 120, 0.7)";
-        ctx.lineWidth = detailed ? 2 : 1;
-        ctx.beginPath();
-        ctx.arc(x, y, detailed && isYou ? 10 : detailed ? 6 : isYou ? 4 : 3, 0, Math.PI * 2);
-        ctx.stroke();
-      }
+      ctx.strokeStyle = isYou ? 'rgba(240, 216, 120, 0.55)' : isClan ? 'rgba(104, 191, 232, 0.75)' : "rgba(120, 216, 120, 0.7)";
+      ctx.lineWidth = detailed ? 2 : 1;
+      ctx.beginPath();
+      ctx.arc(x, y, detailed && isYou ? 10 : detailed ? 6 : isYou ? 4 : 3, 0, Math.PI * 2);
+      ctx.stroke();
     }
   }
 
@@ -1628,6 +1785,65 @@ export class Renderer {
     ctx.fillRect(g.x + 8, g.y - 12 + bob, 2, 2);
   }
 
+  private drawAmbientTerrain(
+    ctx: CanvasRenderingContext2D,
+    minX: number,
+    minY: number,
+    maxX: number,
+    maxY: number,
+    time: number,
+  ) {
+    ctx.save();
+    ctx.lineWidth = 0.75;
+    for (let ty = minY; ty <= maxY; ty++) {
+      for (let tx = minX; tx <= maxX; tx++) {
+        if (this.tileAt(tx, ty) !== Tile.Water && !this.terrainAt(tx, ty)?.swimmable) continue;
+        const seed = hash2(tx, ty);
+        const drift = (time * (4.5 + seed * 2) + seed * 20) % 16;
+        const y = ty * TILE + 7 + drift;
+        const x = tx * TILE + 4 + seed * 9;
+        ctx.strokeStyle = `rgba(164, 211, 231, ${0.12 + Math.sin(time * 2.4 + seed * 8) * 0.035})`;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + 5 + seed * 4, y);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  private drawStationFx(
+    ctx: CanvasRenderingContext2D,
+    kind: string,
+    x: number,
+    bottomY: number,
+    time: number,
+    seed: number,
+  ) {
+    // Fuel state controls visibility; reduced-motion keeps a steady flame
+    // rather than hiding the only visual indication that the station is lit.
+    const flicker = this.reducedMotion ? 0.5 : 0.5 + 0.5 * Math.sin(time * 17 + seed * 0.73);
+    const baseY = kind === 'torch' ? bottomY - 20 : kind === 'furnace' ? bottomY - 8 : bottomY - 11;
+    ctx.save();
+    if (kind === 'furnace') {
+      ctx.globalAlpha = 0.55 + flicker * 0.25;
+      ctx.fillStyle = '#f0a13a';
+      ctx.fillRect(x - 4, baseY - 1, 8, 4);
+      ctx.fillStyle = '#ffe08a';
+      ctx.fillRect(x - 2, baseY - 1, 4, 2);
+    } else {
+      const height = 5 + Math.round(flicker * 3);
+      ctx.globalAlpha = 0.78 + flicker * 0.18;
+      ctx.fillStyle = '#d86127';
+      ctx.fillRect(x - 3, baseY - height + 2, 6, height);
+      ctx.fillStyle = '#f2b13d';
+      ctx.fillRect(x - 2 + (flicker > 0.65 ? 1 : 0), baseY - height, 4, height - 1);
+      ctx.fillStyle = '#ffe47c';
+      ctx.fillRect(x - 1, baseY - height + 1, 2, Math.max(2, height - 3));
+    }
+    ctx.restore();
+  }
+
   private drawHeldItem(
     ctx: CanvasRenderingContext2D,
     x: number,
@@ -1644,8 +1860,8 @@ export class Renderer {
     let a = angle;
     let reach = isGun ? 10 - recoil * 4 : 8; // guns kick back into the shoulder
     if (swingPhase !== null && !isGun) {
-      if (weapon === "spear") reach += Math.sin(swingPhase * Math.PI) * 14;
-      else a += -0.9 + easeOut(swingPhase) * 1.6;
+      if (weapon === "spear") reach += spearThrust(swingPhase) * 14;
+      else a += meleeSwingOffset(swingPhase);
     }
     ctx.rotate(a);
     // guns are drawn barrel-right in the sheet: keep them ON the aim line so the
@@ -1662,12 +1878,14 @@ export class Renderer {
     ctx.restore();
 
     if (swingPhase !== null && !isGun && weapon !== "spear") {
+      const strike = Math.max(0, Math.min(1, (swingPhase - 0.16) / 0.46));
+      const trail = Math.max(0, 1 - Math.abs(swingPhase - 0.44) / 0.3);
       ctx.save();
       ctx.translate(x, y + 2);
-      ctx.strokeStyle = `rgba(255,255,255,${0.45 * (1 - swingPhase)})`;
+      ctx.strokeStyle = `rgba(255,255,255,${0.42 * trail})`;
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(0, 0, 22, angle - 0.8, angle - 0.8 + easeOut(swingPhase) * 1.6);
+      ctx.arc(0, 0, 22, angle - 0.82, angle - 0.82 + easeOutCubic(strike) * 1.62);
       ctx.stroke();
       ctx.restore();
     }
@@ -1687,8 +1905,8 @@ export class Renderer {
     ctx.beginPath();
     ctx.ellipse(x, y + 14, 9, 3.5, 0, 0, Math.PI * 2);
     ctx.fill();
-    const frame = frameOverride ?? (moving ? Math.floor(time * 8 + seed) % 2 : 0);
-    const bob = moving ? Math.abs(Math.sin(time * 10 + seed)) * 1.5 : 0;
+    const frame = frameOverride ?? (moving ? [1, 2, 3, 2][Math.floor(time * 9 + seed) % 4] : 0);
+    const bob = this.reducedMotion ? 0 : moving ? (1 - Math.cos(time * 18 + seed)) * 0.7 : Math.sin(time * 2.1 + seed) * 0.18;
     this.blitChar(ctx, row, frame, x - 16, y - 16 - bob);
     return bob;
   }
@@ -1700,11 +1918,10 @@ export class Renderer {
     view: WorldView,
   ) {
     const seed = hashStr(p.name);
-    const appearance = p.appearance ?? {
-      ...DEFAULT_CHARACTER_APPEARANCE,
-      outfit: p.look !== undefined ? p.look % CHAR_ROWS.survivorCount : seed % CHAR_ROWS.survivorCount,
-    };
-    const row = appearance.outfit % CHAR_ROWS.survivorCount;
+    // Character customization is temporarily dormant while the player
+    // animation set is being rebuilt. Profiles retain their saved appearance,
+    // but live players use one stable base row with no procedural overlays.
+    const row = 0;
     const serverSwingPhase =
       p.swing > 0 && view.serverNow - p.swing < 400
         ? Math.min(1, (view.serverNow - p.swing) / 400)
@@ -1721,12 +1938,34 @@ export class Renderer {
         ? localMeleeElapsed * 1000
         : swingPhase !== null ? view.serverNow - p.swing : Infinity;
     const playerState: EntityAnimationState = playerHitElapsed < 300 ? 'hit' : playerAttackElapsed < 700 ? 'attack' : p.moving ? 'walk' : 'idle';
-    const playerElapsed = playerState === 'hit' ? playerHitElapsed : playerState === 'attack' ? playerAttackElapsed : view.time * 1000;
-    const fallbackFrame = this.animationFrame('player', playerState, playerElapsed, seed, 2);
+    const pose = this.motionPose(p.id, p.moving, view.time, seed, p.vx, p.vy, playerHitElapsed);
+    const playerElapsed = playerState === 'hit'
+      ? playerHitElapsed
+      : playerState === 'attack'
+        ? playerAttackElapsed
+        : playerState === 'walk'
+          ? pose.animationElapsedMs
+          : view.time * 1000;
+    const fallbackFrame = this.sheetAnimationFrame('player', playerState, playerElapsed, seed);
+    const bodyX = p.dx + pose.x;
+    const bodyY = p.dy + pose.y;
+    const facingLeft = this.facesLeft(p.id, p.facing ?? p.angle);
     const drawFacing = (draw: () => void) => {
       ctx.save();
-      if (Math.cos(p.facing ?? p.angle) < 0) { ctx.translate(p.dx * 2, 0); ctx.scale(-1, 1); }
+      ctx.translate(bodyX, bodyY);
+      ctx.rotate(pose.lean);
+      if (facingLeft) ctx.scale(-1, 1);
+      ctx.translate(-bodyX, -bodyY);
       draw();
+      ctx.restore();
+    };
+    const drawBody = () => {
+      ctx.save();
+      if (playerHitElapsed < 120) ctx.filter = 'brightness(1.75) saturate(0.55)';
+      drawFacing(() => {
+        const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, bodyX, bodyY);
+        if (!custom) this.blitChar(ctx, row, fallbackFrame, bodyX - 16, bodyY - 16);
+      });
       ctx.restore();
     };
 
@@ -1735,7 +1974,8 @@ export class Renderer {
     const playerTy = Math.floor(p.dy / TILE);
     const authoredTerrain = this.terrainAt(playerTx, playerTy);
     const swimming = this.tileAt(playerTx, playerTy) === Tile.Water || Boolean(authoredTerrain?.swimmable);
-    if (isYou && p.moving && !swimming && authoredTerrain?.footstepSound && view.serverNow - this.lastTerrainFootstepAt >= 340) {
+    const footstepCadence = Math.max(190, 315 - Math.hypot(p.vx, p.vy) * 0.45);
+    if (isYou && p.moving && !swimming && authoredTerrain?.footstepSound && view.serverNow - this.lastTerrainFootstepAt >= footstepCadence) {
       this.lastTerrainFootstepAt = view.serverNow;
       this.onSound?.(authoredTerrain.footstepSound, 0.35);
     }
@@ -1747,7 +1987,7 @@ export class Renderer {
       ctx.ellipse(
         p.dx,
         p.dy + 4,
-        12 + Math.sin(view.time * 4 + seed) * 2,
+        12 + (this.reducedMotion ? 0 : Math.sin(view.time * 4 + seed) * 2),
         4.5,
         0,
         0,
@@ -1757,45 +1997,38 @@ export class Renderer {
       ctx.beginPath();
       ctx.rect(p.dx - 16, p.dy - 16, 32, 22); // clip below the waterline
       ctx.clip();
-      drawFacing(() => {
-        const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, p.dx, p.dy);
-        if (!custom) this.blitChar(ctx, row, fallbackFrame, p.dx - 16, p.dy - 16);
-        drawCharacterAppearance(ctx, appearance, p.dx - 16, p.dy - 16, 2, Boolean(p.helmet));
-      });
+      drawBody();
       ctx.restore();
       // nameplate still renders below
     }
-    let bob = 0;
     if (!swimming) {
-      bob = p.moving ? Math.abs(Math.sin(view.time * 10 + seed)) * 1.5 : 0;
       ctx.fillStyle = "rgba(0,0,0,0.3)";
-      ctx.beginPath(); ctx.ellipse(p.dx, p.dy + 14, 9, 3.5, 0, 0, Math.PI * 2); ctx.fill();
-      drawFacing(() => {
-        const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, p.dx, p.dy - bob);
-        if (!custom) this.blitChar(ctx, row, fallbackFrame, p.dx - 16, p.dy - 16 - bob);
-        drawCharacterAppearance(ctx, appearance, p.dx - 16, p.dy - 16 - bob, 2, Boolean(p.helmet));
-      });
+      ctx.beginPath(); ctx.ellipse(p.dx, p.dy + 14, 9 * pose.shadowScale, 3.5 * pose.shadowScale, 0, 0, Math.PI * 2); ctx.fill();
+      drawBody();
     }
 
     // armor overlays
+    ctx.save();
+    if (playerHitElapsed < 120) ctx.filter = 'brightness(1.75) saturate(0.55)';
     if (!swimming && p.helmet) {
       ctx.fillStyle = p.helmet === "helmet_military" ? "#44513a" : "#8a8a92";
-      ctx.fillRect(p.dx - 7, p.dy - 16 - bob, 14, 5);
+      ctx.fillRect(bodyX - 7, bodyY - 16, 14, 5);
     }
     if (!swimming && p.vest) {
       ctx.fillStyle = p.vest === "vest_military" ? "#3c4834" : "#867454";
-      ctx.fillRect(p.dx - 8, p.dy - 4 - bob, 16, 7);
+      ctx.fillRect(bodyX - 8, bodyY - 4, 16, 7);
     }
+    ctx.restore();
 
     if (p.weapon && !swimming) {
       const recoil = isYou && view.time < this.kickUntil ? (this.kickUntil - view.time) / 0.09 : 0;
-      this.drawHeldItem(ctx, p.dx, p.dy, p.weapon, p.angle, swingPhase, recoil);
+      this.drawHeldItem(ctx, bodyX, bodyY, p.weapon, p.angle, swingPhase, recoil);
     } else if (swingPhase !== null && !swimming) {
       // bare-fist jab, alternating hands
       const side = Math.floor(p.swing / 400) & 1 ? 1 : -1;
       const ext = Math.sin(swingPhase * Math.PI) * 12;
       ctx.save();
-      ctx.translate(p.dx, p.dy + 2);
+      ctx.translate(bodyX, bodyY + 2);
       ctx.rotate(p.angle);
       ctx.fillStyle = "#d8a878";
       ctx.fillRect(6 + ext, side * 4 - 2, 5, 4);
@@ -1834,7 +2067,14 @@ export class Renderer {
     const attackElapsed = e.attackAt ? view.serverNow - e.attackAt : Infinity;
     const hitElapsed = e.hitAt ? view.serverNow - e.hitAt : Infinity;
     const state: EntityAnimationState = hitElapsed < 300 ? 'hit' : attackElapsed < 700 ? 'attack' : e.moving ? 'walk' : 'idle';
-    const elapsed = state === 'hit' ? hitElapsed : state === 'attack' ? attackElapsed : time * 1000;
+    const pose = this.motionPose(e.id, e.moving, time, seed, e.vx, e.vy, hitElapsed);
+    const elapsed = state === 'hit'
+      ? hitElapsed
+      : state === 'attack'
+        ? attackElapsed
+        : state === 'walk'
+          ? pose.animationElapsedMs
+          : time * 1000;
     const previousSoundState = this.entitySoundStates.get(e.id);
     if (previousSoundState !== state) {
       this.entitySoundStates.set(e.id, state);
@@ -1842,7 +2082,6 @@ export class Renderer {
       const cue = soundAction ? this.visuals.mobSounds?.[e.kind]?.[soundAction] : undefined;
       if (cue) this.onSound?.(cue, 0.55);
     }
-    const custom = this.drawEngineSprite(ctx, `mob:${e.kind}`, state, elapsed, seed, e.dx, e.dy);
     const ANIMAL_ROWS: Partial<Record<string, number>> = {
       deer: CHAR_ROWS.deer,
       rabbit: CHAR_ROWS.rabbit,
@@ -1852,32 +2091,27 @@ export class Renderer {
       bear: CHAR_ROWS.bear,
     };
     const animalRow = ANIMAL_ROWS[e.kind];
-    if (!custom && animalRow !== undefined) {
-      // quadruped: flip toward its heading so it runs the right way
-      ctx.save();
-      ctx.translate(e.dx, e.dy);
-      if (Math.cos(e.angle) < 0) ctx.scale(-1, 1);
-      ctx.fillStyle = "rgba(0,0,0,0.25)";
-      ctx.beginPath();
-      ctx.ellipse(0, 13, e.kind === "rabbit" ? 6 : e.kind === "bear" ? 12 : 10, 3, 0, 0, Math.PI * 2);
-      ctx.fill();
-      const frame = this.animationFrame(`mob:${e.kind}`, state, elapsed, seed, 2);
-      this.blitChar(ctx, animalRow, frame, -16, -16);
-      ctx.restore();
-    } else if (!custom) {
-      this.drawShadowAndSprite(
-        ctx,
-        e.dx,
-        e.dy,
-        e.kind === "zombie" ? CHAR_ROWS.zombie : CHAR_ROWS.military,
-        e.moving,
-        e.kind === "zombie" ? time * 0.7 : time,
-        seed,
-        this.animationFrame(`mob:${e.kind}`, state, elapsed, seed, 2),
-      );
+    const bodyX = e.dx + pose.x;
+    const bodyY = e.dy + pose.y;
+    const shadowWidth = e.kind === 'rabbit' ? 6 : e.kind === 'bear' ? 12 : animalRow !== undefined ? 10 : 9;
+    ctx.fillStyle = "rgba(0,0,0,0.27)";
+    ctx.beginPath();
+    ctx.ellipse(e.dx, e.dy + 13, shadowWidth * pose.shadowScale, 3 * pose.shadowScale, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.save();
+    ctx.translate(bodyX, bodyY);
+    ctx.rotate(pose.lean);
+    if (this.facesLeft(e.id, e.angle)) ctx.scale(-1, 1);
+    if (hitElapsed < 120) ctx.filter = 'brightness(1.8) saturate(0.45)';
+    const custom = this.drawEngineSprite(ctx, `mob:${e.kind}`, state, elapsed, seed, 0, 0);
+    if (!custom) {
+      const row = animalRow ?? (e.kind === "zombie" ? CHAR_ROWS.zombie : CHAR_ROWS.military);
+      this.blitChar(ctx, row, this.sheetAnimationFrame(`mob:${e.kind}`, state, elapsed, seed), -16, -16);
     }
+    ctx.restore();
     if (e.kind === "military")
-      this.drawHeldItem(ctx, e.dx, e.dy, "rifle", e.angle, null);
+      this.drawHeldItem(ctx, bodyX, bodyY, "rifle", e.angle, null);
 
     if (e.hp < e.maxHp) {
       const hpw = 20;
@@ -1985,8 +2219,24 @@ export class Renderer {
   }
 }
 
-function easeOut(t: number): number {
-  return 1 - (1 - t) * (1 - t);
+function easeInCubic(t: number): number {
+  return t * t * t;
+}
+
+function easeOutCubic(t: number): number {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function meleeSwingOffset(t: number): number {
+  if (t < 0.18) return -0.78 * easeInCubic(t / 0.18);
+  if (t < 0.62) return -0.78 + 1.62 * easeOutCubic((t - 0.18) / 0.44);
+  return 0.84 * (1 - easeOutCubic((t - 0.62) / 0.38));
+}
+
+function spearThrust(t: number): number {
+  if (t < 0.18) return -0.16 * easeInCubic(t / 0.18);
+  if (t < 0.58) return -0.16 + 1.16 * easeOutCubic((t - 0.18) / 0.4);
+  return 1 - easeOutCubic((t - 0.58) / 0.42);
 }
 
 /** tiles.png column for a structure tile (for the build ghost); -1 = no sprite. */

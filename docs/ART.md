@@ -21,11 +21,16 @@ Rendered at 2× world scale (TILE = 32 px world, 16 px art) with `imageSmoothing
 | 10-11 / rows 0-1 | tree (32×32 block) |
 | 12 | rock |
 | 13 | bed (bottom) |
+| 14 | workbench |
+| 15 | unlit firepit (fuel flame is rendered dynamically) |
+| 16 | unlit furnace (fuel glow is rendered dynamically) |
+| 17 | stump |
+| 18 | rubble |
 
-## chars.png (16×16, 2 walk frames per row)
+## chars.png (16×16, 4 poses per row)
 
 Rows 0-7 are survivor outfit bases; row 8 zombie, row 9 military, row 10 trader, rows 11-14 deer/rabbit/boar/wolf, row 15 fox, and row 16 bear.
-Frame 0 = idle, frame 1 = step. The survivor row is selected by `appearance.outfit`. `game/character-appearance.ts` composites skin tone, body silhouette, hair and accent at the same pixel scale, followed by gameplay armor and held items. The pre-deploy creator, signed-in deployment portrait, and world renderer use this same compositor so the saved survivor stays recognizable across surfaces.
+Frame 0 is idle. Frames 1-3 are the left contact, passing/hop and right contact poses; the compatibility walk loop uses `1, 2, 3, 2`. The survivor row is selected by `appearance.outfit`. `game/character-appearance.ts` composites skin tone, body silhouette, hair and accent at the same pixel scale and follows the active frame offset, followed by gameplay armor and held items. The pre-deploy creator, signed-in deployment portrait, and world renderer use this same compositor so the saved survivor stays recognizable across surfaces.
 
 `CharacterAppearance.cosmetics` reserves `head`, `face`, `back` and `badge` asset identifiers. They are visual-only and intentionally separate from helmet/vest gameplay equipment. When real cosmetic art is added, resolve those identifiers to atlas layers in the shared compositor rather than adding creator-only rendering.
 

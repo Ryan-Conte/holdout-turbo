@@ -229,19 +229,27 @@ const T = {
   // 15 firepit / 16 furnace / 17 stump / 18 rubble
   {
     const [x, y] = cell(15, 0);
-    rect(png, x + 3, y + 9, 10, 4, hex("#5c5c62")); // stone ring
-    rect(png, x + 5, y + 7, 6, 4, hex("#4a331e")); // logs
-    rect(png, x + 6, y + 3, 4, 5, hex("#d8722a")); // flame
-    rect(png, x + 7, y + 2, 2, 3, hex("#f0b83a"));
-    px(png, x + 7, y + 1, hex("#f8dc72"));
+    rect(png, x + 3, y + 9, 10, 4, hex("#55565c")); // cold stone ring
+    rect(png, x + 4, y + 9, 8, 2, hex("#6d6e73")); // upper stone faces
+    rect(png, x + 5, y + 7, 6, 3, hex("#251f1a")); // dark, unlit coals
+    rect(png, x + 4, y + 7, 7, 2, hex("#4a331e")); // crossed log
+    rect(png, x + 7, y + 6, 5, 2, hex("#35261d")); // crossed log
+    px(png, x + 6, y + 8, hex("#777477")); // cold ash
+    px(png, x + 9, y + 9, hex("#858185"));
+    px(png, x + 4, y + 11, hex("#85868b"));
+    px(png, x + 11, y + 12, hex("#424349"));
   }
   {
     const [x, y] = cell(16, 0);
-    rect(png, x + 2, y + 3, 12, 12, hex("#6a6a72"));
-    rect(png, x + 3, y + 2, 10, 3, hex("#82828a"));
-    rect(png, x + 5, y + 8, 6, 5, hex("#2a2a2e")); // mouth
-    rect(png, x + 6, y + 9, 4, 3, hex("#d8722a")); // glow
-    px(png, x + 4, y + 1, hex("#4a4a50"));
+    rect(png, x + 2, y + 3, 12, 12, hex("#606168")); // stone body
+    rect(png, x + 3, y + 2, 10, 3, hex("#7a7b82")); // cap
+    rect(png, x + 4, y + 1, 4, 2, hex("#494a50")); // short flue
+    rect(png, x + 4, y + 7, 8, 7, hex("#45464c")); // iron mouth rim
+    rect(png, x + 5, y + 8, 6, 5, hex("#1d1e21")); // cold chamber
+    rect(png, x + 6, y + 11, 4, 2, hex("#343236")); // ash bed
+    px(png, x + 3, y + 5, hex("#85868d")); // masonry highlights
+    px(png, x + 11, y + 5, hex("#4e4f55"));
+    px(png, x + 12, y + 13, hex("#77787e"));
   }
   {
     const [x, y] = cell(17, 0);
@@ -368,7 +376,7 @@ const T = {
   save(png, "tiles.png");
 }
 
-// ── chars.png — 16×16, 2 frames per row ──────────────────────────────────
+// ── chars.png — 16×16, 4 frames per row ──────────────────────────────────
 const SHIRTS = [
   "#8a3a3a",
   "#3a5a8a",
@@ -381,20 +389,23 @@ const SHIRTS = [
 ];
 {
   const rows = 17;
-  const png = sheet(2, rows);
+  const CHAR_FRAMES = [0, 1, 2, 3];
+  const png = sheet(CHAR_FRAMES.length, rows);
   const skin = hex("#d8a878");
   const drawBody = (fx, fy, frame, shirt, skinC, hairC, helmet) => {
+    const lift = frame === 2 ? -1 : 0;
+    fy += lift;
     // legs
-    const l1 = frame === 0 ? 12 : 11;
-    const l2 = frame === 0 ? 12 : 13;
+    const l1 = [12, 11, 12, 13][frame];
+    const l2 = [12, 13, 12, 11][frame];
     rect(png, fx + 5, fy + l1, 2, 15 - l1 + 1, hex("#2e2838"));
     rect(png, fx + 9, fy + l2, 2, 15 - l2 + 1, hex("#2e2838"));
     // torso
     rect(png, fx + 4, fy + 6, 8, 6, shirt);
     rect(png, fx + 4, fy + 10, 8, 2, mul(shirt, 0.8));
     // arms
-    rect(png, fx + 3, fy + 7, 1, 4, shirt);
-    rect(png, fx + 12, fy + 7, 1, 4, shirt);
+    rect(png, fx + 3, fy + 7 + (frame === 1 ? 1 : frame === 3 ? -1 : 0), 1, 4, shirt);
+    rect(png, fx + 12, fy + 7 + (frame === 3 ? 1 : frame === 1 ? -1 : 0), 1, 4, shirt);
     // head
     rect(png, fx + 5, fy + 1, 6, 5, skinC);
     if (helmet) {
@@ -418,11 +429,11 @@ const SHIRTS = [
   ];
 
   SHIRTS.forEach((s, row) => {
-    for (const frame of [0, 1])
+    for (const frame of CHAR_FRAMES)
       drawBody(frame * C, row * C, frame, hex(s), skin, hex("#3a2a1a"), null);
   });
   // row 8: zombie
-  for (const frame of [0, 1])
+  for (const frame of CHAR_FRAMES)
     drawBody(
       frame * C,
       8 * C,
@@ -433,7 +444,7 @@ const SHIRTS = [
       null,
     );
   // row 9: military
-  for (const frame of [0, 1])
+  for (const frame of CHAR_FRAMES)
     drawBody(
       frame * C,
       9 * C,
@@ -444,7 +455,7 @@ const SHIRTS = [
       hex("#3a4632"),
     );
   // row 10: trader
-  for (const frame of [0, 1])
+  for (const frame of CHAR_FRAMES)
     drawBody(
       frame * C,
       10 * C,
@@ -455,7 +466,7 @@ const SHIRTS = [
       null,
     );
   // row 11: deer (quadruped, side view)
-  for (const frame of [0, 1]) {
+  for (const frame of CHAR_FRAMES) {
     const fx = frame * C;
     const fy = 11 * C;
     const body = hex("#8a6a44");
@@ -465,18 +476,18 @@ const SHIRTS = [
     rect(png, fx + 12, fy + 1, 1, 2, dark); // antler
     px(png, fx + 14, fy + 1, dark);
     px(png, fx + 13, fy + 4, hex("#1c1814")); // eye
-    const l = frame === 0 ? 0 : 1;
+    const l = [0, 1, 0, -1][frame];
     rect(png, fx + 4 + l, fy + 11, 2, 4, dark); // legs
     rect(png, fx + 10 - l, fy + 11, 2, 4, dark);
     rect(png, fx + 3, fy + 5, 3, 2, hex("#f0ead8")); // tail
   }
   // row 12: rabbit (small, hops)
-  for (const frame of [0, 1]) {
+  for (const frame of CHAR_FRAMES) {
     const fx = frame * C;
     const fy = 12 * C;
     const fur = hex("#b8a88e");
     const dark = hex("#94836a");
-    const hop = frame === 0 ? 0 : -1;
+    const hop = [0, -1, -2, -1][frame];
     rect(png, fx + 5, fy + 9 + hop, 6, 4, fur); // body
     rect(png, fx + 10, fy + 7 + hop, 3, 3, fur); // head
     rect(png, fx + 10, fy + 5 + hop, 1, 2, dark); // ears
@@ -487,7 +498,7 @@ const SHIRTS = [
     rect(png, fx + 9, fy + 13, 2, 2, dark);
   }
   // row 13: boar (bulky, tusks)
-  for (const frame of [0, 1]) {
+  for (const frame of CHAR_FRAMES) {
     const fx = frame * C;
     const fy = 13 * C;
     const hide = hex("#5a4a3c");
@@ -498,12 +509,12 @@ const SHIRTS = [
     px(png, fx + 14, fy + 10, hex("#e8e0d0")); // tusk
     px(png, fx + 13, fy + 11, hex("#e8e0d0"));
     px(png, fx + 13, fy + 8, hex("#1c1814")); // eye
-    const l = frame === 0 ? 0 : 1;
+    const l = [0, 1, 0, -1][frame];
     rect(png, fx + 3 + l, fy + 12, 2, 3, dark);
     rect(png, fx + 9 - l, fy + 12, 2, 3, dark);
   }
   // row 14: wolf (lean, grey)
-  for (const frame of [0, 1]) {
+  for (const frame of CHAR_FRAMES) {
     const fx = frame * C;
     const fy = 14 * C;
     const fur = hex("#6e7076");
@@ -514,18 +525,19 @@ const SHIRTS = [
     rect(png, fx + 13, fy + 3, 1, 2, dark);
     px(png, fx + 14, fy + 7, hex("#c03a2a")); // eye — hungry
     rect(png, fx + 0, fy + 6, 3, 2, dark); // tail
-    const l = frame === 0 ? 0 : 1;
+    const l = [0, 1, 0, -1][frame];
     rect(png, fx + 3 + l, fy + 11, 2, 4, dark);
     rect(png, fx + 9 - l, fy + 11, 2, 4, dark);
   }
   // row 15: red fox (small, bright tail tip)
-  for (const frame of [0, 1]) {
+  for (const frame of CHAR_FRAMES) {
     const fx = frame * C;
     const fy = 15 * C;
     const fur = hex("#b95d2e");
     const dark = hex("#6f3324");
     const cream = hex("#e7cfaa");
-    const hop = frame === 0 ? 0 : -1;
+    const hop = [0, -1, -2, -1][frame];
+    const step = [0, 1, 0, -1][frame];
     rect(png, fx + 3, fy + 8 + hop, 8, 4, fur);
     rect(png, fx + 10, fy + 6 + hop, 4, 4, fur);
     px(png, fx + 11, fy + 4 + hop, dark);
@@ -533,12 +545,12 @@ const SHIRTS = [
     px(png, fx + 13, fy + 7 + hop, hex("#1c1814"));
     rect(png, fx + 0, fy + 7 + hop, 4, 2, fur);
     px(png, fx + 0, fy + 7 + hop, cream);
-    rect(png, fx + 4 + frame, fy + 12, 2, 3, dark);
-    rect(png, fx + 9 - frame, fy + 12, 2, 3, dark);
+    rect(png, fx + 4 + step, fy + 12, 2, 3, dark);
+    rect(png, fx + 9 - step, fy + 12, 2, 3, dark);
     px(png, fx + 12, fy + 9 + hop, cream);
   }
   // row 16: black bear (large silhouette, tan muzzle)
-  for (const frame of [0, 1]) {
+  for (const frame of CHAR_FRAMES) {
     const fx = frame * C;
     const fy = 16 * C;
     const fur = hex("#332d29");
@@ -551,7 +563,7 @@ const SHIRTS = [
     px(png, fx + 14, fy + 4, fur);
     rect(png, fx + 13, fy + 8, 3, 2, muzzle);
     px(png, fx + 13, fy + 6, hex("#d6b45d"));
-    const step = frame === 0 ? 0 : 1;
+    const step = [0, 1, 0, -1][frame];
     rect(png, fx + 2 + step, fy + 12, 3, 4, fur);
     rect(png, fx + 9 - step, fy + 12, 3, 4, fur);
   }

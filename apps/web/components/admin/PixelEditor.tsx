@@ -139,7 +139,7 @@ export function PixelEditor() {
           width: 16,
           height: 16,
           pixels: [],
-          source: { sheet: "chars", col: 0, row: 0, frames: 2 },
+          source: { sheet: "chars", col: 0, row: 0, frames: 4 },
         }),
       );
     setDocument({ ...draft, assets });

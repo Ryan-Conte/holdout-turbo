@@ -18,6 +18,7 @@ const {
   combatAttackAllowed,
   elevationStepAllowed,
   fatigueMoveMultiplier,
+  harvestResourceTileMatches,
   questCanClaim,
   questUnlocked,
   restoredStructureTile,
@@ -146,6 +147,16 @@ test('structure restoration keeps foundations and elevation rejects cliffs', () 
   assert.equal(restoredStructureTile(undefined, 0), 0);
   assert.equal(elevationStepAllowed(1, 2), true);
   assert.equal(elevationStepAllowed(1, 3), false);
+});
+
+test('harvest resources only remain active on live node tiles', () => {
+  assert.equal(harvestResourceTileMatches(Tile.Tree, Tile.Tree), true);
+  assert.equal(harvestResourceTileMatches(Tile.Rock, Tile.Rock), true);
+  assert.equal(harvestResourceTileMatches(Tile.Rock, Tile.CopperOre), true);
+  assert.equal(harvestResourceTileMatches(Tile.Rock, Tile.IronOre), true);
+  assert.equal(harvestResourceTileMatches(Tile.Tree, Tile.Stump), false);
+  assert.equal(harvestResourceTileMatches(Tile.Rock, Tile.Rubble), false);
+  assert.equal(harvestResourceTileMatches(Tile.Rock, Tile.Grass), false);
 });
 
 test('authored map conversion preserves runtime content IDs, rotation and placements', () => {

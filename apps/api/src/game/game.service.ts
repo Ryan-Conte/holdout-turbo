@@ -136,6 +136,7 @@ import {
   combatAttackAllowed,
   elevationStepAllowed,
   fatigueMoveMultiplier,
+  harvestResourceTileMatches,
   questCanClaim,
   questUnlocked as questRuleUnlocked,
   restoredStructureTile,
@@ -903,8 +904,15 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     }
     for (const [i, left] of saved.nodeHits) {
       if (i < 0 || i >= inst.tiles.length) continue;
-      const resource = this.content.resource(inst.resourceKinds[String(i)]);
-      const total = resource?.maxHits ?? NODE_HITS[inst.tiles[i] as Tile];
+      const tile = inst.tiles[i] as Tile;
+      const attachedResource = this.content.resource(
+        inst.resourceKinds[String(i)],
+      );
+      const resource =
+        attachedResource && harvestResourceTileMatches(attachedResource.tile, tile)
+          ? attachedResource
+          : undefined;
+      const total = resource?.maxHits ?? NODE_HITS[tile];
       if (total && left > 0) inst.nodeHits.set(i, Math.min(left, total));
     }
     let restoredCooldowns = 0;
@@ -934,6 +942,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       )
         continue;
       inst.tiles[respawn.i] = respawn.depletedTile;
+      delete inst.resourceKinds[String(respawn.i)];
       inst.nodeHits.delete(respawn.i);
       inst.nodeRespawns.push(respawn);
       seen.add(respawn.i);
@@ -2412,9 +2421,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
           if (x < 0 || y < 0 || x >= inst.w || y >= inst.h) continue;
           const index = y * inst.w + x;
           const tile = inst.tiles[index] as Tile;
-          const resource = this.content.resource(
+          const attachedResource = this.content.resource(
             inst.resourceKinds[String(index)],
           );
+          const resource =
+            attachedResource &&
+            harvestResourceTileMatches(attachedResource.tile, tile)
+              ? attachedResource
+              : undefined;
           const nodeSkill =
             resource?.skill ??
             (tile === Tile.Tree
@@ -5822,7 +5836,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         return; // authored/player structures take melee damage
       const tile = inst.tiles[i] as Tile;
       const resourceId = inst.resourceKinds[String(i)];
-      const resourceDef = this.content.resource(resourceId);
+      const attachedResource = this.content.resource(resourceId);
+      const resourceDef =
+        attachedResource && harvestResourceTileMatches(attachedResource.tile, tile)
+          ? attachedResource
+          : undefined;
       const totalHits = resourceDef?.maxHits ?? NODE_HITS[tile];
       if (!totalHits) continue;
 
@@ -5919,7 +5937,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         const baseResourceId =
           previousVariant?.baseResourceId ?? resourceId ?? "";
         inst.tiles[i] = depleted;
-        this.io?.to(inst.id).emit(EV.tile, { i, tile: depleted });
+        delete inst.resourceKinds[String(i)];
+        this.io?.to(inst.id).emit(EV.tile, {
+          i,
+          tile: depleted,
+          resourceId: null,
+        });
         inst.nodeRespawns.push({
           i,
           at: now + (resourceDef?.respawnMs ?? NODE_RESPAWN_MS),
@@ -6161,10 +6184,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     dmg: number,
     attacker: ServerPlayer | null,
     ranged = false,
+    projectile?: Projectile,
   ) {
     e.hp -= dmg;
     e.lastHitAt = Date.now();
-    this.hitFx(inst, e.x, e.y, dmg, "enemy");
+    this.hitFx(inst, e.x, e.y, dmg, "enemy", undefined, undefined, projectile);
     if (attacker) {
       e.targetSid = attacker.sid;
       e.enraged = true; // neutral animals fight back (or bolt further) once hurt
@@ -6373,7 +6397,16 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
               const killerName = pr.ownerKind
                 ? `a ${this.content.enemy(pr.ownerKind).name}`
                 : (shooter?.name ?? "?");
-              this.hitFx(inst, pr.x, pr.y, pr.damage, "player");
+              this.hitFx(
+                inst,
+                pr.x,
+                pr.y,
+                pr.damage,
+                "player",
+                undefined,
+                undefined,
+                pr,
+              );
               this.damagePlayer(
                 target,
                 pr.damage,
@@ -6392,7 +6425,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
             alive = false;
             const shooter =
               pr.ownerKind === null ? this.players.get(pr.owner) : undefined;
-            this.damageEnemy(inst, e, pr.damage, shooter ?? null, true);
+            this.damageEnemy(inst, e, pr.damage, shooter ?? null, true, pr);
             break;
           }
         }
@@ -6496,6 +6529,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     kind: HitSnap["kind"],
     material?: "wood" | "stone",
     soundId?: string,
+    projectile?: Projectile,
   ) {
     const payload: HitSnap = {
       x: Math.round(x),
@@ -6505,6 +6539,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     };
     if (material) payload.material = material;
     if (soundId) payload.soundId = soundId;
+    if (projectile) {
+      payload.projectileId = projectile.id;
+      payload.projectileAngle = projectile.angle;
+    }
     this.io?.to(inst.id).emit(EV.hit, payload);
   }
 
@@ -6567,6 +6605,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       id: pr.id,
       x: Math.round(pr.x),
       y: Math.round(pr.y),
+      vx: pr.vx,
+      vy: pr.vy,
       angle: pr.angle,
     }));
     const allContainers = [...inst.containers.values()].map(
@@ -6634,11 +6674,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
               name: snapshot.name,
               x: snapshot.x,
               y: snapshot.y,
-              relation: adminTracking
-                ? ("admin" as const)
-                : sameClan
-                  ? ("clan" as const)
-                  : ("friend" as const),
+              relation: sameClan
+                ? ("clan" as const)
+                : isFriend
+                  ? ("friend" as const)
+                  : ("admin" as const),
             },
           ];
         }),

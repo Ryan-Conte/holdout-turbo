@@ -48,10 +48,11 @@ export function CharacterCreator({ callsign, value, saving, error, onChange, onC
       ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(140, 244, 65, 18, 0, 0, Math.PI * 2); ctx.fill();
       const scale = 10;
       const left = 60;
-      const top = 65 + Math.sin(time / 450) * 2;
-      const frame = Math.floor(time / 520) % 2;
+      const previewCycle = [0, 1, 2, 3, 2];
+      const top = 65 + Math.sin(time / 420) * 1.5;
+      const frame = previewCycle[Math.floor(time / 170) % previewCycle.length];
       ctx.drawImage(sheets.chars, frame * 16, value.outfit * 16, 16, 16, left, top, 16 * scale, 16 * scale);
-      drawCharacterAppearance(ctx, value, left, top, scale);
+      drawCharacterAppearance(ctx, value, left, top, scale, false, frame);
       frameId = requestAnimationFrame(draw);
     };
     frameId = requestAnimationFrame(draw);

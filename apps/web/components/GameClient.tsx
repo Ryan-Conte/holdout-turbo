@@ -33,6 +33,7 @@ import {
   StationFuelUpdate,
   SWIM_SPEED_MULT,
   TILE,
+  TICK_MS,
   Tile,
   TileUpdate,
   TradeOpen,
@@ -61,6 +62,16 @@ import { WORLD_MAP_DEFAULT_ZOOM, WORLD_MAP_SIZE, WorldMapIcon, WorldMapOverlay, 
 import { AdminPanel } from '@/components/game/AdminPanel';
 import { applyRuntimeGameplay, itemDef, runtimeItems, runtimeRecipes } from '@/lib/runtime-gameplay';
 import { applyRuntimeVisuals } from '@/lib/runtime-visuals';
+import {
+  LOCAL_RECONCILE_DEAD_ZONE,
+  LOCAL_RECONCILE_RATE,
+  REMOTE_INTERPOLATION_DELAY_MS,
+  appendMotionSample,
+  captureMotionSample,
+  estimateNetworkLeadMs,
+  sampleMotion,
+  type MotionSample,
+} from '@/game/interpolation';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 /** the server picked in the login-screen server browser (falls back to env) */
@@ -100,10 +111,14 @@ const DEMOLISHABLE = new Set<number>([
 type DragZone = 'inv' | 'cont' | 'helmet' | 'vest' | 'mod' | 'weapon';
 interface DragState { zone: DragZone; index: number; item: ItemId; qty: number }
 interface CtxMenu { x: number; y: number; zone: DragZone; index: number; item: ItemId; qty: number }
-interface PendingPredictedInput { seq: number; at: number }
+interface PendingPredictedInput { seq: number; at: number; input: InputPayload }
 
 const MAX_PENDING_INPUTS = 80;
 const HARD_RECONCILE_DISTANCE = TILE * 4;
+
+function movementIntentKey(input: InputPayload): string {
+  return `${Number(Boolean(input.up))}${Number(Boolean(input.down))}${Number(Boolean(input.left))}${Number(Boolean(input.right))}${Number(Boolean(input.sprint))}`;
+}
 
 export default function GameClient() {
   const router = useRouter();
@@ -119,7 +134,7 @@ export default function GameClient() {
   const snapRef = useRef<StateSnap | null>(null);
   const initRef = useRef<WorldInit | null>(null);
   const youRef = useRef<string>('');
-  const displayPos = useRef(new Map<string, { x: number; y: number }>());
+  const motionSamplesRef = useRef<MotionSample[]>([]);
   const keys = useRef({ up: false, down: false, left: false, right: false });
   const sprintRef = useRef(false);
   const mouse = useRef({ x: 0, y: 0, down: false });
@@ -127,6 +142,7 @@ export default function GameClient() {
   const sendInputNowRef = useRef<() => void>(() => undefined);
   const inputSeqRef = useRef(0);
   const lastInputRef = useRef<InputPayload>({ up: false, down: false, left: false, right: false, angle: 0, shoot: false });
+  const acknowledgedInputRef = useRef<InputPayload>(lastInputRef.current);
   const pendingInputsRef = useRef<PendingPredictedInput[]>([]);
   const predictedPosRef = useRef<{ x: number; y: number } | null>(null);
   const predictionCorrectionRef = useRef({ x: 0, y: 0 });
@@ -392,8 +408,8 @@ export default function GameClient() {
 
   const getMapPlayerPosition = useCallback(() => {
     const id = youRef.current;
-    const displayed = displayPos.current.get(id);
-    if (displayed) return { x: displayed.x / TILE, y: displayed.y / TILE };
+    const predicted = predictedPosRef.current;
+    if (predicted) return { x: predicted.x / TILE, y: predicted.y / TILE };
     const player = snapRef.current?.players.find((entry) => entry.id === id);
     return player ? { x: player.x / TILE, y: player.y / TILE } : null;
   }, []);
@@ -571,6 +587,7 @@ export default function GameClient() {
       socketRef.current = socket;
       inputSeqRef.current = 0;
       pendingInputsRef.current = [];
+      acknowledgedInputRef.current = lastInputRef.current;
       latencyRef.current = null;
       setLatencyMs(null);
 
@@ -596,7 +613,7 @@ export default function GameClient() {
         const terrainKinds = { ...decodeTerrainRuns(init.terrainRuns, cellCount), ...(init.terrainKinds ?? {}) };
         rendererRef.current = new Renderer(tiles, init.width, init.height, sheets, init.pois, init.traders, init.exit, init.extracts ?? [], init.unders ?? {}, elevations, visuals, terrainKinds, init.resourceKinds ?? {}, init.blockKinds ?? {}, init.blockRotations ?? {}, init.openDoors ?? [], init.stationFuel ?? {}, init.gameplay, (soundId, volume) => sfx.play(soundId, volume));
         updateWorldMapView({ centerX: init.width / 2, centerY: init.height / 2, zoom: WORLD_MAP_DEFAULT_ZOOM });
-        displayPos.current.clear();
+        motionSamplesRef.current = [];
         seenProjectiles.current.clear();
         snapRef.current = null;
         predictedPosRef.current = null;
@@ -635,6 +652,7 @@ export default function GameClient() {
       socket.on(EV.state, (s: StateSnap) => {
         const receivedAt = performance.now();
         snapRef.current = s;
+        motionSamplesRef.current = appendMotionSample(motionSamplesRef.current, captureMotionSample(s, receivedAt));
         setOnline(s.population ?? s.players.length);
         const you = s.players.find((p) => p.id === youRef.current);
         if (you) {
@@ -642,6 +660,7 @@ export default function GameClient() {
           const acknowledged = pendingInputsRef.current.filter((entry) => entry.seq <= ack);
           const newestAcknowledged = acknowledged.at(-1);
           if (newestAcknowledged) {
+            acknowledgedInputRef.current = newestAcknowledged.input;
             const sample = Math.max(0, receivedAt - newestAcknowledged.at);
             latencyRef.current = latencyRef.current === null ? sample : latencyRef.current * 0.8 + sample * 0.2;
             if (receivedAt - lastLatencyUiAtRef.current > 500) {
@@ -651,14 +670,31 @@ export default function GameClient() {
           }
           pendingInputsRef.current = pendingInputsRef.current.filter((entry) => entry.seq > ack);
 
-          const leadSeconds = Math.min(0.25, Math.max(0.025, (latencyRef.current ?? 80) / 2000));
-          const expected = predictMovement({ x: you.x, y: you.y }, lastInputRef.current, leadSeconds);
           const predicted = predictedPosRef.current;
-          if (!predicted || Math.hypot(expected.x - predicted.x, expected.y - predicted.y) > HARD_RECONCILE_DISTANCE) {
-            predictedPosRef.current = expected;
+          const awaitingMovementChange = pendingInputsRef.current.some(
+            (entry) => movementIntentKey(entry.input) !== movementIntentKey(acknowledgedInputRef.current),
+          );
+          if (!predicted) {
+            predictedPosRef.current = { x: you.x, y: you.y };
+            predictionCorrectionRef.current = { x: 0, y: 0 };
+          } else if (awaitingMovementChange) {
+            // The authoritative position predates a local start/stop/turn. Let
+            // prediction run until that intent is acknowledged instead of
+            // dragging the player back toward a snapshot we know is stale.
             predictionCorrectionRef.current = { x: 0, y: 0 };
           } else {
-            predictionCorrectionRef.current = { x: expected.x - predicted.x, y: expected.y - predicted.y };
+            const leadSeconds = estimateNetworkLeadMs(latencyRef.current, TICK_MS) / 1000;
+            const expected = predictMovement({ x: you.x, y: you.y }, acknowledgedInputRef.current, leadSeconds);
+            const error = { x: expected.x - predicted.x, y: expected.y - predicted.y };
+            const errorDistance = Math.hypot(error.x, error.y);
+            if (errorDistance > HARD_RECONCILE_DISTANCE) {
+              predictedPosRef.current = expected;
+              predictionCorrectionRef.current = { x: 0, y: 0 };
+            } else {
+              predictionCorrectionRef.current = errorDistance > LOCAL_RECONCILE_DEAD_ZONE
+                ? error
+                : { x: 0, y: 0 };
+            }
           }
         }
         const next = new Set<number>();
@@ -1051,8 +1087,11 @@ export default function GameClient() {
         sprint: sprintRef.current && !locked,
         seq: ++inputSeqRef.current,
       };
+      if (movementIntentKey(input) !== movementIntentKey(lastInputRef.current)) {
+        predictionCorrectionRef.current = { x: 0, y: 0 };
+      }
       lastInputRef.current = input;
-      pendingInputsRef.current.push({ seq: input.seq!, at: performance.now() });
+      pendingInputsRef.current.push({ seq: input.seq!, at: performance.now(), input });
       if (pendingInputsRef.current.length > MAX_PENDING_INPUTS) {
         pendingInputsRef.current.splice(0, pendingInputsRef.current.length - MAX_PENDING_INPUTS);
       }
@@ -1091,7 +1130,8 @@ export default function GameClient() {
           }
         }
       }
-      if (moving && now - lastStepAt.current > 340) {
+      const stepCadence = sprintRef.current ? 215 : 285;
+      if (moving && now - lastStepAt.current > stepCadence) {
         sfx.step();
         lastStepAt.current = now;
       }
@@ -1111,6 +1151,7 @@ export default function GameClient() {
     const ctx = canvas.getContext('2d')!;
     let raf = 0;
     let last = performance.now();
+    let localVelocity = { x: 0, y: 0 };
 
     const resize = () => {
       canvas.width = window.innerWidth;
@@ -1128,26 +1169,13 @@ export default function GameClient() {
       const init = initRef.current;
       if (!renderer || !snap || !init) return;
 
-      const f = 1 - Math.exp(-14 * dt);
-      const seen = new Set<string>();
-      const lerp = (id: string, x: number, y: number) => {
-        seen.add(id);
-        let d = displayPos.current.get(id);
-        if (!d) {
-          d = { x, y };
-          displayPos.current.set(id, d);
-        }
-        if (Math.hypot(x - d.x, y - d.y) > 200) { d.x = x; d.y = y; }
-        d.x += (x - d.x) * f;
-        d.y += (y - d.y) * f;
-        return d;
-      };
       const self = snap.players.find((player) => player.id === youRef.current);
       if (self) {
         if (!predictedPosRef.current) predictedPosRef.current = { x: self.x, y: self.y };
         if (!self.dead) {
           const locked = panelsOpenRef.current;
-          predictedPosRef.current = predictMovement(predictedPosRef.current, {
+          const beforePrediction = predictedPosRef.current;
+          const predicted = predictMovement(beforePrediction, {
             up: !locked && keys.current.up,
             down: !locked && keys.current.down,
             left: !locked && keys.current.left,
@@ -1156,10 +1184,19 @@ export default function GameClient() {
             shoot: false,
             sprint: !locked && sprintRef.current,
           }, dt);
+          const velocityBlend = 1 - Math.exp(-18 * dt);
+          const rawVelocity = dt > 0
+            ? { x: (predicted.x - beforePrediction.x) / dt, y: (predicted.y - beforePrediction.y) / dt }
+            : { x: 0, y: 0 };
+          localVelocity = {
+            x: localVelocity.x + (rawVelocity.x - localVelocity.x) * velocityBlend,
+            y: localVelocity.y + (rawVelocity.y - localVelocity.y) * velocityBlend,
+          };
+          predictedPosRef.current = predicted;
 
           const correction = predictionCorrectionRef.current;
           if (Math.hypot(correction.x, correction.y) > 0.01) {
-            const reconcileFactor = 1 - Math.exp(-10 * dt);
+            const reconcileFactor = 1 - Math.exp(-LOCAL_RECONCILE_RATE * dt);
             const before = predictedPosRef.current;
             const corrected = renderer.movePredictedPublic(
               before.x,
@@ -1174,10 +1211,16 @@ export default function GameClient() {
             };
           }
         }
+        if (self.dead) {
+          const velocityBlend = 1 - Math.exp(-18 * dt);
+          localVelocity.x += (0 - localVelocity.x) * velocityBlend;
+          localVelocity.y += (0 - localVelocity.y) * velocityBlend;
+        }
       }
+      const motionSamples = motionSamplesRef.current;
+      const remoteRenderAt = now - REMOTE_INTERPOLATION_DELAY_MS;
       const players: RenderPlayer[] = snap.players.map((p) => {
         if (p.id === youRef.current && predictedPosRef.current) {
-          seen.add(p.id);
           const locked = panelsOpenRef.current;
           const localDx = locked ? 0 : (keys.current.right ? 1 : 0) - (keys.current.left ? 1 : 0);
           const localDy = locked ? 0 : (keys.current.down ? 1 : 0) - (keys.current.up ? 1 : 0);
@@ -1192,19 +1235,26 @@ export default function GameClient() {
             y: predictedPosRef.current.y,
             dx: predictedPosRef.current.x,
             dy: predictedPosRef.current.y,
+            vx: localVelocity.x,
+            vy: localVelocity.y,
             angle,
             facing,
             moving,
           };
         }
-        const d = lerp(p.id, p.x, p.y);
-        return { ...p, dx: d.x, dy: d.y };
+        const motion = sampleMotion(motionSamples, 'players', p.id, remoteRenderAt);
+        return { ...p, dx: motion?.x ?? p.x, dy: motion?.y ?? p.y, vx: motion?.vx ?? 0, vy: motion?.vy ?? 0 };
       });
       const enemies: RenderEnemy[] = snap.enemies.map((e) => {
-        const d = lerp(e.id, e.x, e.y);
-        return { ...e, dx: d.x, dy: d.y };
+        const motion = sampleMotion(motionSamples, 'enemies', e.id, remoteRenderAt);
+        return { ...e, dx: motion?.x ?? e.x, dy: motion?.y ?? e.y, vx: motion?.vx ?? 0, vy: motion?.vy ?? 0 };
       });
-      for (const id of displayPos.current.keys()) if (!seen.has(id)) displayPos.current.delete(id);
+      const projectiles = snap.projectiles.map((projectile) => {
+        // Fast, short-lived tracers need current-time presentation. Buffering them
+        // with remote characters makes the impact arrive before the bullet.
+        const motion = sampleMotion(motionSamples, 'projectiles', projectile.id, now);
+        return { ...projectile, x: motion?.x ?? projectile.x, y: motion?.y ?? projectile.y };
+      });
 
       floatsRef.current = floatsRef.current.filter((fl) => now - fl.at < 900);
       const floats: DamageFloat[] = floatsRef.current.map((fl) => ({
@@ -1259,7 +1309,7 @@ export default function GameClient() {
       renderer.draw(ctx, canvas.width, canvas.height, {
         players,
         enemies,
-        projectiles: snap.projectiles,
+        projectiles,
         containers: snap.containers,
         ground: snap.ground,
         floats,
@@ -1292,23 +1342,45 @@ export default function GameClient() {
 
       const you = meNow;
       const mm = minimapRef.current;
-      const visibleMapIds = new Set(players.map((player) => player.id));
-      const tacticalPlayers = [
-        ...players,
-        ...(snap.mapPlayers ?? []).filter((player) => !visibleMapIds.has(player.id)).map((player) => ({
-          id: player.id,
-          name: player.name,
-          dx: player.x,
-          dy: player.y,
-          dead: false,
-        })),
-      ];
       const tacticalFriendNames = new Set(friendNamesRef.current);
       const tacticalClanNames = new Set(clanNamesRef.current);
+      const tacticalPlayerIds = new Set([youRef.current]);
       for (const player of snap.mapPlayers ?? []) {
-        if (player.relation === 'clan') tacticalClanNames.add(player.name);
-        else tacticalFriendNames.add(player.name);
+        if (player.relation === 'clan') {
+          tacticalClanNames.add(player.name);
+          tacticalPlayerIds.add(player.id);
+        } else if (player.relation === 'friend') {
+          tacticalFriendNames.add(player.name);
+          tacticalPlayerIds.add(player.id);
+        }
       }
+      const tacticalPlayers = players
+        .filter((player) => (
+          tacticalPlayerIds.has(player.id)
+          || (init.kind !== 'world' && (
+            tacticalFriendNames.has(player.name)
+            || tacticalClanNames.has(player.name)
+          ))
+        ))
+        .map((player) => ({
+          id: player.id,
+          name: player.name,
+          dx: player.dx,
+          dy: player.dy,
+          dead: player.dead,
+        }));
+      const visibleMapIds = new Set(tacticalPlayers.map((player) => player.id));
+      tacticalPlayers.push(
+        ...(snap.mapPlayers ?? [])
+          .filter((player) => player.relation !== 'admin' && !visibleMapIds.has(player.id))
+          .map((player) => ({
+            id: player.id,
+            name: player.name,
+            dx: player.x,
+            dy: player.y,
+            dead: false,
+          })),
+      );
       const mapView = {
         pois: init.pois,
         players: tacticalPlayers,

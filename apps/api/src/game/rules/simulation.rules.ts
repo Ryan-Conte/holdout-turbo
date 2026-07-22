@@ -1,4 +1,4 @@
-import type { QuestDef } from '@holdout/shared';
+import { Tile, type QuestDef } from '@holdout/shared';
 
 export function actionInterruptedByMovement(startX: number, startY: number, x: number, y: number, tolerance = 14): boolean {
   return Math.hypot(x - startX, y - startY) > tolerance;
@@ -22,6 +22,17 @@ export function clanHideoutExitTarget(hasWorldReturnPosition: boolean): 'safe_zo
 
 export function elevationStepAllowed(from: number, to: number): boolean {
   return Math.abs(to - from) <= 1;
+}
+
+/**
+ * A resource ID may only describe a node that still exists on the simulation
+ * tile. Rock definitions also cover the copper/iron variants rolled at spawn.
+ */
+export function harvestResourceTileMatches(resourceTile: number, currentTile: number): boolean {
+  return resourceTile === currentTile || (
+    resourceTile === Tile.Rock &&
+    (currentTile === Tile.CopperOre || currentTile === Tile.IronOre)
+  );
 }
 
 export function questUnlocked(claimed: Record<string, boolean>, quest: Pick<QuestDef, 'requires'>): boolean {

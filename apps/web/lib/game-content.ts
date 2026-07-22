@@ -54,9 +54,9 @@ const spriteAssets = [
       width: 16,
       height: 16,
       pixels: [] as string[],
-      source: { sheet: 'chars' as const, col: 0, row, frames: 2 },
+      source: { sheet: 'chars' as const, col: 0, row, frames: 4 },
   })),
-  { id: 'character:brute', name: 'Brute', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'chars' as const, col: 0, row: 8, frames: 2 } },
+  { id: 'character:brute', name: 'Brute', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'chars' as const, col: 0, row: 8, frames: 4 } },
   { id: 'resource:tree', name: 'Common tree', width: 32, height: 32, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 10, row: 0, frames: 1 } },
   { id: 'resource:ironwood', name: 'Ironwood tree', width: 32, height: 32, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 10, row: 0, frames: 1 } },
   { id: 'resource:rock', name: 'Stone outcrop', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 12, row: 0, frames: 1 } },
@@ -76,9 +76,9 @@ const spriteAssets = [
 
 const defaultClips = {
   idle: { frames: [0], frameMs: 500, loop: true },
-  walk: { frames: [0, 1], frameMs: 125, loop: true },
-  attack: { frames: [1, 0], frameMs: 110, loop: false },
-  hit: { frames: [1, 0], frameMs: 90, loop: false },
+  walk: { frames: [1, 2, 3, 2], frameMs: 105, loop: true },
+  attack: { frames: [0, 1, 2, 0], frameMs: 90, loop: false },
+  hit: { frames: [3, 0], frameMs: 80, loop: false },
   death: { frames: [1], frameMs: 400, loop: false },
 };
 

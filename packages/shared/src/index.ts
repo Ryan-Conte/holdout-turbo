@@ -570,7 +570,14 @@ export interface MapPlayerSnap {
   relation: 'friend' | 'clan' | 'admin';
 }
 
-export interface ProjectileSnap { id: number; x: number; y: number; angle: number }
+export interface ProjectileSnap {
+  id: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  angle: number;
+}
 
 export interface ContainerSnap {
   id: string;
@@ -681,6 +688,9 @@ export interface HitSnap {
   kind: 'player' | 'enemy' | 'node';
   material?: 'wood' | 'stone';
   soundId?: string;
+  /** Lets clients retire the matching tracer on the exact authoritative impact. */
+  projectileId?: number;
+  projectileAngle?: number;
 }
 
 /** `under` = a station's floor; `resourceId` changes the live resource variant. */

@@ -270,7 +270,8 @@ export function MapStudio() {
     const x = object.x * TILE + TILE / 2;
     const y = object.y * TILE + TILE / 2;
     const pulse = 0.72 + Math.sin(time / 320 + index) * 0.18;
-    const frame = Math.floor(time / 420 + index) % 2;
+    const previewCycle = [0, 1, 2, 3, 2];
+    const frame = previewCycle[Math.floor(time / 180 + index) % previewCycle.length];
 
     if (object.type.startsWith('poi_') || object.type === 'trader') {
       if (showZones) {

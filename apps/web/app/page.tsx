@@ -2,8 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { DEFAULT_CHARACTER_APPEARANCE, sanitizeCharacterAppearance, type CharacterAppearance } from '@holdout/shared';
-import { CharacterCreator } from '@/components/CharacterCreator';
+import { DEFAULT_CHARACTER_APPEARANCE } from '@holdout/shared';
 import { SurvivorPortrait } from '@/components/SurvivorPortrait';
 import { authClient } from '@/lib/auth-client';
 
@@ -118,14 +117,15 @@ function RelayPicker({ id, label, servers, selectedUrl, pings, onPick, onRescan 
 }
 
 const FIELD_NOTES = [
-  { code: '01', title: 'SCAVENGE', desc: 'Push deeper into the zone for weapons, ore, and prototype hardware.' },
-  { code: '02', title: 'FORTIFY', desc: 'Turn a bare hideout into a working base with storage, fire, and steel.' },
-  { code: '03', title: 'EXTRACT', desc: 'Reach a beacon alive. Anything left on your body belongs to the zone.' },
+  { code: '01', title: 'SCAVENGE', desc: 'Enter the zone and search for weapons, resources, and valuable gear.' },
+  { code: '02', title: 'BUILD', desc: 'Bring supplies home and turn your hideout into a fortified base.' },
+  { code: '03', title: 'EXTRACT', desc: 'Reach an extraction beacon alive—or lose everything you carried.' },
 ];
 
 export default function LandingPage() {
   const router = useRouter();
   const { data: session, isPending } = authClient.useSession();
+  const [accessMode, setAccessMode] = useState<'account' | 'guest'>('account');
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
@@ -137,13 +137,6 @@ export default function LandingPage() {
   const [pings, setPings] = useState<Pings>({});
   const [deploying, setDeploying] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [landingView, setLandingView] = useState<'deploy' | 'character'>('deploy');
-  const [appearance, setAppearance] = useState<CharacterAppearance>(DEFAULT_CHARACTER_APPEARANCE);
-  const [savedAppearance, setSavedAppearance] = useState<CharacterAppearance>(DEFAULT_CHARACTER_APPEARANCE);
-  const [appearanceConfigured, setAppearanceConfigured] = useState(false);
-  const [appearanceLoading, setAppearanceLoading] = useState(true);
-  const [appearanceSaving, setAppearanceSaving] = useState(false);
-  const [appearanceError, setAppearanceError] = useState('');
 
   useEffect(() => {
     if (!session?.user) {
@@ -152,34 +145,6 @@ export default function LandingPage() {
     }
     void fetch('/api/admin/me').then((res) => setIsAdmin(res.ok)).catch(() => setIsAdmin(false));
   }, [session?.user.id]);
-
-  useEffect(() => {
-    if (!session?.user) {
-      setAppearance(DEFAULT_CHARACTER_APPEARANCE);
-      setSavedAppearance(DEFAULT_CHARACTER_APPEARANCE);
-      setAppearanceConfigured(false);
-      setAppearanceLoading(isPending);
-      setLandingView('deploy');
-      return;
-    }
-    let cancelled = false;
-    setAppearanceLoading(true);
-    void fetch('/api/profile/appearance', { cache: 'no-store' })
-      .then(async (res) => {
-        if (!res.ok) throw new Error('Could not load survivor profile');
-        const data = await res.json() as { appearance?: unknown; configured?: boolean };
-        if (cancelled) return;
-        const loaded = sanitizeCharacterAppearance(data.appearance);
-        setAppearance(loaded);
-        setSavedAppearance(loaded);
-        setAppearanceConfigured(Boolean(data.configured));
-      })
-      .catch(() => {
-        if (!cancelled) setAppearanceError('Could not load your survivor. You can still configure a new profile.');
-      })
-      .finally(() => { if (!cancelled) setAppearanceLoading(false); });
-    return () => { cancelled = true; };
-  }, [isPending, session?.user.id]);
 
   useEffect(() => {
     const message = new URLSearchParams(window.location.search).get('steam_error');
@@ -281,11 +246,6 @@ export default function LandingPage() {
   }
 
   const deploy = () => {
-    if (!appearanceConfigured) {
-      setAppearanceError('');
-      setLandingView('character');
-      return;
-    }
     setDeploying(true);
     router.push('/play');
   };
@@ -296,90 +256,61 @@ export default function LandingPage() {
     router.push(`/play?guest=1&server=${encodeURIComponent(serverUrl)}`);
   };
 
-  const saveAppearance = async () => {
-    setAppearanceSaving(true);
-    setAppearanceError('');
-    try {
-      const res = await fetch('/api/profile/appearance', {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ appearance }),
-      });
-      if (!res.ok) throw new Error('Could not save profile');
-      const data = await res.json() as { appearance?: unknown };
-      const saved = sanitizeCharacterAppearance(data.appearance);
-      setAppearance(saved);
-      setSavedAppearance(saved);
-      setAppearanceConfigured(true);
-      setLandingView('deploy');
-    } catch {
-      setAppearanceError('The survivor profile could not be saved. Please try again.');
-    } finally {
-      setAppearanceSaving(false);
-    }
-  };
-
   const selectedServer = servers.find((server) => server.url === serverUrl);
   const availableServers = servers.filter((server) => typeof pings[server.id] === 'number').length;
-
-  if (session?.user && landingView === 'character') {
-    return (
-      <CharacterCreator
-        callsign={session.user.name}
-        value={appearance}
-        saving={appearanceSaving}
-        error={appearanceError}
-        onChange={setAppearance}
-        onCancel={() => { setAppearance(savedAppearance); setLandingView('deploy'); }}
-        onSave={() => void saveAppearance()}
-      />
-    );
-  }
 
   return (
     <div className="home-shell" id="top">
       <header className="home-topbar">
         <a className="home-brand" href="#top" aria-label="Holdout home">
           <span className="home-brand-mark">H</span>
-          <span><b>HOLDOUT</b><small>EXTRACTION PROTOCOL</small></span>
+          <span><b>HOLDOUT</b><small>SURVIVAL EXTRACTION</small></span>
         </a>
-        <div className="home-network">
-          <span className={`home-network-dot${availableServers > 0 ? ' online' : ''}`} />
-          <span>{servers.length === 0 ? 'SEARCHING FOR RELAYS' : `${availableServers}/${servers.length} RELAYS AVAILABLE`}</span>
+        <div className="home-topbar-status">
+          <span className="home-build-tag">EARLY ACCESS</span>
+          <div className="home-network">
+            <span className={`home-network-dot${availableServers > 0 ? ' online' : ''}`} />
+            <span>{servers.length === 0 ? 'SEARCHING FOR RELAYS' : `${availableServers}/${servers.length} RELAYS ONLINE`}</span>
+          </div>
         </div>
       </header>
 
       <main className="home-layout">
         <section className="home-briefing">
-          <div className="home-kicker"><span>FIELD BRIEFING</span><b>SECTOR 07</b></div>
-          <h1>NOTHING OUT THERE<br />IS <em>YOURS</em> YET.</h1>
+          <div className="home-kicker"><span>ONLINE SURVIVAL EXTRACTION</span><b>SECTOR 07 IS LIVE</b></div>
+          <h1>BUILD YOUR HOLDOUT.<br /><em>SURVIVE THE ZONE.</em></h1>
           <p className="home-lede">
-            Enter empty-handed. Scavenge a living from the ruins, build somewhere worth returning to,
-            and make it home before another survivor takes your place.
+            Enter a hostile shared world, take what you can carry, and get out alive.
+            Every successful raid makes your home stronger. Every death costs you the gear on your back.
           </p>
 
-          <div className="home-map" aria-label="Illustrated extraction zone">
-            <div className="home-map-grid" />
-            <div className="home-route route-one" />
-            <div className="home-route route-two" />
-            <span className="home-map-label label-outpost">SAFEHOUSE 04</span>
-            <span className="home-map-label label-danger">HIGH RISK</span>
-            <span className="home-map-label label-extract">EXFIL B</span>
-            <div className="home-map-point point-safe"><i /></div>
-            <div className="home-map-point point-danger"><i /></div>
-            <div className="home-extract-ring"><i /></div>
-            <div className="home-sprite survivor" />
-            <div className="home-sprite hostile" />
-            <div className="home-map-coords">27.4691 N / 82.6417 E<br />SIGNAL DEGRADED</div>
+          <div className="home-pill-row" aria-label="Game features">
+            <span>PERSISTENT BASE</span>
+            <span>OPEN-WORLD PVP</span>
+            <span>SOLO OR CLAN</span>
           </div>
 
-          <div className="home-field-notes">
-            {FIELD_NOTES.map((note) => (
-              <article key={note.code}>
-                <span>{note.code}</span>
-                <div><b>{note.title}</b><p>{note.desc}</p></div>
-              </article>
-            ))}
+          <div className="home-raid-loop">
+            <div className="home-raid-loop-head">
+              <div><span>HOW A RAID WORKS</span><b>YOUR NEXT RUN</b></div>
+              <small>ONE LIFE · ONE LOADOUT</small>
+            </div>
+            <div className="home-field-notes">
+              {FIELD_NOTES.map((note) => (
+                <article key={note.code}>
+                  <span>{note.code}</span>
+                  <div><b>{note.title}</b><p>{note.desc}</p></div>
+                </article>
+              ))}
+            </div>
+          </div>
+
+          <div className="home-risk-strip">
+            <span aria-hidden="true">!</span>
+            <div>
+              <b>EVERYTHING CARRIED IS AT RISK</b>
+              <p>Your hideout is safe. The world outside it is not.</p>
+            </div>
           </div>
         </section>
 
@@ -395,7 +326,7 @@ export default function LandingPage() {
             ) : session?.user ? (
               <>
                 <div className="home-operator">
-                  <div className="home-portrait"><SurvivorPortrait appearance={appearance} label={`${session.user.name} survivor`} /></div>
+                  <div className="home-portrait"><SurvivorPortrait appearance={DEFAULT_CHARACTER_APPEARANCE} label={`${session.user.name} survivor`} /></div>
                   <div><span>OPERATOR ONLINE</span><b>{session.user.name}</b><small>Clearance verified</small></div>
                 </div>
                 <RelayPicker
@@ -407,13 +338,8 @@ export default function LandingPage() {
                   onPick={pickServer}
                   onRescan={() => { setPings({}); void measurePings(servers); }}
                 />
-                <button className="btn-survivor" disabled={appearanceLoading} onClick={() => { setAppearanceError(''); setLandingView('character'); }}>
-                  <span><i className={appearanceConfigured ? 'ready' : ''} />{appearanceConfigured ? 'SURVIVOR READY' : 'PROFILE REQUIRED'}</span>
-                  <b>{appearanceLoading ? 'LOADING...' : appearanceConfigured ? 'EDIT APPEARANCE' : 'CREATE SURVIVOR'}</b>
-                </button>
-                {appearanceError && <div className="auth-error">{appearanceError}</div>}
-                <button className="btn-primary deploy-btn" disabled={deploying || appearanceLoading || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'} onClick={deploy}>
-                  <span>{deploying ? 'OPENING CHANNEL...' : appearanceConfigured ? 'ENTER HIDEOUT' : 'CREATE SURVIVOR TO CONTINUE'}</span>
+                <button className="btn-primary deploy-btn" disabled={deploying || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'} onClick={deploy}>
+                  <span>{deploying ? 'OPENING CHANNEL...' : 'ENTER HIDEOUT'}</span>
                   <b>{selectedServer?.region ?? '--'}</b>
                 </button>
                 <div className="home-console-links">
@@ -424,46 +350,90 @@ export default function LandingPage() {
             ) : (
               <>
                 <div className="home-auth-intro">
-                  <span>AUTHORIZED PERSONNEL ONLY</span>
-                  <h2>ENTER THE ZONE</h2>
-                  <p>Your profile, hideout, and extraction record are tied to this identity.</p>
+                  <span>DEPLOYMENT OPTIONS</span>
+                  <h2>CHOOSE HOW TO PLAY</h2>
+                  <p>Continue your survivor or jump straight into a temporary guest raid.</p>
                 </div>
-                <div className="auth-tabs">
-                  <button className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setError(''); }}>LOG IN</button>
-                  <button className={mode === 'register' ? 'active' : ''} onClick={() => { setMode('register'); setError(''); }}>ENLIST</button>
+                <div className="home-access-modes" role="tablist" aria-label="Deployment type">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={accessMode === 'account'}
+                    aria-controls="account-access"
+                    className={accessMode === 'account' ? 'active' : ''}
+                    onClick={() => { setAccessMode('account'); setError(''); }}
+                  >
+                    <span>ACCOUNT</span>
+                    <small>Save your progress</small>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={accessMode === 'guest'}
+                    aria-controls="guest-access"
+                    className={accessMode === 'guest' ? 'active' : ''}
+                    onClick={() => { setAccessMode('guest'); setError(''); }}
+                  >
+                    <span>GUEST RAID</span>
+                    <small>Play immediately</small>
+                  </button>
                 </div>
-                <form onSubmit={submit}>
-                  <label><span>EMAIL</span><input placeholder="operator@holdout" type="email" value={email} onChange={(event) => setEmail(event.target.value)} /></label>
-                  {mode === 'register' && (
-                    <label><span>CALLSIGN</span><input placeholder="Shown in game" value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-                  )}
-                  <label><span>PASSWORD</span><input placeholder="Minimum 8 characters" type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
-                  {error && <div className="auth-error">{error}</div>}
-                  <button className="btn-primary" disabled={busy}>{busy ? 'AUTHENTICATING...' : mode === 'login' ? 'VERIFY IDENTITY' : 'CREATE OPERATOR'}</button>
-                </form>
-                <div className="auth-divider"><span>OR USE EXTERNAL ID</span></div>
-                <a className="btn-steam" href="/api/auth/steam"><span className="steam-mark">S</span> CONTINUE WITH STEAM</a>
-                <div className="auth-divider guest-divider"><span>TRY WITHOUT AN ACCOUNT</span></div>
-                <div className="guest-relay-picker">
-                  <RelayPicker
-                    id="guest-relay"
-                    label="SELECT GUEST RELAY"
-                    servers={servers}
-                    selectedUrl={serverUrl}
-                    pings={pings}
-                    onPick={pickServer}
-                    onRescan={() => { setPings({}); void measurePings(servers); }}
-                  />
-                </div>
-                <button
-                  className="btn-guest"
-                  disabled={deploying || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'}
-                  onClick={deployGuest}
-                >
-                  <span>{deploying ? 'OPENING GUEST CHANNEL...' : 'DROP IN AS GUEST'}</span>
-                  <small>Temporary raid · no chat, community, extraction or saved progress</small>
-                  <b>{selectedServer?.region ?? 'SELECTING RELAY'}</b>
-                </button>
+
+                {accessMode === 'account' ? (
+                  <div className="home-access-panel" id="account-access" role="tabpanel">
+                    <div className="home-access-panel-head">
+                      <b>ACCOUNT ACCESS</b>
+                      <span>Persistent survivor</span>
+                    </div>
+                    <div className="auth-tabs">
+                      <button type="button" className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setError(''); }}>LOG IN</button>
+                      <button type="button" className={mode === 'register' ? 'active' : ''} onClick={() => { setMode('register'); setError(''); }}>CREATE ACCOUNT</button>
+                    </div>
+                    <form onSubmit={submit}>
+                      <label><span>EMAIL</span><input placeholder="operator@holdout" type="email" value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+                      {mode === 'register' && (
+                        <label><span>CALLSIGN</span><input placeholder="Shown in game" value={username} onChange={(event) => setUsername(event.target.value)} /></label>
+                      )}
+                      <label><span>PASSWORD</span><input placeholder="Minimum 8 characters" type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+                      {error && <div className="auth-error">{error}</div>}
+                      <button className="btn-primary" disabled={busy}>{busy ? 'AUTHENTICATING...' : mode === 'login' ? 'LOG IN & CONTINUE' : 'CREATE SURVIVOR'}</button>
+                    </form>
+                    <div className="auth-divider"><span>OR CONTINUE WITH</span></div>
+                    <a className="btn-steam" href="/api/auth/steam"><span className="steam-mark">S</span> STEAM</a>
+                  </div>
+                ) : (
+                  <div className="home-access-panel home-guest-panel" id="guest-access" role="tabpanel">
+                    <div className="home-access-panel-head">
+                      <b>GUEST DEPLOYMENT</b>
+                      <span>Temporary raid</span>
+                    </div>
+                    <p className="home-guest-lede">Choose a relay and enter the main world immediately with empty hands.</p>
+                    <div className="home-guest-notice">
+                      <b>GUEST LIMITS</b>
+                      <p>No saved progress, extraction, chat, friends, clans, or community features.</p>
+                    </div>
+                    <div className="guest-relay-picker">
+                      <RelayPicker
+                        id="guest-relay"
+                        label="CHOOSE RELAY"
+                        servers={servers}
+                        selectedUrl={serverUrl}
+                        pings={pings}
+                        onPick={pickServer}
+                        onRescan={() => { setPings({}); void measurePings(servers); }}
+                      />
+                    </div>
+                    <button
+                      className="btn-guest"
+                      disabled={deploying || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'}
+                      onClick={deployGuest}
+                    >
+                      <span>{deploying ? 'OPENING GUEST CHANNEL...' : 'DEPLOY AS GUEST'}</span>
+                      <small>Start a temporary raid now</small>
+                      <b>{selectedServer?.region ?? 'SELECTING RELAY'}</b>
+                    </button>
+                  </div>
+                )}
               </>
             )}
           </div>
@@ -473,9 +443,9 @@ export default function LandingPage() {
       </main>
 
       <footer className="home-footer">
-        <span>HOLDOUT FIELD NETWORK</span>
-        <p>Punch trees. Forge steel. Wall in your camp. Trust carefully. Extract.</p>
-        <span>ALL CARRIED GEAR AT RISK</span>
+        <span>HOLDOUT FIELD NETWORK · BUILD 0.7.4</span>
+        <p>Scavenge. Build. Fight. Extract.</p>
+        <span>THE ZONE KEEPS WHAT YOU LOSE</span>
       </footer>
     </div>
   );
