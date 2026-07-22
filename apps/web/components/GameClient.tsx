@@ -60,8 +60,10 @@ import { DeathOverlay, PauseOverlay } from '@/components/game/SystemOverlays';
 import { TradePanel, TradeTab } from '@/components/game/TradePanel';
 import { WORLD_MAP_DEFAULT_ZOOM, WORLD_MAP_SIZE, WorldMapIcon, WorldMapOverlay, type WorldMapViewport } from '@/components/game/WorldMapOverlay';
 import { AdminPanel } from '@/components/game/AdminPanel';
+import { MobileControls, type TouchVector } from '@/components/game/MobileControls';
 import { applyRuntimeGameplay, itemDef, runtimeItems, runtimeRecipes } from '@/lib/runtime-gameplay';
 import { applyRuntimeVisuals } from '@/lib/runtime-visuals';
+import { isTouchPlayDevice } from '@/lib/mobile-play';
 import {
   LOCAL_RECONCILE_DEAD_ZONE,
   LOCAL_RECONCILE_RATE,
@@ -137,6 +139,8 @@ export default function GameClient() {
   const motionSamplesRef = useRef<MotionSample[]>([]);
   const keys = useRef({ up: false, down: false, left: false, right: false });
   const sprintRef = useRef(false);
+  const touchMoveRef = useRef({ x: 0, y: 0, active: false, sprint: false });
+  const touchAimRef = useRef({ x: 1, y: 0, hasDirection: false, firing: false });
   const mouse = useRef({ x: 0, y: 0, down: false });
   const mouseSeenRef = useRef(false);
   const sendInputNowRef = useRef<() => void>(() => undefined);
@@ -243,6 +247,7 @@ export default function GameClient() {
   const [demolishMode, setDemolishMode] = useState(false); // camp demolish mode (X)
   const [buildRotation, setBuildRotation] = useState(0);
   const [escMenu, setEscMenu] = useState(false); // pause/system menu (ESC)
+  const [touchMode, setTouchMode] = useState(false);
   const [objectives, setObjectives] = useState<Record<string, boolean>>(() => {
     try { return JSON.parse(localStorage.getItem('holdout_objectives') ?? '{}'); } catch { return {}; }
   });
@@ -280,6 +285,19 @@ export default function GameClient() {
       window.removeEventListener('pointerdown', unlockAmbient);
       window.removeEventListener('keydown', unlockAmbient);
       stopAmbient();
+    };
+  }, []);
+
+  useEffect(() => {
+    const pointerQuery = window.matchMedia('(pointer: coarse)');
+    const compactQuery = window.matchMedia('(max-width: 900px) and (max-height: 600px), (max-width: 600px) and (orientation: portrait)');
+    const update = () => setTouchMode(isTouchPlayDevice() || compactQuery.matches);
+    update();
+    pointerQuery.addEventListener('change', update);
+    compactQuery.addEventListener('change', update);
+    return () => {
+      pointerQuery.removeEventListener('change', update);
+      compactQuery.removeEventListener('change', update);
     };
   }, []);
 
@@ -444,6 +462,39 @@ export default function GameClient() {
     if (which !== null) setDemolishMode(false);
     setEscMenu(false);
   }, [getMapPlayerPosition, updateWorldMapView]);
+
+  const updateTouchMove = useCallback((vector: TouchVector, active: boolean) => {
+    const magnitude = Math.hypot(vector.x, vector.y);
+    touchMoveRef.current = {
+      x: active && magnitude >= 0.14 ? vector.x : 0,
+      y: active && magnitude >= 0.14 ? vector.y : 0,
+      active,
+      sprint: active && magnitude >= 0.82,
+    };
+    if (active) startAmbient();
+    sendInputNowRef.current();
+  }, []);
+
+  const updateTouchAim = useCallback((vector: TouchVector, active: boolean) => {
+    const magnitude = Math.hypot(vector.x, vector.y);
+    if (magnitude >= 0.16) {
+      touchAimRef.current.x = vector.x / magnitude;
+      touchAimRef.current.y = vector.y / magnitude;
+      touchAimRef.current.hasDirection = true;
+    }
+    touchAimRef.current.firing = active && magnitude >= 0.2;
+    if (active) startAmbient();
+    sendInputNowRef.current();
+  }, []);
+
+  const closeMobilePanel = useCallback(() => {
+    setChatOpen(false);
+    setChatText('');
+    setCtxMenu(null);
+    setLootQueue([]);
+    lootContRef.current = null;
+    only(null);
+  }, [only]);
 
   // no build mode: holding a kit IS placement — equip it, ghost follows, click places
   const holdKit = useCallback((slot: number) => {
@@ -999,13 +1050,15 @@ export default function GameClient() {
       mouse.current.x = e.clientX;
       mouse.current.y = e.clientY;
       mouseSeenRef.current = true;
+      const touchGenerated = (e as MouseEvent & { sourceCapabilities?: { firesTouchEvents?: boolean } }).sourceCapabilities?.firesTouchEvents === true;
+      if (!touchGenerated) touchAimRef.current.hasDirection = false;
       if (dragRef.current) setDragPos({ x: e.clientX, y: e.clientY });
     };
     const onMouseDown = (e: MouseEvent) => {
       // keep the context menu open when clicking its own buttons
       if (!(e.target instanceof Element && e.target.closest('.ctx-menu'))) setCtxMenu(null);
       if (e.button !== 0) return;
-      if (e.target instanceof Element && e.target.closest('.panel, .gear-screen, .death-overlay, .hotbar, .ctx-menu, button, input, .chat-bar')) return;
+      if (e.target instanceof Element && e.target.closest('.panel, .gear-screen, .death-overlay, .hotbar, .ctx-menu, .mobile-controls, button, input, .chat-bar')) return;
       // holding a build kit: click the ground to place it (no separate build mode)
       const pl = heldKitRef.current;
       if (pl && snapRef.current) {
@@ -1050,6 +1103,8 @@ export default function GameClient() {
     const onBlur = () => {
       keys.current = { up: false, down: false, left: false, right: false };
       sprintRef.current = false;
+      touchMoveRef.current = { x: 0, y: 0, active: false, sprint: false };
+      touchAimRef.current.firing = false;
       mouse.current.down = false;
       sendInputNowRef.current();
     };
@@ -1081,18 +1136,25 @@ export default function GameClient() {
     const sendInput = () => {
       const socket = socketRef.current;
       if (!socket || !socket.connected) return;
-      const angle = Math.atan2(mouse.current.y - window.innerHeight / 2, mouse.current.x - window.innerWidth / 2);
+      const touchMove = touchMoveRef.current;
+      const touchAim = touchAimRef.current;
+      const angle = touchAim.hasDirection
+        ? Math.atan2(touchAim.y, touchAim.x)
+        : Math.atan2(mouse.current.y - window.innerHeight / 2, mouse.current.x - window.innerWidth / 2);
       // menus freeze you in place (and stop attacks)
       const locked = panelsOpenRef.current;
-      const dirs = locked
-        ? { up: false, down: false, left: false, right: false }
-        : keys.current;
-      const moving = !locked && (keys.current.up || keys.current.down || keys.current.left || keys.current.right);
+      const dirs = locked ? { up: false, down: false, left: false, right: false } : {
+        up: keys.current.up || touchMove.y < -0.22,
+        down: keys.current.down || touchMove.y > 0.22,
+        left: keys.current.left || touchMove.x < -0.22,
+        right: keys.current.right || touchMove.x > 0.22,
+      };
+      const moving = !locked && (dirs.up || dirs.down || dirs.left || dirs.right);
       const input: InputPayload = {
         ...dirs,
         angle,
-        shoot: mouse.current.down && !locked && !heldKitRef.current && !demolishRef.current,
-        sprint: sprintRef.current && !locked,
+        shoot: (mouse.current.down || touchAim.firing) && !locked && !heldKitRef.current && !demolishRef.current,
+        sprint: (sprintRef.current || touchMove.sprint) && !locked,
         seq: ++inputSeqRef.current,
       };
       if (movementIntentKey(input) !== movementIntentKey(lastInputRef.current)) {
@@ -1138,7 +1200,7 @@ export default function GameClient() {
           }
         }
       }
-      const stepCadence = sprintRef.current ? 215 : 285;
+      const stepCadence = input.sprint ? 215 : 285;
       if (moving && now - lastStepAt.current > stepCadence) {
         sfx.step();
         lastStepAt.current = now;
@@ -1564,6 +1626,17 @@ export default function GameClient() {
     setCtxMenu({ x: e.clientX, y: e.clientY, zone, index, item, qty });
   };
 
+  const openTouchCtx = (zone: DragZone, index: number, item: ItemId, qty: number, x: number, y: number) => {
+    setCtxMenu({
+      x: Math.max(8, Math.min(x, window.innerWidth - 168)),
+      y: Math.max(8, Math.min(y, window.innerHeight - 230)),
+      zone,
+      index,
+      item,
+      qty,
+    });
+  };
+
   const ctxAction = (action: string) => {
     const m = ctxMenu;
     setCtxMenu(null);
@@ -1586,7 +1659,7 @@ export default function GameClient() {
   const equippedItem = inv && inv.equipped !== null ? inv.inv.slots[inv.equipped] : null;
   const eqWeapon = equippedItem ? itemDef(equippedItem.id).weapon : null;
   const heldKit = equippedItem && itemDef(equippedItem.id).place ? { slot: inv!.equipped!, item: equippedItem.id, qty: equippedItem.qty } : null;
-  const anyPanel = showGear || showCraft || showSkills || showSocial || showMap || showAdmin || !!container || !!trade || chatOpen || !!station || !!dead || escMenu;
+  const anyPanel = showGear || showCraft || showSkills || showSocial || showMap || showAdmin || !!container || !!trade || chatOpen || !!ctxMenu || !!station || !!dead || escMenu;
   const ammoReserve = eqWeapon ? countOf(eqWeapon.ammo) : null;
   const weight = inv ? invWeight(inv.inv, runtimeItems()) : 0;
   const cap = inv ? invCapacity(inv.inv) : BACKPACKS[0];
@@ -1714,6 +1787,9 @@ export default function GameClient() {
         }}
         onMouseUp={() => dropOn('inv', i)}
         onContextMenu={(e) => s && openCtx('inv', i, s.id, s.qty, e)}
+        onClick={(e) => {
+          if (touchMode && s) openTouchCtx('inv', i, s.id, s.qty, e.clientX, e.clientY);
+        }}
         onDoubleClick={() => s && useSlot(i)}
       >
         {i < 5 && <span className="keycap">{i + 1}</span>}
@@ -1732,6 +1808,9 @@ export default function GameClient() {
           onMouseDown={(e) => id && beginDrag(zone, 0, id, 1, e)}
           onMouseUp={() => dropOn(zone, 0)}
           onContextMenu={(e) => id && openCtx(zone, 0, id, 1, e)}
+          onClick={(e) => {
+            if (touchMode && id) openTouchCtx(zone, 0, id, 1, e.clientX, e.clientY);
+          }}
         >
           <span className="corner">{label}</span>
           {id && <ItemIcon id={id} size={32} />}
@@ -1745,6 +1824,45 @@ export default function GameClient() {
       <canvas ref={canvasRef} className="world" style={{ cursor: anyPanel ? 'default' : 'none' }} />
       {!connected && <div className="connect-overlay">CONNECTING TO THE ZONE…</div>}
       {hurtAt > 0 && <div className="hurt-flash" key={hurtAt} />}
+
+      <MobileControls
+        connected={connected && !dead}
+        gameplayLocked={anyPanel}
+        panelOpen={anyPanel}
+        guest={isGuest}
+        muted={muted}
+        rotatingBuild={Boolean(heldKit)}
+        onMove={updateTouchMove}
+        onAim={updateTouchAim}
+        onInteract={() => {
+          startAmbient();
+          navigator.vibrate?.(8);
+          emit(EV.interact);
+        }}
+        onReload={() => {
+          startAmbient();
+          navigator.vibrate?.(8);
+          if (heldKitRef.current) rotateBuild();
+          else emit(EV.reload);
+        }}
+        onHeal={() => {
+          startAmbient();
+          navigator.vibrate?.(8);
+          quickHeal();
+        }}
+        onGear={() => only(menuRef.current.gear ? null : 'gear')}
+        onCraft={() => only(menuRef.current.craft ? null : 'craft')}
+        onMap={() => only(menuRef.current.map ? null : 'map')}
+        onSkills={() => only(menuRef.current.skills ? null : 'skills')}
+        onSocial={() => {
+          only(menuRef.current.social ? null : 'social');
+          refreshCommunity();
+        }}
+        onChat={() => setChatOpen(true)}
+        onSound={() => setMuted(toggleMute())}
+        onPause={() => setEscMenu(true)}
+        onClosePanel={closeMobilePanel}
+      />
 
       {connected && !showMap && (
         <div className="minimap-wrap">
@@ -1808,7 +1926,7 @@ export default function GameClient() {
         </div>
       )}
 
-      {prompt && !panelsOpenRef.current && <div className="prompt"><b>E</b> {prompt}</div>}
+      {prompt && !panelsOpenRef.current && <div className="prompt"><b>{touchMode ? 'USE' : 'E'}</b> {prompt}</div>}
 
       {/* HUD */}
       {inv && (
@@ -1836,7 +1954,7 @@ export default function GameClient() {
           </div>
           <div className={`bar mini stamina${inv.staminaExhausted ? ' exhausted' : ''}`} title="Exhaustion prevents attacks and slows movement until 25 stamina recovers">
             <div className="fill" style={{ width: `${inv.stamina}%`, background: inv.staminaExhausted ? '#c85a4a' : inv.stamina > 25 ? '#5fd0a0' : 'var(--gold)' }} />
-            <div className="label">{inv.staminaExhausted ? `EXHAUSTED ${inv.stamina}` : `STAM ${inv.stamina} · SHIFT run`}</div>
+            <div className="label">{inv.staminaExhausted ? `EXHAUSTED ${inv.stamina}` : touchMode ? `STAM ${inv.stamina} · STICK EDGE RUN` : `STAM ${inv.stamina} · SHIFT run`}</div>
           </div>
           <div className="weapon-line">
             {equippedItem
@@ -1874,8 +1992,8 @@ export default function GameClient() {
         const rawHeld = inv.inv.slots.filter((s) => s && itemDef(s.id).raw) as { id: ItemId; qty: number }[];
         const hints: string[] = [];
         if (inv.nearWater) {
-          hints.push(inv.thirst < 100 ? 'E — drink from the water' : 'Water here');
-          if (hasRod) hints.push('LMB — cast the line');
+          hints.push(inv.thirst < 100 ? (touchMode ? 'USE — drink from the water' : 'E — drink from the water') : 'Water here');
+          if (hasRod) hints.push(touchMode ? 'AIM stick — cast the line' : 'LMB — cast the line');
           else hints.push('equip a rod to fish');
         }
         if (inv.nearFirepit && rawHeld.length) hints.push('right-click raw food → cook');
@@ -1999,6 +2117,11 @@ export default function GameClient() {
               onMouseDown={(e) => equippedItem && inv.equipped !== null && beginDrag('weapon', inv.equipped, equippedItem.id, 1, e)}
               onMouseUp={() => dropOn('weapon', 0)}
               onContextMenu={(e) => equippedItem && inv.equipped !== null && openCtx('inv', inv.equipped, equippedItem.id, 1, e)}
+              onClick={(e) => {
+                if (touchMode && equippedItem && inv.equipped !== null) {
+                  openTouchCtx('inv', inv.equipped, equippedItem.id, 1, e.clientX, e.clientY);
+                }
+              }}
             >
               <span className="corner">[1]</span>
               {equippedItem ? (

@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { DEFAULT_CHARACTER_APPEARANCE } from '@holdout/shared';
 import { SurvivorPortrait } from '@/components/SurvivorPortrait';
 import { authClient } from '@/lib/auth-client';
+import { enterMobilePlayMode } from '@/lib/mobile-play';
 
 interface GameServerEntry { id: number; name: string; region: string; url: string }
 type Pings = Record<number, number | 'timeout' | undefined>;
@@ -245,14 +246,16 @@ export default function LandingPage() {
     }
   }
 
-  const deploy = () => {
+  const deploy = async () => {
     setDeploying(true);
+    await enterMobilePlayMode();
     router.push('/play');
   };
 
-  const deployGuest = () => {
+  const deployGuest = async () => {
     if (!serverUrl) return;
     setDeploying(true);
+    await enterMobilePlayMode();
     router.push(`/play?guest=1&server=${encodeURIComponent(serverUrl)}`);
   };
 
@@ -338,7 +341,7 @@ export default function LandingPage() {
                   onPick={pickServer}
                   onRescan={() => { setPings({}); void measurePings(servers); }}
                 />
-                <button className="btn-primary deploy-btn" disabled={deploying || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'} onClick={deploy}>
+                <button className="btn-primary deploy-btn" disabled={deploying || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'} onClick={() => void deploy()}>
                   <span>{deploying ? 'OPENING CHANNEL...' : 'ENTER HIDEOUT'}</span>
                   <b>{selectedServer?.region ?? '--'}</b>
                 </button>
@@ -426,7 +429,7 @@ export default function LandingPage() {
                     <button
                       className="btn-guest"
                       disabled={deploying || !serverUrl || pings[selectedServer?.id ?? -1] === 'timeout'}
-                      onClick={deployGuest}
+                      onClick={() => void deployGuest()}
                     >
                       <span>{deploying ? 'OPENING GUEST CHANNEL...' : 'DEPLOY AS GUEST'}</span>
                       <small>Start a temporary raid now</small>
