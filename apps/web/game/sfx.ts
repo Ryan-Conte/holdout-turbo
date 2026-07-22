@@ -80,6 +80,8 @@ type AmbientGraph = {
 };
 
 let ambientNodes: AmbientGraph | null = null;
+// Keep the wind/rumble bed well behind footsteps, creatures and combat cues.
+const AMBIENT_MASTER_GAIN = 0.38;
 
 function ambientNoise(ac: AudioContext, seconds: number, channels: number, smoothing: number, drive: number) {
   const buffer = ac.createBuffer(channels, Math.ceil(ac.sampleRate * seconds), ac.sampleRate);
@@ -101,7 +103,7 @@ export function startAmbient() {
   const now = ac.currentTime;
   const master = ac.createGain();
   master.gain.setValueAtTime(0.0001, now);
-  master.gain.exponentialRampToValueAtTime(1, now + 1.8);
+  master.gain.exponentialRampToValueAtTime(AMBIENT_MASTER_GAIN, now + 1.8);
   master.connect(ac.destination);
 
   // A wide, gently moving wind layer keeps the open world from feeling
