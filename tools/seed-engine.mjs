@@ -811,6 +811,66 @@ try {
       }
     }
     if (kind === "sprites") {
+      if (row.draft?.storage === "asset-rows-v1") {
+        const stored = await prisma.gameSpriteAsset.findMany();
+        const byId = new Map(stored.map((asset) => [asset.assetId, asset]));
+        const missing = sprites.assets.filter((asset) => {
+          const existing = byId.get(asset.id);
+          return !existing || existing.draftDeleted;
+        });
+        if (missing.length) {
+          const currentContent = await prisma.gameContent.findUniqueOrThrow({ where: { kind } });
+          const nextRevision = currentContent.revision + 1;
+          const publishedAt = new Date();
+          await prisma.$transaction(async (tx) => {
+            for (const asset of missing) {
+              await tx.gameSpriteAsset.upsert({
+                where: { assetId: asset.id },
+                create: {
+                  assetId: asset.id,
+                  draft: asset,
+                  published: asset,
+                  draftDeleted: false,
+                  publishedDeleted: false,
+                  draftRevision: nextRevision,
+                  publishedRevision: nextRevision,
+                  publishedAt,
+                },
+                update: {
+                  draft: asset,
+                  published: asset,
+                  draftDeleted: false,
+                  publishedDeleted: false,
+                  draftRevision: nextRevision,
+                  publishedRevision: nextRevision,
+                  updatedAt: new Date(),
+                  publishedAt,
+                },
+              });
+              await tx.gameSpriteAssetRevision.upsert({
+                where: { assetId_revision: { assetId: asset.id, revision: nextRevision } },
+                create: { assetId: asset.id, revision: nextRevision, data: asset, published: true },
+                update: { data: asset, deleted: false, published: true },
+              });
+            }
+            await tx.gameContent.update({
+              where: { kind },
+              data: {
+                revision: nextRevision,
+                publishedRevision: nextRevision,
+                publishedAt,
+                updatedAt: new Date(),
+              },
+            });
+            await tx.gameContentRevision.upsert({
+              where: { kind_revision: { kind, revision: nextRevision } },
+              create: { kind, revision: nextRevision, data: currentContent.draft, published: true },
+              update: { data: currentContent.draft, published: true },
+            });
+          });
+        }
+        continue;
+      }
       const current = row.draft;
       if (Array.isArray(current?.assets)) {
         const missing = sprites.assets.filter(

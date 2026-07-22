@@ -18,6 +18,7 @@
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "seed:engine": "npm run build -w @holdout/shared && node tools/seed-engine.mjs",
+    "migrate:sprites": "node tools/migrate-sprite-storage.mjs",
     "validate:showcase-map": "npm run seed:engine && node tools/seed-showcase-map.mjs --dry-run --preview=docs/assets/ashfall-basin-showcase.png",
     "seed:showcase-map": "npm run seed:engine && node tools/seed-showcase-map.mjs --preview=docs/assets/ashfall-basin-showcase.png",
     "validate:frontier-map": "npm run build -w @holdout/shared && node tools/seed-frontier-map.mjs --dry-run --preview=docs/assets/greyvale-frontier-500.png",

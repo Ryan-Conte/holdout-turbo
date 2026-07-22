@@ -230,6 +230,44 @@ model GameContentRevision {
   @@map("game_content_revisions")
 }
 
+// Pixel frames grow much faster than the other engine documents. Store each
+// sprite independently so editing one asset never rewrites every other frame.
+model GameSpriteAsset {
+  id                Int       @id @default(autoincrement())
+  assetId           String    @unique @map("asset_id") @db.VarChar(80)
+  draft             Json
+  published         Json
+  draftDeleted      Boolean   @default(false) @map("draft_deleted")
+  publishedDeleted  Boolean   @default(true) @map("published_deleted")
+  draftRevision     Int       @default(1) @map("draft_revision")
+  publishedRevision Int       @default(0) @map("published_revision")
+  updatedBy         String?   @map("updated_by")
+  updatedAt         DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+  publishedAt       DateTime? @map("published_at") @db.Timestamptz(6)
+
+  @@index([draftDeleted, assetId])
+  @@index([publishedDeleted, assetId])
+  @@map("game_sprite_assets")
+}
+
+// Sparse per-asset history reconstructs any global sprite revision without
+// copying the complete sprite library on every single-pixel edit.
+model GameSpriteAssetRevision {
+  id        Int      @id @default(autoincrement())
+  assetId   String   @map("asset_id") @db.VarChar(80)
+  revision  Int
+  data      Json
+  deleted   Boolean  @default(false)
+  published Boolean  @default(false)
+  createdBy String?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([assetId, revision])
+  @@index([revision])
+  @@index([assetId, createdAt])
+  @@map("game_sprite_asset_revisions")
+}
+
 // Batched append-only economy events; aggregate counters are also exposed by /health.
 model GameTelemetryEvent {
   id        Int      @id @default(autoincrement())

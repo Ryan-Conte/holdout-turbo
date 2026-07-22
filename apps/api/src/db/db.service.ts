@@ -956,11 +956,32 @@ export class DbService implements OnModuleInit, OnModuleDestroy {
         where: { kind: { in: kinds } },
         select: { kind: true, draft: true, published: true },
       });
-      this.recordDatabasePollSuccess();
-      return Object.fromEntries(rows.flatMap((row) => {
+      const documents = Object.fromEntries(rows.flatMap((row) => {
         const document = this.contentChannel === 'staging' ? row.draft : row.published;
         return document === null ? [] : [[row.kind, document]];
       }));
+      const spriteManifest = documents.sprites;
+      if (
+        spriteManifest &&
+        typeof spriteManifest === 'object' &&
+        !Array.isArray(spriteManifest) &&
+        (spriteManifest as { storage?: unknown }).storage === 'asset-rows-v1'
+      ) {
+        const spriteRows = await this.prisma.gameSpriteAsset.findMany({ orderBy: { assetId: 'asc' } });
+        const staging = this.contentChannel === 'staging';
+        const palette = Array.isArray((spriteManifest as { palette?: unknown }).palette)
+          ? (spriteManifest as { palette: unknown[] }).palette.filter((color): color is string => typeof color === 'string')
+          : [];
+        documents.sprites = {
+          palette,
+          assets: spriteRows.flatMap((asset) => {
+            const deleted = staging ? asset.draftDeleted : asset.publishedDeleted;
+            return deleted ? [] : [staging ? asset.draft : asset.published];
+          }),
+        };
+      }
+      this.recordDatabasePollSuccess();
+      return documents;
     } catch (err) {
       this.recordDatabasePollFailure('loadPublishedContent', err);
       return null;

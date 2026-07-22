@@ -184,7 +184,7 @@ export function MapStudio() {
       fetch('/api/admin/content/resources', { cache: 'no-store' }).then((response) => response.json()),
       fetch('/api/admin/content/blocks', { cache: 'no-store' }).then((response) => response.json()),
       fetch('/api/admin/content/terrain', { cache: 'no-store' }).then((response) => response.json()),
-      fetch('/api/admin/content/sprites', { cache: 'no-store' }).then((response) => response.json()),
+      fetch('/api/admin/content/sprites?include=published', { cache: 'no-store' }).then((response) => response.json()),
       loadSheets(),
     ]).then(([mapData, mobData, lootData, resourceData, blockData, terrainData, spriteData, loadedSheets]) => {
       if (cancelled) return;

@@ -111,6 +111,8 @@ export function AnimationEditor() {
   const editCanvasRef = useRef<HTMLCanvasElement>(null);
   const pixelHistoryRef = useRef<string[][]>([]);
   const lastPixelRef = useRef(-1);
+  const loadedSpriteIdsRef = useRef(new Set<string>());
+  const dirtySpriteIdsRef = useRef(new Set<string>());
   const [animations, setAnimations] = useState<AnimationDocument>({});
   const [mobs, setMobs] = useState<Record<string, EngineMobDefinition>>({});
   const [sprites, setSprites] = useState<SpriteDocument>({ palette: [], assets: [] });
@@ -124,6 +126,7 @@ export function AnimationEditor() {
   const [pixelTool, setPixelTool] = useState<PixelTool>('pencil');
   const [pixelColor, setPixelColor] = useState('#eee7d2ff');
   const [spriteDirty, setSpriteDirty] = useState(false);
+  const [spriteLoading, setSpriteLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [meta, setMeta] = useState({ revision: 0, publishedRevision: 0 });
   const [spriteMeta, setSpriteMeta] = useState({ revision: 0, publishedRevision: 0 });
@@ -153,6 +156,8 @@ export function AnimationEditor() {
         setAnimations(animationData.draft ?? {});
         setMobs(mobData.draft ?? {});
         setSprites(spriteData.draft ?? { palette: [], assets: [] });
+        loadedSpriteIdsRef.current.clear();
+        dirtySpriteIdsRef.current.clear();
         setSounds(soundData.draft ?? { presets: {}, actions: {} });
         setMeta({ revision: animationData.revision, publishedRevision: animationData.publishedRevision });
         setSpriteMeta({ revision: spriteData.revision, publishedRevision: spriteData.publishedRevision });
@@ -160,6 +165,37 @@ export function AnimationEditor() {
       })
       .catch((error) => setStatus(`Load failed: ${(error as Error).message}`));
   }, []);
+
+  useEffect(() => {
+    const assetId = selectedAsset?.id;
+    if (!assetId) return;
+    if (loadedSpriteIdsRef.current.has(assetId) || dirtySpriteIdsRef.current.has(assetId)) {
+      setSpriteLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setSpriteLoading(true);
+    void fetch(`/api/admin/content/sprites?asset=${encodeURIComponent(assetId)}`, { cache: 'no-store' })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? 'Could not load sprite frames');
+        if (cancelled) return;
+        loadedSpriteIdsRef.current.add(assetId);
+        if (data.draft) {
+          setSprites((current) => ({
+            ...current,
+            assets: current.assets.map((asset) => asset.id === assetId ? data.draft as PixelAsset : asset),
+          }));
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setStatus(`Sprite load failed: ${(error as Error).message}`);
+      })
+      .finally(() => {
+        if (!cancelled) setSpriteLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [selectedAsset?.id]);
 
   useEffect(() => {
     setPreviewStep(0);
@@ -259,6 +295,7 @@ export function AnimationEditor() {
         return { ...asset, pixels: frames[0], frames };
       }),
     }));
+    dirtySpriteIdsRef.current.add(selectedAsset.id);
     setSpriteDirty(true);
   };
 
@@ -292,6 +329,7 @@ export function AnimationEditor() {
       ...current,
       assets: current.assets.map((asset) => asset.id === selectedAsset.id ? { ...asset, pixels: imported[0], frames: imported } : asset),
     }));
+    dirtySpriteIdsRef.current.add(selectedAsset.id);
     setSpriteDirty(true);
     setSourceFrame(0);
     setStatus(`${imported.length} editable frame(s) prepared for ${selectedAsset.name}`);
@@ -357,10 +395,12 @@ export function AnimationEditor() {
     try {
       let spritesChanged = spriteDirty;
       if (spritesChanged) {
-        const response = await fetch('/api/admin/content/sprites', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ draft: sprites }) });
+        const dirtyAssets = sprites.assets.filter((asset) => dirtySpriteIdsRef.current.has(asset.id));
+        const response = await fetch('/api/admin/content/sprites', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ assets: dirtyAssets, palette: sprites.palette }) });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error ?? 'Sprite save failed');
         setSpriteMeta((current) => ({ ...current, revision: data.revision }));
+        dirtySpriteIdsRef.current.clear();
         setSpriteDirty(false);
       }
       const response = await fetch('/api/admin/content/animations', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ draft: animations }) });
@@ -481,7 +521,7 @@ export function AnimationEditor() {
                 onPointerUp={(event) => { lastPixelRef.current = -1; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }}
                 onContextMenu={(event) => event.preventDefault()}
               />
-              {selectedAsset?.source ? <button className="animation-import-art" onClick={() => void importSourceFrames()}>{customFrames.length ? 'REIMPORT PLACEHOLDER FRAMES (OVERWRITES ART)' : 'IMPORT PLACEHOLDER FRAMES TO EDIT'}</button> : customFrames.length === 0 ? <button className="animation-import-art" disabled={!selectedAsset} onClick={() => void importSourceFrames()}>CREATE EDITABLE FRAME</button> : null}
+              {selectedAsset?.source ? <button className="animation-import-art" disabled={spriteLoading} onClick={() => void importSourceFrames()}>{spriteLoading ? 'LOADING SPRITE FRAMES...' : customFrames.length ? 'REIMPORT PLACEHOLDER FRAMES (OVERWRITES ART)' : 'IMPORT PLACEHOLDER FRAMES TO EDIT'}</button> : customFrames.length === 0 ? <button className="animation-import-art" disabled={!selectedAsset || spriteLoading} onClick={() => void importSourceFrames()}>{spriteLoading ? 'LOADING SPRITE FRAMES...' : 'CREATE EDITABLE FRAME'}</button> : null}
               {customFrames.length > 0 ? <>
                 <div className="animation-pixel-tools">
                   {(['pencil', 'eraser', 'fill', 'dropper'] as PixelTool[]).map((tool) => <button key={tool} className={pixelTool === tool ? 'active' : ''} onClick={() => setPixelTool(tool)}>{tool.toUpperCase()}</button>)}

@@ -77,6 +77,7 @@ export function PixelEditor() {
   const previewRef = useRef<HTMLCanvasElement>(null);
   const historyRef = useRef<string[][]>([]);
   const lastPixelRef = useRef(-1);
+  const loadedAssetsRef = useRef(new Set<string>());
   const [document, setDocument] = useState<SpriteDocument>({
     palette: [EMPTY],
     assets: [],
@@ -92,6 +93,7 @@ export function PixelEditor() {
   const [previewMs, setPreviewMs] = useState(125);
   const [status, setStatus] = useState("Loading sprite document...");
   const [revision, setRevision] = useState(0);
+  const [assetLoading, setAssetLoading] = useState(false);
   const asset = document.assets[selected];
   const frames = !asset
     ? []
@@ -130,7 +132,7 @@ export function PixelEditor() {
       return;
     }
     const draft = data.draft as SpriteDocument;
-    const assets = draft.assets.map(normalizedAsset);
+    const assets = draft.assets;
     if (!assets.some((entry) => entry.id === "character:player"))
       assets.push(
         normalizedAsset({
@@ -143,6 +145,7 @@ export function PixelEditor() {
         }),
       );
     setDocument({ ...draft, assets });
+    loadedAssetsRef.current.clear();
     setRevision(data.revision);
     setStatus("Sprite draft loaded");
   }, []);
@@ -154,6 +157,38 @@ export function PixelEditor() {
     setFrameIndex(0);
     historyRef.current = [];
   }, [selected]);
+
+  useEffect(() => {
+    const assetId = asset?.id;
+    if (!assetId) return;
+    if (loadedAssetsRef.current.has(assetId)) {
+      setAssetLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setAssetLoading(true);
+    void fetch(`/api/admin/content/sprites?asset=${encodeURIComponent(assetId)}`, { cache: "no-store" })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? "Could not load sprite frames");
+        if (cancelled) return;
+        loadedAssetsRef.current.add(assetId);
+        if (data.draft) {
+          const loaded = normalizedAsset(data.draft as PixelAsset);
+          setDocument((current) => ({
+            ...current,
+            assets: current.assets.map((entry) => entry.id === assetId ? loaded : entry),
+          }));
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setStatus(`Sprite load failed: ${(error as Error).message}`);
+      })
+      .finally(() => {
+        if (!cancelled) setAssetLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [asset?.id]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -349,6 +384,7 @@ export function PixelEditor() {
       ...current,
       assets: [...current.assets, next],
     }));
+    loadedAssetsRef.current.add(id);
     setSelected(document.assets.length);
   };
 
@@ -468,6 +504,10 @@ export function PixelEditor() {
   }, [undo]);
 
   const save = async (publish: boolean) => {
+    if (assetLoading) {
+      setStatus("Wait for this sprite's frames to finish loading");
+      return;
+    }
     if (!asset) {
       setStatus("Create or select a sprite asset before saving");
       return;
@@ -749,8 +789,8 @@ export function PixelEditor() {
           <button disabled={!asset?.source} onClick={importSource}>
             IMPORT PLACEHOLDER FRAMES
           </button>
-          <button onClick={() => void save(false)}>SAVE DRAFT</button>
-          <button className="publish" onClick={() => void save(true)}>
+          <button disabled={assetLoading} onClick={() => void save(false)}>SAVE DRAFT</button>
+          <button className="publish" disabled={assetLoading} onClick={() => void save(true)}>
             PUBLISH LIVE
           </button>
           <p>{status}</p>
