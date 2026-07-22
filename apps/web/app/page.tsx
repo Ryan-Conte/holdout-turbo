@@ -9,6 +9,7 @@ import { authClient } from '@/lib/auth-client';
 
 interface GameServerEntry { id: number; name: string; region: string; url: string }
 type Pings = Record<number, number | 'timeout' | undefined>;
+const PING_TIMEOUT_MS = 4_000;
 
 interface RelayPickerProps {
   id: string;
@@ -186,17 +187,43 @@ export default function LandingPage() {
   }, []);
 
   const measurePings = useCallback(async (list: GameServerEntry[]) => {
-    await Promise.all(list.map(async (server) => {
+    const measurements = await Promise.all(list.map(async (server) => {
       const startedAt = performance.now();
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), PING_TIMEOUT_MS);
       try {
-        const res = await fetch(`${server.url}/socket.io/?EIO=4&transport=polling&t=${Date.now()}`, { cache: 'no-store' });
+        const res = await fetch(`${server.url}/socket.io/?EIO=4&transport=polling&t=${Date.now()}`, {
+          cache: 'no-store',
+          signal: controller.signal,
+        });
         if (!res.ok) throw new Error('Server unavailable');
         const milliseconds = Math.max(1, Math.round(performance.now() - startedAt));
-        setPings((current) => ({ ...current, [server.id]: milliseconds }));
+        return { server, ping: milliseconds } as const;
       } catch {
-        setPings((current) => ({ ...current, [server.id]: 'timeout' }));
+        return { server, ping: 'timeout' } as const;
+      } finally {
+        window.clearTimeout(timeout);
       }
     }));
+
+    const measuredPings = Object.fromEntries(
+      measurements.map(({ server, ping }) => [server.id, ping]),
+    ) as Pings;
+    setPings(measuredPings);
+
+    const fastest = measurements.reduce<(typeof measurements)[number] | undefined>(
+      (best, measurement) => {
+        if (typeof measurement.ping !== 'number') return best;
+        return !best || typeof best.ping !== 'number' || measurement.ping < best.ping
+          ? measurement
+          : best;
+      },
+      undefined,
+    );
+    if (fastest) {
+      setServerUrl(fastest.server.url);
+      localStorage.setItem('holdout_server_url', fastest.server.url);
+    }
   }, []);
 
   useEffect(() => {
