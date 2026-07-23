@@ -141,6 +141,7 @@ export interface GameContainer {
   lootTable?: string;
   eventId?: string;
   eventKind?: 'supply_drop' | 'boss_reward';
+  expiresAt?: number;
 }
 
 export interface RandomWorldEvent {
@@ -163,6 +164,7 @@ export interface GroundItem {
   item: ItemId;
   qty: number;
   dur?: number;
+  expiresAt: number;
 }
 
 export interface Projectile {

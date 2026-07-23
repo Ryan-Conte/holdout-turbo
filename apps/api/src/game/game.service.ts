@@ -156,6 +156,11 @@ import {
   randomEventDelay,
   randomEventType,
 } from "./rules/random-event.rules";
+import {
+  chestRestockAtAfterOpen,
+  droppedLootExpiresAt,
+  purgeExpiredLoot,
+} from "./rules/loot-lifecycle.rules";
 import { TelemetryService } from "./telemetry.service";
 import type {
   Enemy,
@@ -181,7 +186,6 @@ const BOT_TRADE_COOLDOWN_MS = 1800;
 const SNAPSHOT_VIEW_RANGE = 1100;
 const PLAYER_LEASE_TTL_SECONDS = 45;
 const PLAYER_LEASE_HEARTBEAT_MS = 15_000;
-const CHEST_RESTOCK_MS = 20 * 60_000;
 const MAX_RANDOM_EVENTS = 2;
 const SUPPLY_DROP_TTL_MS = 12 * 60_000;
 const BOSS_EVENT_TTL_MS = 18 * 60_000;
@@ -2710,6 +2714,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     if (best) {
+      this.startChestRestock(best);
       p.openContainer = best.id;
       this.emitTo(sid, EV.container, {
         id: best.id,
@@ -3054,6 +3059,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const inst = this.inst(p);
     const c = inst.containers.get(containerId);
     if (!c || Math.hypot(c.x - p.x, c.y - p.y) > INTERACT_RANGE * 1.5) return;
+    this.startChestRestock(c);
     const item = c.slots[slot];
     if (!item) return;
     // Tarkov-style: taking loot costs time (heavier = slower); your own stash is instant
@@ -3111,8 +3117,6 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       } else if (c.kind === "bag") {
         inst.containers.delete(c.id);
         this.io?.to(inst.id).emit(EV.containerGone, c.id);
-      } else if (c.kind !== "storage") {
-        c.restockAt = Date.now() + CHEST_RESTOCK_MS;
       }
     }
     this.pushInventory(p);
@@ -3132,6 +3136,15 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     if (!c || c.kind === "bag" || c.eventId) return null;
     if (Math.hypot(c.x - p.x, c.y - p.y) > INTERACT_RANGE * 1.5) return null;
     return c;
+  }
+
+  private startChestRestock(c: Container, now = Date.now()) {
+    if (
+      (c.kind !== "chest" && c.kind !== "crate") ||
+      c.eventId
+    )
+      return;
+    c.restockAt = chestRestockAtAfterOpen(c.restockAt, now);
   }
 
   /** Deposit a backpack slot into a container. `target` (optional) = a specific slot to drop onto. */
@@ -5012,6 +5025,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       y,
       item: id as ItemId,
       qty,
+      expiresAt: droppedLootExpiresAt(Date.now()),
       ...(dur !== undefined ? { dur } : {}),
     });
   }
@@ -5019,7 +5033,14 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
   private spawnGroundAt(inst: Instance, x: number, y: number) {
     const roll = rollGround(this.rnd, this.content.lootTables);
     const gid = `g${this.nextId++}`;
-    inst.ground.set(gid, { id: gid, x, y, item: roll.id, qty: roll.qty });
+    inst.ground.set(gid, {
+      id: gid,
+      x,
+      y,
+      item: roll.id,
+      qty: roll.qty,
+      expiresAt: droppedLootExpiresAt(Date.now()),
+    });
     this.telemetry.record({
       kind: "item_spawned",
       itemId: roll.id,
@@ -5568,6 +5589,10 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
     const day = (now % DAY_LENGTH_MS) / DAY_LENGTH_MS;
     const night = isNight(day);
     for (const inst of this.instances.values()) {
+      purgeExpiredLoot(inst.ground, now);
+      for (const id of purgeExpiredLoot(inst.containers, now)) {
+        this.io?.to(inst.id).emit(EV.containerGone, id);
+      }
       if (inst.kind === "world") {
         this.updateRandomEvents(inst, now);
         this.updateNightHorde(inst, now, day, night);
@@ -5584,6 +5609,11 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
               ? rollNamed(this.rnd, c.lootTable, this.content.lootTables)
               : rollChest(this.rnd, c.tier, this.content.lootTables);
             c.restockAt = null;
+            for (const player of this.players.values()) {
+              if (player.instanceId === inst.id && player.openContainer === c.id)
+                player.openContainer = null;
+            }
+            this.io?.to(inst.id).emit(EV.containerGone, c.id);
           }
         }
         // Node regrowth selects a weighted published tree/rock variant. Rock
@@ -6491,6 +6521,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         tier: "normal",
         slots: drops,
         restockAt: null,
+        expiresAt: droppedLootExpiresAt(Date.now()),
         ...(e.eventId ? { eventKind: "boss_reward" as const } : {}),
       });
       if (e.eventId)
@@ -6730,6 +6761,7 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
         tier: "normal",
         slots: dropped,
         restockAt: null,
+        expiresAt: droppedLootExpiresAt(Date.now()),
       });
     }
     if (this.isBot(target)) {

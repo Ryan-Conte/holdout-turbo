@@ -20,6 +20,13 @@ const {
   randomEventType,
 } = require('../dist/game/rules/random-event.rules.js');
 const {
+  CHEST_RESTOCK_MS,
+  DROPPED_LOOT_TTL_MS,
+  chestRestockAtAfterOpen,
+  droppedLootExpiresAt,
+  purgeExpiredLoot,
+} = require('../dist/game/rules/loot-lifecycle.rules.js');
+const {
   actionInterruptedByDamage,
   actionInterruptedByMovement,
   clanHideoutExitTarget,
@@ -124,6 +131,31 @@ test('random world events use bounded cadence and deterministic weighted selecti
   assert.equal(randomEventDelay(() => 1), RANDOM_EVENT_MAX_MS);
   assert.equal(randomEventType(() => 0.549), 'supply_drop');
   assert.equal(randomEventType(() => 0.55), 'boss');
+});
+
+test('transient loot expires after 30 minutes without removing permanent containers', () => {
+  const now = 1_000_000;
+  assert.equal(DROPPED_LOOT_TTL_MS, 30 * 60_000);
+  assert.equal(droppedLootExpiresAt(now), now + 30 * 60_000);
+
+  const loot = new Map([
+    ['expired', { expiresAt: now }],
+    ['future', { expiresAt: now + 1 }],
+    ['permanent', {}],
+  ]);
+  assert.deepEqual(purgeExpiredLoot(loot, now), ['expired']);
+  assert.deepEqual([...loot.keys()], ['future', 'permanent']);
+});
+
+test('opening a chest starts one 20-minute refill timer that later opens cannot postpone', () => {
+  const now = 1_000_000;
+  const firstRestockAt = chestRestockAtAfterOpen(null, now);
+  assert.equal(CHEST_RESTOCK_MS, 20 * 60_000);
+  assert.equal(firstRestockAt, now + 20 * 60_000);
+  assert.equal(
+    chestRestockAtAfterOpen(firstRestockAt, now + 5 * 60_000),
+    firstRestockAt,
+  );
 });
 
 test('crafting costs are deterministic and do not accept partial payment', () => {
