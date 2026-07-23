@@ -5,6 +5,7 @@ import type { PixelAsset, SpriteDocument } from "@holdout/shared";
 
 const EMPTY = "#00000000";
 type PixelTool = "pencil" | "eraser" | "fill" | "dropper";
+type PixelAdminAction = "import" | "save" | "publish" | "delete";
 
 function rgbaHex(r: number, g: number, b: number, a: number): string {
   return `#${[r, g, b, a].map((part) => part.toString(16).padStart(2, "0")).join("")}`;
@@ -93,7 +94,9 @@ export function PixelEditor() {
   const [previewMs, setPreviewMs] = useState(125);
   const [status, setStatus] = useState("Loading sprite document...");
   const [revision, setRevision] = useState(0);
+  const [documentLoading, setDocumentLoading] = useState(true);
   const [assetLoading, setAssetLoading] = useState(false);
+  const [adminAction, setAdminAction] = useState<PixelAdminAction | null>(null);
   const asset = document.assets[selected];
   const frames = !asset
     ? []
@@ -123,31 +126,35 @@ export function PixelEditor() {
     );
 
   const load = useCallback(async () => {
-    const res = await fetch("/api/admin/content/sprites", {
-      cache: "no-store",
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      setStatus(data.error ?? "Could not load sprites");
-      return;
+    setDocumentLoading(true);
+    try {
+      const res = await fetch("/api/admin/content/sprites", {
+        cache: "no-store",
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Could not load sprites");
+      const draft = data.draft as SpriteDocument;
+      const assets = draft.assets;
+      if (!assets.some((entry) => entry.id === "character:player"))
+        assets.push(
+          normalizedAsset({
+            id: "character:player",
+            name: "Player base",
+            width: 16,
+            height: 16,
+            pixels: [],
+            source: { sheet: "chars", col: 0, row: 0, frames: 4 },
+          }),
+        );
+      setDocument({ ...draft, assets });
+      loadedAssetsRef.current.clear();
+      setRevision(data.revision);
+      setStatus("Sprite draft loaded");
+    } catch (error) {
+      setStatus(`Sprite load failed: ${(error as Error).message}`);
+    } finally {
+      setDocumentLoading(false);
     }
-    const draft = data.draft as SpriteDocument;
-    const assets = draft.assets;
-    if (!assets.some((entry) => entry.id === "character:player"))
-      assets.push(
-        normalizedAsset({
-          id: "character:player",
-          name: "Player base",
-          width: 16,
-          height: 16,
-          pixels: [],
-          source: { sheet: "chars", col: 0, row: 0, frames: 4 },
-        }),
-      );
-    setDocument({ ...draft, assets });
-    loadedAssetsRef.current.clear();
-    setRevision(data.revision);
-    setStatus("Sprite draft loaded");
   }, []);
 
   useEffect(() => {
@@ -167,6 +174,7 @@ export function PixelEditor() {
     }
     let cancelled = false;
     setAssetLoading(true);
+    setStatus(`Loading ${asset.name} frame data...`);
     void fetch(`/api/admin/content/sprites?asset=${encodeURIComponent(assetId)}`, { cache: "no-store" })
       .then(async (response) => {
         const data = await response.json();
@@ -180,6 +188,7 @@ export function PixelEditor() {
             assets: current.assets.map((entry) => entry.id === assetId ? loaded : entry),
           }));
         }
+        setStatus(`${asset.name} frame data loaded`);
       })
       .catch((error) => {
         if (!cancelled) setStatus(`Sprite load failed: ${(error as Error).message}`);
@@ -252,50 +261,57 @@ export function PixelEditor() {
   }, [frameIndex, selected, asset]);
 
   const importSource = async () => {
-    if (!asset?.source) return;
+    if (!asset?.source || adminAction) return;
     const count = asset.source.frames ?? 1;
     if (
       !window.confirm(
-        `Import ${count} placeholder frame${count === 1 ? "" : "s"} from ${asset.source.sheet}.png? This will replace all ${frames.length} editable frame${frames.length === 1 ? "" : "s"} currently in ${asset.name}.`,
+        `${asset.name} already has ${frames.length} saved editable frame${frames.length === 1 ? "" : "s"}. Are you sure you want to import ${count} placeholder frame${count === 1 ? "" : "s"} from ${asset.source.sheet}.png? This will replace the current artwork.`,
       )
     ) {
       setStatus(`Placeholder import cancelled for ${asset.name}`);
       return;
     }
-    const image = new Image();
-    image.src = `/sprites/${asset.source.sheet}.png`;
-    await image.decode();
-    const imported: string[][] = [];
-    for (let sourceFrame = 0; sourceFrame < count; sourceFrame++) {
-      const scratch = window.document.createElement("canvas");
-      scratch.width = asset.width;
-      scratch.height = asset.height;
-      const ctx = scratch.getContext("2d", { willReadFrequently: true });
-      if (!ctx) continue;
-      ctx.drawImage(
-        image,
-        (asset.source.col + sourceFrame) * 16,
-        asset.source.row * 16,
-        asset.width,
-        asset.height,
-        0,
-        0,
-        asset.width,
-        asset.height,
-      );
-      const rgba = ctx.getImageData(0, 0, asset.width, asset.height).data;
-      const pixels: string[] = [];
-      for (let i = 0; i < rgba.length; i += 4)
-        pixels.push(rgbaHex(rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]));
-      imported.push(pixels);
-    }
-    if (imported.length) {
+    setAdminAction("import");
+    setStatus(`Importing placeholder frames for ${asset.name}...`);
+    try {
+      const image = new Image();
+      image.src = `/sprites/${asset.source.sheet}.png`;
+      await image.decode();
+      const imported: string[][] = [];
+      for (let sourceFrame = 0; sourceFrame < count; sourceFrame++) {
+        const scratch = window.document.createElement("canvas");
+        scratch.width = asset.width;
+        scratch.height = asset.height;
+        const ctx = scratch.getContext("2d", { willReadFrequently: true });
+        if (!ctx) continue;
+        ctx.drawImage(
+          image,
+          (asset.source.col + sourceFrame) * 16,
+          asset.source.row * 16,
+          asset.width,
+          asset.height,
+          0,
+          0,
+          asset.width,
+          asset.height,
+        );
+        const rgba = ctx.getImageData(0, 0, asset.width, asset.height).data;
+        const pixels: string[] = [];
+        for (let i = 0; i < rgba.length; i += 4)
+          pixels.push(rgbaHex(rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]));
+        imported.push(pixels);
+      }
+      if (!imported.length) throw new Error("No placeholder frames were available");
       updateAsset({ ...asset, pixels: imported[0], frames: imported });
       setFrameIndex(0);
       historyRef.current = [];
       setStatus(
         `Imported ${imported.length} frame(s) from ${asset.source.sheet}.png`,
       );
+    } catch (error) {
+      setStatus(`Placeholder import failed: ${(error as Error).message}`);
+    } finally {
+      setAdminAction(null);
     }
   };
 
@@ -440,34 +456,40 @@ export function PixelEditor() {
   const deleteAsset = async () => {
     if (
       !asset ||
+      adminAction ||
       !window.confirm(
         `Delete sprite ${asset.name} and all ${frames.length} frame(s)?`,
       )
     )
       return;
+    setAdminAction("delete");
     setStatus(`Deleting ${asset.name} from the sprite draft...`);
-    const deleted = await fetch("/api/admin/content/sprites", {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ assetId: asset.id }),
-    });
-    const deleteData = await deleted.json();
-    if (!deleted.ok) {
-      setStatus(deleteData.error ?? "Sprite deletion failed");
-      return;
+    try {
+      const deleted = await fetch("/api/admin/content/sprites", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assetId: asset.id }),
+      });
+      const deleteData = await deleted.json();
+      if (!deleted.ok)
+        throw new Error(deleteData.error ?? "Sprite deletion failed");
+      setDocument((current) => ({
+        ...current,
+        assets: current.assets.filter((_, index) => index !== selected),
+      }));
+      setSelected(Math.max(0, selected - 1));
+      setFrameIndex(0);
+      setRevision(deleteData.revision);
+      setStatus(
+        deleteData.deleted
+          ? `${asset.name} deleted from draft revision ${deleteData.revision}`
+          : `${asset.name} removed before it was saved`,
+      );
+    } catch (error) {
+      setStatus(`Sprite deletion failed: ${(error as Error).message}`);
+    } finally {
+      setAdminAction(null);
     }
-    setDocument((current) => ({
-      ...current,
-      assets: current.assets.filter((_, index) => index !== selected),
-    }));
-    setSelected(Math.max(0, selected - 1));
-    setFrameIndex(0);
-    setRevision(deleteData.revision);
-    setStatus(
-      deleteData.deleted
-        ? `${asset.name} deleted from draft revision ${deleteData.revision}`
-        : `${asset.name} removed before it was saved`,
-    );
   };
 
   const updatePickerColor = (rgb: string) =>
@@ -512,35 +534,59 @@ export function PixelEditor() {
       setStatus("Create or select a sprite asset before saving");
       return;
     }
-    setStatus("Saving pixel and frame data to the database...");
-    const saved = await fetch("/api/admin/content/sprites", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ asset, palette: document.palette }),
-    });
-    const saveData = await saved.json();
-    if (!saved.ok) {
-      setStatus(saveData.error ?? "Sprite save failed");
-      return;
-    }
-    setRevision(saveData.revision);
-    if (!publish) {
-      setStatus(`Sprite draft revision ${saveData.revision} saved`);
-      return;
-    }
-    const published = await fetch("/api/admin/content/sprites", {
-      method: "POST",
-    });
-    const publishData = await published.json();
+    if (adminAction) return;
+    setAdminAction(publish ? "publish" : "save");
     setStatus(
-      published.ok
-        ? `Sprite revision ${publishData.publishedRevision} published`
-        : publishData.error,
+      publish
+        ? "Saving pixel data before publishing..."
+        : "Saving pixel and frame data to the database...",
     );
+    try {
+      const saved = await fetch("/api/admin/content/sprites", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ asset, palette: document.palette }),
+      });
+      const saveData = await saved.json();
+      if (!saved.ok) throw new Error(saveData.error ?? "Sprite save failed");
+      setRevision(saveData.revision);
+      if (!publish) {
+        setStatus(`Sprite draft revision ${saveData.revision} saved`);
+        return;
+      }
+      setStatus(`Publishing sprite revision ${saveData.revision}...`);
+      const published = await fetch("/api/admin/content/sprites", {
+        method: "POST",
+      });
+      const publishData = await published.json();
+      if (!published.ok)
+        throw new Error(publishData.error ?? "Sprite publish failed");
+      setStatus(`Sprite revision ${publishData.publishedRevision} published`);
+    } catch (error) {
+      setStatus(`Sprite save failed: ${(error as Error).message}`);
+    } finally {
+      setAdminAction(null);
+    }
   };
 
+  if (documentLoading) {
+    return (
+      <section className="engine-editor">
+        <div className="admin-editor-loading" role="status" aria-live="polite">
+          <span className="spinner" />
+          <b>LOADING SPRITE WORKSHOP...</b>
+        </div>
+      </section>
+    );
+  }
+
+  const editorBusy = assetLoading || adminAction !== null;
+
   return (
-    <section className="engine-editor pixel-studio">
+    <section
+      className={`engine-editor pixel-studio${editorBusy ? " is-busy" : ""}`}
+      aria-busy={editorBusy}
+    >
       <header className="engine-editor-head">
         <div>
           <div className="engine-kicker">PIXEL + ANIMATION LAB</div>
@@ -562,7 +608,7 @@ export function PixelEditor() {
         <aside className="engine-records pixel-assets">
           <div className="engine-record-toolbar">
             <b>{document.assets.length} ASSETS</b>
-            <button onClick={addAsset}>+ NEW</button>
+            <button disabled={adminAction !== null} onClick={addAsset}>+ NEW</button>
           </div>
           <div className="pixel-asset-search">
             <input
@@ -583,6 +629,7 @@ export function PixelEditor() {
             <button
               className={selected === index ? "active" : ""}
               key={entry.id}
+              disabled={adminAction !== null}
               onClick={() => setSelected(index)}
             >
               <span>{entry.name}</span>
@@ -610,8 +657,12 @@ export function PixelEditor() {
                   }
                 />
                 <span>{asset.id}</span>
-                <button className="pixel-delete" onClick={deleteAsset}>
-                  DELETE ASSET
+                <button
+                  className="pixel-delete"
+                  disabled={editorBusy}
+                  onClick={deleteAsset}
+                >
+                  {adminAction === "delete" ? "DELETING..." : "DELETE ASSET"}
                 </button>
               </div>
               <div className="pixel-tool-row">
@@ -786,14 +837,20 @@ export function PixelEditor() {
             />
           </label>
           <button onClick={addPaletteColor}>+ ADD COLOR TO PALETTE</button>
-          <button disabled={!asset?.source} onClick={importSource}>
-            IMPORT PLACEHOLDER FRAMES
+          <button disabled={!asset?.source || editorBusy} onClick={importSource}>
+            {assetLoading
+              ? "LOADING FRAME DATA..."
+              : adminAction === "import"
+                ? "IMPORTING PLACEHOLDER FRAMES..."
+                : "IMPORT PLACEHOLDER FRAMES"}
           </button>
-          <button disabled={assetLoading} onClick={() => void save(false)}>SAVE DRAFT</button>
-          <button className="publish" disabled={assetLoading} onClick={() => void save(true)}>
-            PUBLISH LIVE
+          <button disabled={editorBusy} onClick={() => void save(false)}>
+            {adminAction === "save" ? "SAVING DRAFT..." : "SAVE DRAFT"}
           </button>
-          <p>{status}</p>
+          <button className="publish" disabled={editorBusy} onClick={() => void save(true)}>
+            {adminAction === "publish" ? "PUBLISHING..." : "PUBLISH LIVE"}
+          </button>
+          <p aria-live="polite">{status}</p>
         </aside>
       </div>
     </section>

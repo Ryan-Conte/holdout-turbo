@@ -16,6 +16,12 @@ function fallbackDocument(): SpriteDocument {
   return defaultGameContent('sprites') as SpriteDocument;
 }
 
+const fallbackSources = new Map(
+  fallbackDocument().assets.flatMap((asset) =>
+    asset.source ? [[asset.id, asset.source] as const] : [],
+  ),
+);
+
 function spriteDocument(value: unknown, fallback = fallbackDocument()): SpriteDocument {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return fallback;
   const candidate = value as Partial<SpriteDocument>;
@@ -38,7 +44,11 @@ function json(value: unknown): PrismaClientTypes.InputJsonValue {
 }
 
 function pixelAsset(value: PrismaClientTypes.JsonValue): PixelAsset {
-  return value as unknown as PixelAsset;
+  const asset = value as unknown as PixelAsset;
+  const fallbackSource = fallbackSources.get(asset.id);
+  return !asset.source && fallbackSource
+    ? { ...asset, source: { ...fallbackSource } }
+    : asset;
 }
 
 function metadataAsset(asset: PixelAsset): PixelAsset {
