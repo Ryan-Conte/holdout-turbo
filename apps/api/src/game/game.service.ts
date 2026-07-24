@@ -6464,6 +6464,12 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
                       ? 15
                       : e.kind === "bear"
                         ? 16
+                        : e.kind === "moose"
+                          ? 17
+                          : e.kind === "raccoon"
+                            ? 18
+                            : e.kind === "cougar"
+                              ? 19
                         : 9,
     };
     for (const viewer of this.players.values()) {

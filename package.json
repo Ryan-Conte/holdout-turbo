@@ -23,6 +23,8 @@
     "seed:showcase-map": "npm run seed:engine && node tools/seed-showcase-map.mjs --preview=docs/assets/ashfall-basin-showcase.png",
     "validate:frontier-map": "npm run build -w @holdout/shared && node tools/seed-frontier-map.mjs --dry-run --preview=docs/assets/greyvale-frontier-500.png",
     "seed:frontier-map": "npm run build -w @holdout/shared && node tools/seed-frontier-map.mjs --preview=docs/assets/greyvale-frontier-500.png",
+    "art:generate": "npm run build -w @holdout/shared && node tools/gen-sprites.mjs && node tools/gen-production-art.mjs",
+    "art:publish": "npm run art:generate && node tools/seed-engine.mjs && node tools/publish-production-art.mjs",
     "deploy:api": "npm --workspace=apps/api run build && npm --workspace=apps/api run deploy",
     "deploy:web": "npm --workspace=apps/web run build && npm --workspace=apps/web run deploy",
     "deploy:api:ci": "npm --workspace=apps/api run build --if-present && echo \"Replace this with your CI/CD deploy command (scp/rsync/docker push, etc.)\"",

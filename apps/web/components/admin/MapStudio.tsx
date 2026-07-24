@@ -46,6 +46,7 @@ export function MapStudio() {
   const minimapBaseRef = useRef<HTMLCanvasElement | null>(null);
   const overviewRef = useRef<MapOverview | null>(null);
   const pixelFramesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const pixelScalesRef = useRef<Map<string, number>>(new Map());
   const mapRef = useRef<EditorMap | null>(null);
   const cameraRef = useRef<Camera>({ x: 1600, y: 1600, zoom: 0.5 });
   const spaceHeldRef = useRef(false);
@@ -206,6 +207,7 @@ export function MapStudio() {
       setBlocks(blockDocument.world ?? {});
       setTerrainDefs((terrainData.published ?? terrainData.draft ?? {}) as TerrainDocument);
       const spriteDocument = (spriteData.published ?? spriteData.draft ?? { assets: [] }) as SpriteDocument;
+      pixelScalesRef.current = new Map(spriteDocument.assets.map((asset) => [asset.id, asset.renderScale ?? 2]));
       pixelFramesRef.current = new Map(spriteDocument.assets.flatMap((asset) => {
         const pixels = asset.frames?.[0]?.length === asset.width * asset.height ? asset.frames[0] : asset.pixels;
         if (pixels.length !== asset.width * asset.height) return [];
@@ -328,17 +330,32 @@ export function MapStudio() {
       ctx.beginPath(); ctx.arc(x, y, 12 + pulse * 5, 0, Math.PI * 2); ctx.stroke();
       ctx.fillStyle = '#62e593'; ctx.fillRect(x - 3, y - 10, 6, 20); ctx.fillRect(x - 10, y - 3, 20, 6);
     } else if (object.type === 'trader' || object.type === 'trader_black') {
-      drawCharacter(ctx, x, y, CHAR_ROWS.trader, frame);
+      const traderFrame = pixelFramesRef.current.get('character:trader');
+      if (traderFrame) {
+        const renderScale = pixelScalesRef.current.get('character:trader') ?? 2;
+        const width = traderFrame.width * renderScale; const height = traderFrame.height * renderScale;
+        ctx.drawImage(traderFrame, x - width / 2, y - height / 2, width, height);
+      } else drawCharacter(ctx, x, y, CHAR_ROWS.trader, frame);
     } else {
       const id = object.type === 'mob' ? object.contentId ?? 'military' : object.type;
-      const row = id === 'zombie' ? CHAR_ROWS.zombie : id === 'military' ? CHAR_ROWS.military
-        : id === 'deer' ? CHAR_ROWS.deer : id === 'rabbit' ? CHAR_ROWS.rabbit
-          : id === 'boar' ? CHAR_ROWS.boar : id === 'wolf' ? CHAR_ROWS.wolf
-            : id === 'fox' ? CHAR_ROWS.fox : id === 'bear' ? CHAR_ROWS.bear
-            : mobs[id]?.spriteId?.startsWith('character:')
-              ? ({ zombie: 8, military: 9, trader: 10, deer: 11, rabbit: 12, boar: 13, wolf: 14, fox: 15, bear: 16 } as Record<string, number>)[mobs[id].spriteId!.slice(10)] ?? CHAR_ROWS.military
-              : CHAR_ROWS.military;
-      drawCharacter(ctx, x, y, row, frame);
+      const spriteId = mobs[id]?.spriteId ?? `character:${id}`;
+      const customFrame = pixelFramesRef.current.get(spriteId);
+      if (customFrame) {
+        const renderScale = pixelScalesRef.current.get(spriteId) ?? 2;
+        const width = customFrame.width * renderScale; const height = customFrame.height * renderScale;
+        ctx.fillStyle = 'rgba(0,0,0,.28)';
+        ctx.beginPath(); ctx.ellipse(x, y + 10, Math.max(6, width * .28), 4, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.drawImage(customFrame, x - width / 2, y - height / 2, width, height);
+      } else {
+        const row = id === 'zombie' ? CHAR_ROWS.zombie : id === 'military' ? CHAR_ROWS.military
+          : id === 'deer' ? CHAR_ROWS.deer : id === 'rabbit' ? CHAR_ROWS.rabbit
+            : id === 'boar' ? CHAR_ROWS.boar : id === 'wolf' ? CHAR_ROWS.wolf
+              : id === 'fox' ? CHAR_ROWS.fox : id === 'bear' ? CHAR_ROWS.bear
+                : id === 'moose' ? CHAR_ROWS.moose : id === 'raccoon' ? CHAR_ROWS.raccoon
+                  : id === 'cougar' ? CHAR_ROWS.cougar
+                    : CHAR_ROWS.military;
+        drawCharacter(ctx, x, y, row, frame);
+      }
       if (mobs[id]?.boss) {
         ctx.fillStyle = '#f0b24c'; ctx.font = 'bold 10px Consolas, monospace'; ctx.textAlign = 'center'; ctx.fillText('BOSS', x, y - 25);
       }
@@ -422,8 +439,9 @@ export function MapStudio() {
         const skipResourceFrame = !blockId && keepsOreTileSprite(map.tiles[Number(index)], contentId);
         if (frame) {
           if (skipResourceFrame) continue;
-          const scale = blockId ? blocks[blockId]?.scale ?? 1 : 1;
-          const width = frame.width * 2 * scale; const height = frame.height * 2 * scale;
+          const definitionScale = blockId ? blocks[blockId]?.scale ?? 1 : 1;
+          const renderScale = pixelScalesRef.current.get(spriteId!) ?? 2;
+          const width = frame.width * renderScale * definitionScale; const height = frame.height * renderScale * definitionScale;
           if (blockId) {
             const quarterTurn = ((map.blockRotations?.[index] ?? 0) % 4 + 4) % 4;
             const renderedHeight = quarterTurn % 2 ? width : height;
@@ -891,7 +909,7 @@ export function MapStudio() {
     for (const object of map?.objects ?? []) {
       if (object.type === 'spawn') stats.spawns++;
       if (object.type === 'extract') stats.extracts++;
-      if (['zombie', 'military', 'deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear', 'mob'].includes(object.type)) stats.mobs++;
+      if (['zombie', 'military', 'deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear', 'moose', 'raccoon', 'cougar', 'mob'].includes(object.type)) stats.mobs++;
       if (object.type.startsWith('chest')) stats.chests++;
     }
     return stats;

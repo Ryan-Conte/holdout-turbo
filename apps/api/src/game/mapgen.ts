@@ -326,6 +326,9 @@ export function generateMap(seed = (Math.random() * 2 ** 31) | 0): GeneratedMap 
     { kind: 'wolf', count: 4, poiPad: 10 },
     { kind: 'fox', count: 6, poiPad: 5 },
     { kind: 'bear', count: 2, poiPad: 14 },
+    { kind: 'moose', count: 3, poiPad: 9 },
+    { kind: 'raccoon', count: 7, poiPad: 4 },
+    { kind: 'cougar', count: 2, poiPad: 14 },
   ];
   for (const w of wildlife) {
     for (let i = 0; i < w.count; i++) {
@@ -508,6 +511,9 @@ export function fromAuthored(map: AuthoredMap): GeneratedMap {
       case 'wolf': out.enemySpawns.push({ x: cx, y: cy, kind: 'wolf' }); break;
       case 'fox': out.enemySpawns.push({ x: cx, y: cy, kind: 'fox' }); break;
       case 'bear': out.enemySpawns.push({ x: cx, y: cy, kind: 'bear' }); break;
+      case 'moose': out.enemySpawns.push({ x: cx, y: cy, kind: 'moose' }); break;
+      case 'raccoon': out.enemySpawns.push({ x: cx, y: cy, kind: 'raccoon' }); break;
+      case 'cougar': out.enemySpawns.push({ x: cx, y: cy, kind: 'cougar' }); break;
       case 'mob': out.enemySpawns.push({ x: cx, y: cy, kind: o.contentId || 'zombie', respawnMs: o.respawnMs }); break;
       case 'spawn': out.spawns.push({ x: cx, y: cy }); break;
       case 'extract': out.extracts.push({ x: cx, y: cy }); break;

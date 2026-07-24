@@ -199,7 +199,13 @@ export class ContentService implements OnModuleInit, OnModuleDestroy {
     }
     const assets = Object.fromEntries((Array.isArray(sprites?.assets) ? sprites.assets : [])
       .filter((asset) => asset && typeof asset.id === 'string' && asset.width > 0 && asset.height > 0)
-      .map((asset) => [asset.id, { width: asset.width, height: asset.height, pixels: asset.pixels, frames: asset.frames }]));
+      .map((asset) => [asset.id, {
+        width: asset.width,
+        height: asset.height,
+        renderScale: asset.renderScale,
+        pixels: asset.pixels,
+        frames: asset.frames,
+      }]));
     this.visualDefs = {
       assets,
       animations: animationDefs,

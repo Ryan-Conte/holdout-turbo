@@ -15,7 +15,11 @@ const {
 export const FRONTIER_MAP_NAME = 'Greyvale Frontier - 500';
 export const FRONTIER_MAP_SEED = 0x47524559;
 export const FRONTIER_MAP_SIZE = 500;
-const BUILTIN_MOB_TYPES = new Set(['zombie', 'military', 'deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear']);
+const BUILTIN_MOB_TYPES = new Set([
+  'zombie', 'military',
+  'deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear',
+  'moose', 'raccoon', 'cougar',
+]);
 
 function mulberry32(seed) {
   let value = seed >>> 0;
@@ -367,6 +371,17 @@ export function generateFrontierMap({ terrainDefs, blockDefs, resourceDefs, mobD
     ...hospital.buildings,
   ];
 
+  // Authored roadside dressing uses real engine blocks and doubles as a
+  // production-art proving ground in the active demo world.
+  for (const [x, y, id, rotation] of [
+    [352, 92, 'road_barrier', 1], [428, 92, 'road_barrier', 1],
+    [365, 104, 'wrecked_car', 0], [418, 104, 'wrecked_car', 1],
+    [399, 330, 'sandbag_wall', 0], [425, 330, 'sandbag_wall', 0],
+    [394, 342, 'stone_wall', 0], [430, 342, 'stone_wall', 0],
+    [330, 174, 'wrecked_car', 1], [352, 181, 'road_barrier', 0],
+    [158, 438, 'dead_tree', 0], [174, 452, 'dead_tree', 1],
+  ]) if (blockDefs[id]) placeBlock(x, y, id, rotation);
+
   const spawnPoints = [
     [24, 55], [24, 190], [24, 300], [24, 455], [475, 42], [475, 155], [475, 280], [475, 455],
     [58, 24], [185, 24], [315, 24], [445, 24], [62, 475], [185, 475], [315, 475], [440, 475],
@@ -467,9 +482,46 @@ export function generateFrontierMap({ terrainDefs, blockDefs, resourceDefs, mobD
   scatterObjects('fox', 12, [265, 335, 470, 480]);
   scatterObjects('bear', 7, [330, 135, 475, 285]);
   scatterObjects('bear', 5, [25, 25, 175, 185]);
+  scatterObjects('moose', 10, [25, 125, 210, 285]);
+  scatterObjects('moose', 8, [270, 345, 470, 480]);
+  scatterObjects('raccoon', 15, [35, 145, 245, 320]);
+  scatterObjects('raccoon', 12, [250, 335, 470, 480]);
+  scatterObjects('cougar', 6, [325, 130, 475, 285]);
+  scatterObjects('cougar', 5, [30, 25, 175, 185]);
+
+  const scatterFloraBlock = (id, count, bounds, allowedTerrain = new Set(['grass', 'mud'])) => {
+    if (!blockDefs[id]) throw new Error(`Missing flora block definition: ${id}`);
+    let placed = 0;
+    for (let attempt = 0; attempt < count * 180 && placed < count; attempt++) {
+      const x = randomInt(bounds[0], bounds[2]); const y = randomInt(bounds[1], bounds[3]);
+      const index = indexOf(x, y);
+      if (x < 5 || y < 5 || x >= W - 5 || y >= H - 5) continue;
+      if (reserved.has(index) || blocks[String(index)] || resources[String(index)] || occupiedGameplay.has(`${x},${y}`)) continue;
+      if (protectedSpawnPoints.some(([px, py]) => Math.hypot(x - px, y - py) < 10)) continue;
+      if (!allowedTerrain.has(terrainIdAt(index)) || elevations[index] > 1) continue;
+      placeBlock(x, y, id, randomInt(0, 3));
+      placed++;
+    }
+    if (placed < count) throw new Error(`Could only place ${placed}/${count} ${id} flora blocks`);
+  };
+
+  scatterFloraBlock('young_pine', 180, [15, 18, 480, 480]);
+  scatterFloraBlock('dense_shrub', 240, [12, 12, 487, 487]);
+  scatterFloraBlock('berry_bush', 120, [24, 118, 465, 470]);
+  scatterFloraBlock('fern_patch', 180, [20, 120, 215, 300]);
+  scatterFloraBlock('fern_patch', 180, [305, 120, 480, 300]);
+  scatterFloraBlock('reeds', 160, [230, 20, 325, 485], new Set(['grass', 'mud', 'sand']));
+  scatterFloraBlock('wildflowers', 220, [12, 12, 487, 487], new Set(['grass']));
+  scatterFloraBlock('tall_grass', 350, [12, 12, 487, 487], new Set(['grass', 'mud']));
+  scatterFloraBlock('fallen_log', 90, [24, 105, 475, 470]);
+  scatterFloraBlock('mossy_stump', 90, [24, 105, 475, 470]);
+  scatterFloraBlock('bramble', 160, [20, 115, 480, 475]);
+  scatterFloraBlock('mushrooms', 150, [20, 115, 480, 475]);
 
   const scatterResource = (id, count, bounds) => {
-    const allowedTerrain = id === 'tree' || id === 'ironwood' ? new Set(['grass', 'mud']) : new Set(['grass', 'mud', 'rock']);
+    const allowedTerrain = resourceDefs[id]?.tile === Tile.Tree
+      ? new Set(['grass', 'mud'])
+      : new Set(['grass', 'mud', 'rock']);
     let placed = 0;
     for (let attempt = 0; attempt < count * 140 && placed < count; attempt++) {
       const x = randomInt(bounds[0], bounds[2]); const y = randomInt(bounds[1], bounds[3]);
@@ -484,11 +536,14 @@ export function generateFrontierMap({ terrainDefs, blockDefs, resourceDefs, mobD
     if (placed < count) throw new Error(`Could only place ${placed}/${count} ${id} resources`);
   };
 
-  scatterResource('tree', 3_500, [6, 6, 493, 493]);
-  scatterResource('tree', 1_250, [18, 125, 195, 285]);
-  scatterResource('tree', 1_100, [310, 125, 480, 285]);
-  scatterResource('tree', 800, [265, 345, 480, 490]);
-  scatterResource('ironwood', 320, [25, 130, 180, 275]);
+  scatterResource('tree', 2_500, [6, 6, 493, 493]);
+  scatterResource('tree', 850, [18, 125, 195, 285]);
+  scatterResource('tree', 700, [310, 125, 480, 285]);
+  scatterResource('pine_tree', 750, [18, 110, 215, 305]);
+  scatterResource('pine_tree', 700, [300, 105, 485, 305]);
+  scatterResource('birch_tree', 420, [20, 320, 235, 485]);
+  scatterResource('birch_tree', 320, [265, 330, 480, 485]);
+  scatterResource('ironwood', 260, [25, 130, 180, 275]);
   scatterResource('rock', 500, [6, 6, 493, 493]);
   scatterResource('rock', 240, [25, 295, 112, 382]);
   scatterResource('copper_vein', 65, [28, 300, 108, 378]);
@@ -552,7 +607,8 @@ export function validateFrontierMap(map, { terrainDefs, blockDefs, resourceDefs,
     counts[id] = (counts[id] ?? 0) + 1;
     return counts;
   }, {});
-  const fauna = ['deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear'].reduce((sum, id) => sum + (enemyCounts[id] ?? 0), 0);
+  const fauna = ['deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear', 'moose', 'raccoon', 'cougar']
+    .reduce((sum, id) => sum + (enemyCounts[id] ?? 0), 0);
   const containers = map.objects.filter((object) => ['chest', 'chest_military', 'chest_custom'].includes(object.type));
   const hotRegions = regions.filter((object) => object.type === 'poi_airport' || object.type === 'poi_hotzone' || object.hot);
   const resourceCounts = Object.values(map.resources).reduce((counts, id) => {

@@ -18,7 +18,7 @@ function fallbackDocument(): SpriteDocument {
 
 const fallbackSources = new Map(
   fallbackDocument().assets.flatMap((asset) =>
-    asset.source ? [[asset.id, asset.source] as const] : [],
+    asset.source ? [[asset.id, { source: asset.source, width: asset.width, height: asset.height }] as const] : [],
   ),
 );
 
@@ -45,9 +45,9 @@ function json(value: unknown): PrismaClientTypes.InputJsonValue {
 
 function pixelAsset(value: PrismaClientTypes.JsonValue): PixelAsset {
   const asset = value as unknown as PixelAsset;
-  const fallbackSource = fallbackSources.get(asset.id);
-  return !asset.source && fallbackSource
-    ? { ...asset, source: { ...fallbackSource } }
+  const fallback = fallbackSources.get(asset.id);
+  return !asset.source && fallback && asset.width === fallback.width && asset.height === fallback.height
+    ? { ...asset, source: { ...fallback.source } }
     : asset;
 }
 

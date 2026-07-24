@@ -5,6 +5,7 @@ import {
   ContainerSnap,
   EntityDeathSnap,
   EnemySnap,
+  FISTS,
   GroundItemSnap,
   HitSnap,
   ITEMS,
@@ -124,6 +125,8 @@ interface FallingTree {
   ty: number;
   t0: number;
   dir: number;
+  spriteId?: string;
+  impacted: boolean;
 }
 interface Corpse {
   x: number;
@@ -403,6 +406,15 @@ export class Renderer {
     return Math.max(0, Math.min(totalFrames - 1, sequence[at] ?? 0));
   }
 
+  private animationDuration(target: string, state: EntityAnimationState, fallbackMs: number): number {
+    const clip = this.visuals.animations?.[target]?.clips?.[state];
+    if (clip?.keyframes?.length) {
+      return clip.keyframes.reduce((sum, keyframe) => sum + Math.max(16, keyframe.durationMs), 0);
+    }
+    if (clip?.frames?.length) return clip.frames.length * Math.max(16, clip.frameMs ?? 125);
+    return fallbackMs;
+  }
+
   private sheetAnimationFrame(target: string, state: EntityAnimationState, elapsedMs: number, seed: number): number {
     if (state === 'walk') {
       const clip = this.visuals.animations?.[target]?.clips?.walk;
@@ -435,7 +447,7 @@ export class Renderer {
       return { x: hitShake, y: 0, shadowScale: 1, lean: 0, animationElapsedMs: moving ? transitionAge * 1000 : time * 1000 };
     }
 
-    const cadence = Math.min(12, 8.2 + speed * 0.018);
+    const cadence = Math.min(17, 12.5 + speed * 0.02);
     const phase = moving
       ? transitionAge * cadence
       : time * cadence + (seed % 997) * 0.031;
@@ -467,8 +479,11 @@ export class Renderer {
   private drawResourceSprite(ctx: CanvasRenderingContext2D, spriteId: string | undefined, x: number, y: number, shakeX: number): boolean {
     const frame = spriteId ? this.visualFrames.get(spriteId)?.[0] : undefined;
     if (!frame) return false;
+    const renderScale = spriteId ? this.visuals.assets?.[spriteId]?.renderScale ?? 2 : 2;
+    const width = frame.width * renderScale;
+    const height = frame.height * renderScale;
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(frame, x - frame.width + shakeX, y - frame.height * 2, frame.width * 2, frame.height * 2);
+    ctx.drawImage(frame, x - width / 2 + shakeX, y - height, width, height);
     return true;
   }
 
@@ -477,8 +492,9 @@ export class Renderer {
     if (!block) return;
     const frame = this.visualFrames.get(block.spriteId)?.[0];
     if (frame) {
-      const width = frame.width * 2 * block.scale;
-      const height = frame.height * 2 * block.scale;
+      const renderScale = this.visuals.assets?.[block.spriteId]?.renderScale ?? 2;
+      const width = frame.width * renderScale * block.scale;
+      const height = frame.height * renderScale * block.scale;
       const quarterTurn = ((rotation % 4) + 4) % 4;
       const angle = quarterTurn * Math.PI / 2;
       const renderedHeight = Math.abs(Math.sin(angle)) * width + Math.abs(Math.cos(angle)) * height;
@@ -501,9 +517,20 @@ export class Renderer {
     const frames = profile ? this.visualFrames.get(profile.spriteId) : undefined;
     if (!frames?.length) return false;
     const frame = frames[this.animationFrame(target, state, elapsedMs, seed, frames.length)];
+    const renderScale = this.visuals.assets?.[profile!.spriteId]?.renderScale ?? 2;
+    const width = frame.width * renderScale;
+    const height = frame.height * renderScale;
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(frame, x - frame.width, y - frame.height, frame.width * 2, frame.height * 2);
+    ctx.drawImage(frame, x - width / 2, y - height / 2, width, height);
     return true;
+  }
+
+  private engineSpriteRenderSize(target: string): { width: number; height: number } | undefined {
+    const profile = this.visuals.animations?.[target];
+    const frame = profile ? this.visualFrames.get(profile.spriteId)?.[0] : undefined;
+    if (!profile || !frame) return undefined;
+    const renderScale = this.visuals.assets?.[profile.spriteId]?.renderScale ?? 2;
+    return { width: frame.width * renderScale, height: frame.height * renderScale };
   }
 
   private tileAt(x: number, y: number): number {
@@ -597,8 +624,9 @@ export class Renderer {
       this.predictedShots = this.predictedShots.filter((shot) => time - shot.t0 < 1.2).slice(-12);
       return 'gun';
     }
+    const meleeDurationMs = definition?.melee?.cooldownMs ?? FISTS.cooldownMs;
     this.localMeleeAt = time;
-    this.localMeleeSuppressUntil = time + 0.9;
+    this.localMeleeSuppressUntil = time + meleeDurationMs / 1000 + 0.08;
     return 'melee';
   }
 
@@ -712,6 +740,31 @@ export class Renderer {
     if (rot !== 0) ctx.rotate(rot);
     // 32×32 source → 64×64, trunk bottom anchored at origin
     ctx.drawImage(this.sheets.tiles, 10 * SPR, 0, 32, 32, -32, -60, 64, 64);
+    ctx.restore();
+  }
+
+  private drawFallingResourceSprite(
+    ctx: CanvasRenderingContext2D,
+    spriteId: string | undefined,
+    cx: number,
+    bottomY: number,
+    rotation: number,
+    alpha: number,
+  ) {
+    const frame = spriteId ? this.visualFrames.get(spriteId)?.[0] : undefined;
+    if (!frame) {
+      this.drawTreeSprite(ctx, cx, bottomY, rotation, alpha);
+      return;
+    }
+    const renderScale = this.visuals.assets?.[spriteId!]?.renderScale ?? 2;
+    const width = frame.width * renderScale;
+    const height = frame.height * renderScale;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(cx, bottomY);
+    ctx.rotate(rotation);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(frame, -width / 2, -height, width, height);
     ctx.restore();
   }
 
@@ -910,6 +963,9 @@ export class Renderer {
   /** Server changed a tile (harvest / regrowth / build), including its rerolled resource variant. */
   applyTile(i: number, tile: number, under?: number, resourceId?: string | null) {
     const old = this.tiles[i];
+    const oldResourceId = this.resourceKinds[String(i)];
+    const fallingSpriteId = this.visuals.resources?.[oldResourceId]?.spriteId
+      ?? this.visuals.resources?.tree?.spriteId;
     this.tiles[i] = tile;
     if ((old === Tile.Firepit || old === Tile.Furnace) && tile !== old) this.stationFuel.delete(i);
     if (resourceId === null) delete this.resourceKinds[String(i)];
@@ -923,8 +979,10 @@ export class Renderer {
       this.falling.push({
         tx,
         ty,
-        t0: this.lastTime,
+        t0: this.lastTime || performance.now() / 1000,
         dir: hash2(tx, ty) < 0.5 ? -1 : 1,
+        spriteId: fallingSpriteId,
+        impacted: false,
       });
       this.burst(
         tx * TILE + 16,
@@ -1145,15 +1203,19 @@ export class Renderer {
     }
 
     // corpses under everything alive
-    this.corpses = this.corpses.filter((c) => view.time - c.t0 < 2);
+    this.corpses = this.corpses.filter((c) => view.time - c.t0 < 3.4);
     for (const c of this.corpses) {
       const elapsed = view.time - c.t0;
-      const fall = easeOutCubic(Math.min(1, elapsed / 0.34));
-      const fade = Math.max(0, Math.min(1, (elapsed - 1.15) / 0.85));
+      const fall = easeInCubic(Math.min(1, elapsed / 0.52));
+      const settleAge = Math.max(0, elapsed - 0.52);
+      const settle = settleAge < 0.42
+        ? Math.sin((settleAge / 0.42) * Math.PI * 2) * 0.045 * (1 - settleAge / 0.42)
+        : 0;
+      const fade = Math.max(0, Math.min(1, (elapsed - 2.55) / 0.85));
       ctx.save();
       ctx.globalAlpha = 0.88 * (1 - fade);
-      ctx.translate(c.x, c.y + fall * 6);
-      ctx.rotate(c.dir * fall * Math.PI / 2);
+      ctx.translate(c.x, c.y + fall * 7);
+      ctx.rotate(c.dir * (fall * Math.PI / 2 + settle));
       const custom = c.target
         ? this.drawEngineSprite(ctx, c.target, 'death', elapsed * 1000, 0, 0, 0)
         : false;
@@ -1277,22 +1339,43 @@ export class Renderer {
         }
       }
 
-    this.falling = this.falling.filter((f) => view.time - f.t0 < 0.7);
+    const treeRecoilEnd = 0.24;
+    const treeImpactAt = 1.08;
+    const treeFadeAt = 2.3;
+    const treeLife = 2.85;
+    this.falling = this.falling.filter((f) => view.time - f.t0 < treeLife);
     for (const f of this.falling) {
-      const t01 = (view.time - f.t0) / 0.7;
-      const fall = easeInCubic(Math.min(1, t01));
+      const age = Math.max(0, view.time - f.t0);
+      let angle = 0;
+      if (age < treeRecoilEnd) {
+        const recoil = age / treeRecoilEnd;
+        angle = f.dir * Math.sin(recoil * Math.PI * 3) * 0.055 * (1 - recoil);
+      } else if (age < treeImpactAt) {
+        const fall = easeInCubic((age - treeRecoilEnd) / (treeImpactAt - treeRecoilEnd));
+        angle = f.dir * fall * (Math.PI / 2 + 0.055);
+      } else {
+        const settleAge = Math.min(1, (age - treeImpactAt) / 0.46);
+        const bounce = Math.sin(settleAge * Math.PI * 2) * 0.06 * (1 - settleAge);
+        angle = f.dir * (Math.PI / 2 + bounce);
+      }
       const cx = f.tx * TILE + TILE / 2;
       const by = f.ty * TILE + TILE - 2;
+      if (!f.impacted && age >= treeImpactAt) {
+        f.impacted = true;
+        this.burst(
+          cx + f.dir * 48,
+          by - 3,
+          ["#263a27", "#49643d", "#6d8651", "#5c3f26", "#93623d"],
+          24,
+          82,
+        );
+      }
+      const alpha = age <= treeFadeAt
+        ? 1
+        : Math.max(0, 1 - (age - treeFadeAt) / (treeLife - treeFadeAt));
       drawables.push({
         y: by,
-        fn: () =>
-          this.drawTreeSprite(
-            ctx,
-            cx,
-            by,
-            f.dir * fall * (Math.PI / 2),
-            1 - fall * 0.92,
-          ),
+        fn: () => this.drawFallingResourceSprite(ctx, f.spriteId, cx, by, angle, alpha),
       });
     }
 
@@ -2012,13 +2095,17 @@ export class Renderer {
     // animation set is being rebuilt. Profiles retain their saved appearance,
     // but live players use one stable base row with no procedural overlays.
     const row = 0;
+    const meleeVisualMs = p.weapon
+      ? this.gameplayItems[p.weapon]?.melee?.cooldownMs ?? FISTS.cooldownMs
+      : FISTS.cooldownMs;
     const serverSwingPhase =
-      p.swing > 0 && view.serverNow - p.swing < 400
-        ? Math.min(1, (view.serverNow - p.swing) / 400)
+      p.swing > 0 && view.serverNow - p.swing < meleeVisualMs
+        ? Math.min(1, (view.serverNow - p.swing) / meleeVisualMs)
         : null;
     const localMeleeElapsed = view.time - this.localMeleeAt;
-    const localSwingPhase = isYou && localMeleeElapsed >= 0 && localMeleeElapsed < 0.4
-      ? Math.min(1, localMeleeElapsed / 0.4)
+    const localMeleeDuration = meleeVisualMs / 1000;
+    const localSwingPhase = isYou && localMeleeElapsed >= 0 && localMeleeElapsed < localMeleeDuration
+      ? Math.min(1, localMeleeElapsed / localMeleeDuration)
       : null;
     const swingPhase = isYou && view.time < this.localMeleeSuppressUntil ? localSwingPhase : serverSwingPhase;
     const playerHitElapsed = p.hitAt ? view.serverNow - p.hitAt : Infinity;
@@ -2027,7 +2114,19 @@ export class Renderer {
       : localSwingPhase !== null
         ? localMeleeElapsed * 1000
         : swingPhase !== null ? view.serverNow - p.swing : Infinity;
-    const playerState: EntityAnimationState = playerHitElapsed < 300 ? 'hit' : playerAttackElapsed < 700 ? 'attack' : p.moving ? 'walk' : 'idle';
+    const playerActionState: EntityAnimationState = p.weapon ? 'attack' : 'punch';
+    const playerActionDuration = this.animationDuration(
+      'player',
+      playerActionState,
+      p.weapon ? meleeVisualMs : FISTS.cooldownMs,
+    );
+    const playerState: EntityAnimationState = playerHitElapsed < 300
+      ? 'hit'
+      : playerAttackElapsed < playerActionDuration
+        ? playerActionState
+        : p.moving
+          ? 'walk'
+          : 'idle';
     const pose = this.motionPose(p.id, p.moving, view.time, seed, p.vx, p.vy, playerHitElapsed);
     const playerElapsed = playerState === 'hit'
       ? playerHitElapsed
@@ -2039,6 +2138,7 @@ export class Renderer {
     const fallbackFrame = this.sheetAnimationFrame('player', playerState, playerElapsed, seed);
     const bodyX = p.dx + pose.x;
     const bodyY = p.dy + pose.y;
+    const playerSpriteSize = this.engineSpriteRenderSize('player') ?? { width: 32, height: 32 };
     const facingLeft = this.facesLeft(p.id, p.facing ?? p.angle);
     const drawFacing = (draw: () => void) => {
       ctx.save();
@@ -2085,7 +2185,12 @@ export class Renderer {
       );
       ctx.stroke();
       ctx.beginPath();
-      ctx.rect(p.dx - 16, p.dy - 16, 32, 22); // clip below the waterline
+      ctx.rect(
+        p.dx - playerSpriteSize.width / 2 - 1,
+        p.dy - playerSpriteSize.height / 2 - 1,
+        playerSpriteSize.width + 2,
+        playerSpriteSize.height / 2 + 7,
+      ); // clip below the waterline
       ctx.clip();
       drawBody();
       ctx.restore();
@@ -2093,7 +2198,17 @@ export class Renderer {
     }
     if (!swimming) {
       ctx.fillStyle = "rgba(0,0,0,0.3)";
-      ctx.beginPath(); ctx.ellipse(p.dx, p.dy + 14, 9 * pose.shadowScale, 3.5 * pose.shadowScale, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(
+        p.dx,
+        p.dy + Math.max(14, playerSpriteSize.height * .28),
+        Math.max(9, playerSpriteSize.width * .22) * pose.shadowScale,
+        3.5 * pose.shadowScale,
+        0,
+        0,
+        Math.PI * 2,
+      );
+      ctx.fill();
       drawBody();
     }
 
@@ -2102,7 +2217,7 @@ export class Renderer {
     if (playerHitElapsed < 120) ctx.filter = 'brightness(1.75) saturate(0.55)';
     if (!swimming && p.helmet) {
       ctx.fillStyle = p.helmet === "helmet_military" ? "#44513a" : "#8a8a92";
-      ctx.fillRect(bodyX - 7, bodyY - 16, 14, 5);
+      ctx.fillRect(bodyX - 7, bodyY - playerSpriteSize.height / 2 + 4, 14, 5);
     }
     if (!swimming && p.vest) {
       ctx.fillStyle = p.vest === "vest_military" ? "#3c4834" : "#867454";
@@ -2113,16 +2228,6 @@ export class Renderer {
     if (p.weapon && !swimming) {
       const recoil = isYou && view.time < this.kickUntil ? (this.kickUntil - view.time) / 0.09 : 0;
       this.drawHeldItem(ctx, bodyX, bodyY, p.weapon, p.angle, swingPhase, recoil);
-    } else if (swingPhase !== null && !swimming) {
-      // bare-fist jab, alternating hands
-      const side = Math.floor(p.swing / 400) & 1 ? 1 : -1;
-      const ext = Math.sin(swingPhase * Math.PI) * 12;
-      ctx.save();
-      ctx.translate(bodyX, bodyY + 2);
-      ctx.rotate(p.angle);
-      ctx.fillStyle = "#d8a878";
-      ctx.fillRect(6 + ext, side * 4 - 2, 5, 4);
-      ctx.restore();
     }
 
     // nameplate — only nearby or friends (positional info discipline)
@@ -2130,20 +2235,23 @@ export class Renderer {
     const distToYou = you ? Math.hypot(p.dx - you.dx, p.dy - you.dy) : 0;
     const isFriend = view.friendNames.has(p.name);
     if (isYou || isFriend || distToYou < NAMEPLATE_RANGE) {
+      const nameplateOffset = Math.max(22, playerSpriteSize.height / 2 + 4);
+      const nameplateY = p.dy - nameplateOffset;
+      const healthY = nameplateY + 1.5;
       ctx.font = "7px monospace";
       ctx.textAlign = "center";
       const nameplate = p.admin ? `[ADMIN] ${p.name}` : p.name;
       ctx.fillStyle = p.admin ? "#68d5f0" : isYou ? "#f0dfa0" : isFriend ? "#a8e0a0" : "#dcd8c8";
       ctx.strokeStyle = "rgba(0,0,0,0.7)";
       ctx.lineWidth = 2;
-      ctx.strokeText(nameplate, p.dx, p.dy - 22);
-      ctx.fillText(nameplate, p.dx, p.dy - 22);
+      ctx.strokeText(nameplate, p.dx, nameplateY);
+      ctx.fillText(nameplate, p.dx, nameplateY);
 
       const hpw = 20;
       ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(p.dx - hpw / 2, p.dy - 20.5, hpw, 2.5);
+      ctx.fillRect(p.dx - hpw / 2, healthY, hpw, 2.5);
       ctx.fillStyle = p.hp > 50 ? "#7fb069" : p.hp > 25 ? "#d8a24a" : "#c25047";
-      ctx.fillRect(p.dx - hpw / 2, p.dy - 20.5, (hpw * p.hp) / p.maxHp, 2.5);
+      ctx.fillRect(p.dx - hpw / 2, healthY, (hpw * p.hp) / p.maxHp, 2.5);
     }
   }
 
@@ -2156,7 +2264,15 @@ export class Renderer {
     const seed = hashStr(e.id);
     const attackElapsed = e.attackAt ? view.serverNow - e.attackAt : Infinity;
     const hitElapsed = e.hitAt ? view.serverNow - e.hitAt : Infinity;
-    const state: EntityAnimationState = hitElapsed < 300 ? 'hit' : attackElapsed < 700 ? 'attack' : e.moving ? 'walk' : 'idle';
+    const attackState: EntityAnimationState = e.kind === 'military' ? 'attack' : 'punch';
+    const attackDuration = this.animationDuration(`mob:${e.kind}`, attackState, e.kind === 'military' ? 700 : 500);
+    const state: EntityAnimationState = hitElapsed < 300
+      ? 'hit'
+      : attackElapsed < attackDuration
+        ? attackState
+        : e.moving
+          ? 'walk'
+          : 'idle';
     const pose = this.motionPose(e.id, e.moving, time, seed, e.vx, e.vy, hitElapsed);
     const elapsed = state === 'hit'
       ? hitElapsed
@@ -2168,7 +2284,7 @@ export class Renderer {
     const previousSoundState = this.entitySoundStates.get(e.id);
     if (previousSoundState !== state) {
       this.entitySoundStates.set(e.id, state);
-      const soundAction = state === 'attack' ? 'attack' : state === 'hit' ? 'hit' : state === 'idle' && previousSoundState === undefined ? undefined : state === 'idle' ? 'idle' : undefined;
+      const soundAction = state === 'attack' || state === 'punch' ? 'attack' : state === 'hit' ? 'hit' : state === 'idle' && previousSoundState === undefined ? undefined : state === 'idle' ? 'idle' : undefined;
       const cue = soundAction ? this.visuals.mobSounds?.[e.kind]?.[soundAction] : undefined;
       if (cue) this.onSound?.(cue, 0.55);
     }
@@ -2179,11 +2295,19 @@ export class Renderer {
       wolf: CHAR_ROWS.wolf,
       fox: CHAR_ROWS.fox,
       bear: CHAR_ROWS.bear,
+      moose: CHAR_ROWS.moose,
+      raccoon: CHAR_ROWS.raccoon,
+      cougar: CHAR_ROWS.cougar,
     };
     const animalRow = ANIMAL_ROWS[e.kind];
     const bodyX = e.dx + pose.x;
     const bodyY = e.dy + pose.y;
-    const shadowWidth = e.kind === 'rabbit' ? 6 : e.kind === 'bear' ? 12 : animalRow !== undefined ? 10 : 9;
+    const enemySpriteSize = this.engineSpriteRenderSize(`mob:${e.kind}`) ?? { width: 32, height: 32 };
+    const shadowWidth =
+      e.kind === 'rabbit' || e.kind === 'raccoon' ? 6
+      : e.kind === 'bear' || e.kind === 'moose' ? 12
+      : animalRow !== undefined ? 10
+      : 9;
     if (e.boss) {
       const pulse = 0.5 + Math.sin(time * 5 + seed) * 0.5;
       ctx.strokeStyle = `rgba(240, 90, 74, ${0.38 + pulse * 0.42})`;
@@ -2216,24 +2340,27 @@ export class Renderer {
 
     if (e.hp < e.maxHp || e.boss) {
       const hpw = e.boss ? 46 : 20;
+      const spriteScale = e.boss ? 1.25 : 1;
+      const healthOffset = Math.max(e.boss ? 27 : 21, enemySpriteSize.height * spriteScale / 2 + 3);
+      const healthY = e.dy - healthOffset;
       if (e.boss) {
         ctx.font = '700 8px monospace';
         ctx.textAlign = 'center';
         ctx.lineWidth = 3;
         ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-        ctx.strokeText(e.boss.name, e.dx, e.dy - 31);
+        ctx.strokeText(e.boss.name, e.dx, healthY - 4);
         ctx.fillStyle = '#ffb0a2';
-        ctx.fillText(e.boss.name, e.dx, e.dy - 31);
+        ctx.fillText(e.boss.name, e.dx, healthY - 4);
       }
       ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(e.dx - hpw / 2, e.dy - (e.boss ? 27 : 21), hpw, e.boss ? 4 : 2.5);
+      ctx.fillRect(e.dx - hpw / 2, healthY, hpw, e.boss ? 4 : 2.5);
       ctx.fillStyle =
         e.boss ? "#db4d3f"
         : e.kind === "zombie" ? "#7fa062"
-        : e.kind === "wolf" || e.kind === "bear" ? "#a04040"
+        : e.kind === "wolf" || e.kind === "bear" || e.kind === "cougar" || e.kind === "moose" ? "#a04040"
         : animalRow !== undefined ? "#c8a878"
         : "#c07a4a";
-      ctx.fillRect(e.dx - hpw / 2, e.dy - (e.boss ? 27 : 21), (hpw * e.hp) / e.maxHp, e.boss ? 4 : 2.5);
+      ctx.fillRect(e.dx - hpw / 2, healthY, (hpw * e.hp) / e.maxHp, e.boss ? 4 : 2.5);
     }
   }
 
@@ -2284,7 +2411,17 @@ export class Renderer {
     y: number,
     time: number,
   ) {
-    this.drawShadowAndSprite(ctx, x, y, CHAR_ROWS.trader, false, time, 7);
+    const profile = this.visuals.animations?.trader;
+    const hasPublishedTrader = !!profile && !!this.visualFrames.get(profile.spriteId)?.length;
+    if (hasPublishedTrader) {
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      ctx.beginPath();
+      ctx.ellipse(x, y + 14, 9, 3.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      this.drawEngineSprite(ctx, "trader", "idle", time * 1000, 7, x, y);
+    } else {
+      this.drawShadowAndSprite(ctx, x, y, CHAR_ROWS.trader, false, time, 7);
+    }
     ctx.font = "7px monospace";
     ctx.textAlign = "center";
     ctx.fillStyle = "#d8c26a";

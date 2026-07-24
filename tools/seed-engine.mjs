@@ -1,6 +1,10 @@
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { PrismaClient } from "@prisma/client";
+import {
+  buildProductionAnimations,
+  buildProductionSpriteDocument,
+} from "./lib/production-art.mjs";
 
 const require = createRequire(import.meta.url);
 const {
@@ -9,7 +13,7 @@ const {
   BLOCKS_ENEMY,
   BLOCKS_MOVE,
   DEFAULT_LOOT_TABLES,
-  DEFAULT_PIXEL_PALETTE,
+  DEFAULT_RESOURCE_NODES,
   ENEMY_DEFS,
   ITEMS,
   ITEM_SPRITE_ORDER,
@@ -29,6 +33,66 @@ const itemSheet = PNG.sync.read(
     new URL("../apps/web/public/sprites/items.png", import.meta.url),
   ),
 );
+const itemSheetA = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-items-a.png", import.meta.url),
+  ),
+);
+const itemSheetB = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-items-b.png", import.meta.url),
+  ),
+);
+const charSheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/chars.png", import.meta.url),
+  ),
+);
+const actorSheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-actors.png", import.meta.url),
+  ),
+);
+const actorWalkASheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-actors-walk-a.png", import.meta.url),
+  ),
+);
+const actorWalkBSheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-actors-walk-b.png", import.meta.url),
+  ),
+);
+const actorPunchWindupSheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-actors-punch-windup.png", import.meta.url),
+  ),
+);
+const actorPunchImpactSheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-actors-punch-impact.png", import.meta.url),
+  ),
+);
+const actorPunchRecoverySheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-actors-punch-recovery.png", import.meta.url),
+  ),
+);
+const floraSheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-flora.png", import.meta.url),
+  ),
+);
+const propSheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-props.png", import.meta.url),
+  ),
+);
+const terrainSheet = PNG.sync.read(
+  readFileSync(
+    new URL("../apps/web/public/sprites/production-terrain.png", import.meta.url),
+  ),
+);
 
 const cropPixels = (sheet, col, row = 0, width = 16, height = 16) => {
   const pixels = [];
@@ -43,46 +107,6 @@ const cropPixels = (sheet, col, row = 0, width = 16, height = 16) => {
 };
 const cropTilePixels = (col, row = 0, width = 16, height = 16) =>
   cropPixels(tileSheet, col, row, width, height);
-
-const terrainAsset = (id, name, col) => ({
-  id: `terrain:${id}`,
-  name,
-  width: 16,
-  height: 16,
-  pixels: cropTilePixels(col),
-  frames: [cropTilePixels(col)],
-});
-const resourceAsset = (id, name, col, width = 16, height = 16) => ({
-  id: `resource:${id}`,
-  name,
-  width,
-  height,
-  pixels: cropTilePixels(col, 0, width, height),
-  frames: [cropTilePixels(col, 0, width, height)],
-});
-const blockAsset = (id, name, col) => ({
-  id: `block:${id}`,
-  name,
-  width: 16,
-  height: 16,
-  pixels: cropTilePixels(col),
-  frames: [cropTilePixels(col)],
-});
-const bedPixels = [...cropTilePixels(9), ...cropTilePixels(13)];
-const chestPixels = (() => {
-  const pixels = new Array(16 * 16).fill("#00000000");
-  const fill = (x, y, w, h, color) => {
-    for (let py = y; py < y + h; py++)
-      for (let px = x; px < x + w; px++) pixels[py * 16 + px] = color;
-  };
-  fill(2, 5, 12, 9, "#33240fff");
-  fill(3, 6, 10, 7, "#7c5226ff");
-  fill(2, 4, 12, 4, "#33240fff");
-  fill(3, 5, 10, 2, "#a06b30ff");
-  fill(7, 7, 3, 5, "#d8a24aff");
-  fill(8, 8, 1, 2, "#f2cf68ff");
-  return pixels;
-})();
 
 const prisma = new PrismaClient();
 const canonicalJson = (value) => {
@@ -99,112 +123,25 @@ const canonicalJson = (value) => {
 const sameJson = (left, right) =>
   JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right));
 
-const sprites = {
-  palette: DEFAULT_PIXEL_PALETTE,
-  assets: [
-    ...ITEM_SPRITE_ORDER.map((id, col) => {
-      const pixels = cropPixels(itemSheet, col);
-      return {
-        id: `item:${id}`,
-        name: ITEMS[id].name,
-        width: 16,
-        height: 16,
-        pixels,
-        frames: [pixels],
-        source: { sheet: "items", col, row: 0 },
-      };
-    }),
-    ...Object.entries({
-      player: 0,
-      zombie: 8,
-      military: 9,
-      trader: 10,
-      deer: 11,
-      rabbit: 12,
-      boar: 13,
-      wolf: 14,
-      fox: 15,
-      bear: 16,
-    }).map(([id, row]) => ({
-      id: `character:${id}`,
-      name: id,
-      width: 16,
-      height: 16,
-      pixels: [],
-      source: { sheet: "chars", col: 0, row, frames: 4 },
-    })),
-    {
-      id: "character:brute",
-      name: "Brute",
-      width: 16,
-      height: 16,
-      pixels: [],
-      source: { sheet: "chars", col: 0, row: 8, frames: 4 },
-    },
-    resourceAsset("tree", "Common tree", 10, 32, 32),
-    resourceAsset("ironwood", "Ironwood tree", 10, 32, 32),
-    resourceAsset("rock", "Stone outcrop", 12),
-    {
-      id: "block:steel_crate",
-      name: "Steel crate block",
-      width: 16,
-      height: 16,
-      pixels: [],
-      source: { sheet: "tiles", col: 14, row: 0, frames: 1 },
-    },
-    ...Object.entries({
-      workbench: 14,
-      firepit: 15,
-      furnace: 16,
-      wood_floor: 19,
-      stone_floor: 20,
-      wall: 21,
-      door: 22,
-      fence: 23,
-      torch: 24,
-      anvil: 27,
-    }).map(([id, col]) => blockAsset(id, BUILDABLES[id].name, col)),
-    {
-      id: "block:bed",
-      name: "Bed",
-      width: 16,
-      height: 32,
-      pixels: bedPixels,
-      frames: [bedPixels],
-    },
-    {
-      id: "block:chest",
-      name: "Storage chest",
-      width: 16,
-      height: 16,
-      pixels: chestPixels,
-      frames: [chestPixels],
-    },
-    terrainAsset("grass", "Grass", 0),
-    terrainAsset("water", "Water", 2),
-    terrainAsset("sand", "Sand", 3),
-    terrainAsset("road", "Dirt road", 4),
-    terrainAsset("mud", "Deep mud", 4),
-    terrainAsset("asphalt", "Asphalt", 5),
-    terrainAsset("floor", "Interior floor", 6),
-    terrainAsset("wall", "Building wall", 7),
-    terrainAsset("doormat", "Door mat", 8),
-    terrainAsset("tree", "Tree ground", 0),
-    terrainAsset("rock", "Rock ground", 0),
-    terrainAsset("bed", "Bed", 13),
-    terrainAsset("copper_ore", "Copper vein ground", 0),
-    terrainAsset("iron_ore", "Iron vein ground", 0),
-    terrainAsset("cliff", "Cliff", 28),
-  ],
-};
-
-const defaultClips = {
-  idle: { frames: [0], frameMs: 500, loop: true },
-  walk: { frames: [1, 2, 3, 2], frameMs: 105, loop: true },
-  attack: { frames: [0, 1, 2, 0], frameMs: 90, loop: false },
-  hit: { frames: [3, 0], frameMs: 80, loop: false },
-  death: { frames: [1], frameMs: 400, loop: false },
-};
+const sprites = buildProductionSpriteDocument({
+  tileSheet,
+  itemSheet,
+  itemSheetA,
+  itemSheetB,
+  charSheet,
+  actorSheet,
+  actorWalkASheet,
+  actorWalkBSheet,
+  actorPunchWindupSheet,
+  actorPunchImpactSheet,
+  actorPunchRecoverySheet,
+  floraSheet,
+  propSheet,
+  terrainSheet,
+  itemSpriteOrder: ITEM_SPRITE_ORDER,
+  items: ITEMS,
+  buildables: BUILDABLES,
+});
 
 const documents = {
   items: ITEMS,
@@ -277,6 +214,107 @@ const documents = {
           { itemId: "scrap", min: 2, max: 5, chance: 1, when: "depleted" },
         ],
       },
+      wrecked_car: {
+        id: "wrecked_car",
+        name: "Wrecked car",
+        spriteId: "block:wrecked_car",
+        scale: 1,
+        offsetY: 0,
+        maxHp: 260,
+        destructible: true,
+        collision: { move: true, enemy: true, bullets: true, sight: false },
+        hitSound: "mine_heavy",
+        breakSound: "rock_break",
+        drops: [
+          { itemId: "scrap", min: 3, max: 7, chance: 1, when: "depleted" },
+        ],
+      },
+      road_barrier: {
+        id: "road_barrier",
+        name: "Road barrier",
+        spriteId: "block:road_barrier",
+        scale: 1,
+        offsetY: 0,
+        maxHp: 80,
+        destructible: true,
+        collision: { move: true, enemy: true, bullets: false, sight: false },
+        hitSound: "wood_heavy",
+        breakSound: "tree_crack",
+        drops: [
+          { itemId: "wood", min: 1, max: 2, chance: 1, when: "depleted" },
+        ],
+      },
+      sandbag_wall: {
+        id: "sandbag_wall",
+        name: "Sandbag wall",
+        spriteId: "block:sandbag_wall",
+        scale: 1,
+        offsetY: 0,
+        maxHp: 220,
+        destructible: true,
+        collision: { move: true, enemy: true, bullets: true, sight: false },
+        hitSound: "mine_heavy",
+        breakSound: "rock_break",
+        drops: [],
+      },
+      dead_tree: {
+        id: "dead_tree",
+        name: "Dead tree",
+        spriteId: "block:dead_tree",
+        scale: 1,
+        offsetY: 0,
+        maxHp: 90,
+        destructible: true,
+        collision: { move: true, enemy: true, bullets: true, sight: false },
+        hitSound: "chop",
+        breakSound: "tree_fall",
+        drops: [
+          { itemId: "wood", min: 2, max: 4, chance: 1, when: "depleted" },
+        ],
+      },
+      stone_wall: {
+        id: "stone_wall",
+        name: "Stone wall",
+        spriteId: "block:stone_wall",
+        scale: 1,
+        offsetY: 0,
+        maxHp: 320,
+        destructible: true,
+        collision: { move: true, enemy: true, bullets: true, sight: true },
+        hitSound: "mine_heavy",
+        breakSound: "rock_break",
+        drops: [
+          { itemId: "stone", min: 2, max: 5, chance: 1, when: "depleted" },
+        ],
+      },
+      ...Object.fromEntries(
+        [
+          ["young_pine", "Young pine"],
+          ["dense_shrub", "Dense shrub"],
+          ["berry_bush", "Red berry bush"],
+          ["fern_patch", "Fern patch"],
+          ["reeds", "Reeds and cattails"],
+          ["wildflowers", "Wildflower patch"],
+          ["tall_grass", "Tall dry grass"],
+          ["fallen_log", "Fallen mossy log"],
+          ["mossy_stump", "Mossy stump"],
+          ["bramble", "Bramble patch"],
+          ["mushrooms", "Mushroom cluster"],
+        ].map(([id, name]) => [
+          id,
+          {
+            id,
+            name,
+            spriteId: `block:${id}`,
+            scale: 1,
+            offsetY: 0,
+            maxHp: 1,
+            destructible: false,
+            collision: { move: false, enemy: false, bullets: false, sight: false },
+            drops: [],
+          },
+        ]),
+      ),
       ...Object.fromEntries(
         Object.entries(BUILDABLES).map(([buildType, buildable]) => {
           const kit = Object.values(ITEMS).find(
@@ -317,91 +355,11 @@ const documents = {
     legacyBuildables: BUILDABLES,
   },
   sprites,
-  animations: {
-    player: { spriteId: "character:player", clips: defaultClips },
-    ...Object.fromEntries(
-      Object.keys(ENEMY_DEFS).map((id) => [
-        `mob:${id}`,
-        { spriteId: `character:${id}`, clips: defaultClips },
-      ]),
-    ),
-    "mob:brute": {
-      spriteId: "character:brute",
-      clips: {
-        ...defaultClips,
-        attack: {
-          frames: [0, 1, 0],
-          frameMs: 180,
-          loop: false,
-          keyframes: [
-            {
-              frame: 0,
-              durationMs: 220,
-              soundId: "brute_roar",
-              event: "windup",
-            },
-            {
-              frame: 1,
-              durationMs: 320,
-              soundId: "brute_slam",
-              event: "impact",
-            },
-            { frame: 0, durationMs: 260, event: "recover" },
-          ],
-        },
-      },
-    },
-  },
-  resources: {
-    tree: {
-      id: "tree",
-      name: "Common tree",
-      tile: 2,
-      depletedTile: 14,
-      maxHits: 6,
-      respawnMs: 240000,
-      skill: "woodcutting",
-      respawnFamily: "tree",
-      respawnWeight: 94,
-      spriteId: "resource:tree",
-      hitSound: "chop",
-      breakSound: "tree_fall",
-      drops: [{ itemId: "wood", min: 2, max: 3, chance: 1, when: "hit" }],
-    },
-    ironwood: {
-      id: "ironwood",
-      name: "Ironwood tree",
-      tile: 2,
-      depletedTile: 14,
-      maxHits: 14,
-      respawnMs: 480000,
-      skill: "woodcutting",
-      respawnFamily: "tree",
-      respawnWeight: 6,
-      spriteId: "resource:ironwood",
-      hitSound: "wood_heavy",
-      breakSound: "tree_crack",
-      drops: [
-        { itemId: "wood", min: 3, max: 5, chance: 1, when: "hit" },
-        { itemId: "iron_ore", min: 1, max: 2, chance: 0.35, when: "depleted" },
-      ],
-    },
-    rock: {
-      id: "rock",
-      name: "Stone outcrop",
-      tile: 7,
-      depletedTile: 15,
-      maxHits: 8,
-      respawnMs: 240000,
-      skill: "mining",
-      respawnFamily: "rock",
-      respawnWeight: 1,
-      spriteId: "resource:rock",
-      hitSound: "mine",
-      breakSound: "rock_break",
-      drops: [{ itemId: "stone", min: 2, max: 3, chance: 1, when: "hit" }],
-    },
-  },
+  animations: buildProductionAnimations({
+    ...ENEMY_DEFS,
+    brute: { id: "brute" },
+  }),
+  resources: DEFAULT_RESOURCE_NODES,
   terrain: {
     grass: {
       id: "grass",
@@ -622,6 +580,17 @@ const documents = {
         volume: 0.16,
         noise: 0.12,
         filterHz: 3200,
+      },
+      mine_heavy: {
+        id: "mine_heavy",
+        name: "Heavy pick strike",
+        wave: "square",
+        frequency: 280,
+        endFrequency: 70,
+        durationMs: 150,
+        volume: 0.16,
+        noise: 0.2,
+        filterHz: 2600,
       },
       rock_break: {
         id: "rock_break",

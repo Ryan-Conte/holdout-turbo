@@ -388,7 +388,7 @@ const SHIRTS = [
   "#5a6a2a",
 ];
 {
-  const rows = 17;
+  const rows = 20;
   const CHAR_FRAMES = [0, 1, 2, 3];
   const png = sheet(CHAR_FRAMES.length, rows);
   const skin = hex("#d8a878");
@@ -566,6 +566,66 @@ const SHIRTS = [
     const step = [0, 1, 0, -1][frame];
     rect(png, fx + 2 + step, fy + 12, 3, 4, fur);
     rect(png, fx + 9 - step, fy + 12, 3, 4, fur);
+  }
+  // row 17: bull moose (tall shoulder, broad antlers)
+  for (const frame of CHAR_FRAMES) {
+    const fx = frame * C;
+    const fy = 17 * C;
+    const fur = hex("#5a4230");
+    const dark = hex("#382a22");
+    const antler = hex("#c19a68");
+    const step = [0, 1, 0, -1][frame];
+    rect(png, fx + 2, fy + 6, 10, 6, fur);
+    rect(png, fx + 3, fy + 4, 5, 3, dark); // raised shoulder
+    rect(png, fx + 10, fy + 3, 4, 5, fur);
+    rect(png, fx + 12, fy + 1, 1, 3, antler);
+    rect(png, fx + 9, fy + 1, 1, 3, antler);
+    px(png, fx + 8, fy, antler);
+    px(png, fx + 10, fy, antler);
+    px(png, fx + 13, fy, antler);
+    px(png, fx + 14, fy + 1, antler);
+    px(png, fx + 13, fy + 5, hex("#d7b86e"));
+    rect(png, fx + 3 + step, fy + 12, 2, 4, dark);
+    rect(png, fx + 9 - step, fy + 12, 2, 4, dark);
+  }
+  // row 18: raccoon (masked face and ringed tail)
+  for (const frame of CHAR_FRAMES) {
+    const fx = frame * C;
+    const fy = 18 * C;
+    const fur = hex("#76736d");
+    const dark = hex("#34363a");
+    const light = hex("#aaa79c");
+    const hop = [0, -1, -2, -1][frame];
+    const step = [0, 1, 0, -1][frame];
+    rect(png, fx + 4, fy + 8 + hop, 7, 4, fur);
+    rect(png, fx + 10, fy + 6 + hop, 4, 4, light);
+    rect(png, fx + 10, fy + 7 + hop, 4, 2, dark);
+    px(png, fx + 13, fy + 7 + hop, hex("#d8c96a"));
+    rect(png, fx + 0, fy + 7 + hop, 5, 2, fur);
+    px(png, fx + 1, fy + 7 + hop, dark);
+    px(png, fx + 3, fy + 8 + hop, dark);
+    rect(png, fx + 5 + step, fy + 12, 2, 3, dark);
+    rect(png, fx + 9 - step, fy + 12, 2, 3, dark);
+  }
+  // row 19: cougar (long tawny predator with dark tail tip)
+  for (const frame of CHAR_FRAMES) {
+    const fx = frame * C;
+    const fy = 19 * C;
+    const fur = hex("#b08052");
+    const light = hex("#d0ad7a");
+    const dark = hex("#4b3729");
+    const stride = [0, 1, 0, -1][frame];
+    const lift = [0, -1, -2, -1][frame];
+    rect(png, fx + 3, fy + 7 + lift, 9, 4, fur);
+    rect(png, fx + 10, fy + 5 + lift, 5, 4, fur);
+    px(png, fx + 11, fy + 4 + lift, dark);
+    px(png, fx + 14, fy + 4 + lift, dark);
+    px(png, fx + 14, fy + 7 + lift, hex("#d9c35d"));
+    px(png, fx + 13, fy + 9 + lift, light);
+    rect(png, fx + 0, fy + 6 + lift, 4, 2, fur);
+    px(png, fx, fy + 6 + lift, dark);
+    rect(png, fx + 4 + stride, fy + 11, 2, 4, dark);
+    rect(png, fx + 10 - stride, fy + 11, 2, 4, dark);
   }
   save(png, "chars.png");
 }

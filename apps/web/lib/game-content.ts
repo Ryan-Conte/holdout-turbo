@@ -20,8 +20,11 @@ import {
   TRADER_STOCK_T2,
 } from '@holdout/shared';
 
-const normalizeResourceTile = (tile: number, skill: ResourceNodeDef['skill'] | undefined) =>
-  tile === Tile.Tree || skill === 'woodcutting' ? Tile.Tree : Tile.Rock;
+const normalizeResourceTile = (tile: number, skill: ResourceNodeDef['skill'] | undefined) => {
+  if (tile === Tile.Tree || skill === 'woodcutting') return Tile.Tree;
+  if (tile === Tile.CopperOre || tile === Tile.IronOre) return tile;
+  return Tile.Rock;
+};
 
 const normalizeResourceNode = (resource: ResourceNodeDef): ResourceNodeDef => ({
   ...resource,
@@ -47,7 +50,11 @@ const spriteAssets = [
     pixels: [] as string[],
     source: { sheet: 'items' as const, col, row: 0 },
   })),
-  ...Object.entries({ player: 0, zombie: 8, military: 9, trader: 10, deer: 11, rabbit: 12, boar: 13, wolf: 14, fox: 15, bear: 16 })
+  ...Object.entries({
+    player: 0, zombie: 8, military: 9, trader: 10,
+    deer: 11, rabbit: 12, boar: 13, wolf: 14, fox: 15, bear: 16,
+    moose: 17, raccoon: 18, cougar: 19,
+  })
     .map(([id, row]) => ({
       id: `character:${id}`,
       name: id.replace('_', ' '),
@@ -60,11 +67,45 @@ const spriteAssets = [
   { id: 'resource:tree', name: 'Common tree', width: 32, height: 32, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 10, row: 0, frames: 1 } },
   { id: 'resource:ironwood', name: 'Ironwood tree', width: 32, height: 32, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 10, row: 0, frames: 1 } },
   { id: 'resource:rock', name: 'Stone outcrop', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 12, row: 0, frames: 1 } },
+  { id: 'resource:copper_vein', name: 'Copper vein', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 25, row: 0, frames: 1 } },
+  { id: 'resource:iron_vein', name: 'Iron vein', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 26, row: 0, frames: 1 } },
+  { id: 'resource:pine_tree', name: 'Spruce pine', width: 64, height: 64, renderScale: 1, pixels: [] as string[] },
+  { id: 'resource:birch_tree', name: 'White birch', width: 64, height: 64, renderScale: 1, pixels: [] as string[] },
   { id: 'block:steel_crate', name: 'Steel crate block', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 14, row: 0, frames: 1 } },
   ...Object.entries({ workbench: 14, firepit: 15, furnace: 16, wood_floor: 19, stone_floor: 20, wall: 21, door: 22, fence: 23, torch: 24, anvil: 27 })
     .map(([id, col]) => ({ id: `block:${id}`, name: BUILDABLES[id as keyof typeof BUILDABLES].name, width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col, row: 0, frames: 1 } })),
   { id: 'block:bed', name: 'Bed', width: 16, height: 32, pixels: [] as string[] },
   { id: 'block:chest', name: 'Storage chest', width: 16, height: 16, pixels: [] as string[] },
+  ...[
+    ['wrecked_car', 'Wrecked car', 24, 24],
+    ['road_barrier', 'Road barrier', 24, 24],
+    ['sandbag_wall', 'Sandbag wall', 24, 24],
+    ['dead_tree', 'Dead tree', 24, 36],
+  ].map(([id, name, width, height]) => ({
+    id: `block:${id}`, name: String(name), width: Number(width), height: Number(height),
+    renderScale: 4 / 3, pixels: [] as string[],
+  })),
+  ...[
+    ['stone_wall', 'Stone wall', 0.55],
+    ['young_pine', 'Young pine', 0.78],
+    ['dense_shrub', 'Dense shrub', 0.68],
+    ['berry_bush', 'Red berry bush', 0.68],
+    ['fern_patch', 'Fern patch', 0.58],
+    ['reeds', 'Reeds and cattails', 0.64],
+    ['wildflowers', 'Wildflower patch', 0.56],
+    ['tall_grass', 'Tall dry grass', 0.64],
+    ['fallen_log', 'Fallen mossy log', 0.8],
+    ['mossy_stump', 'Mossy stump', 0.68],
+    ['bramble', 'Bramble patch', 0.64],
+    ['mushrooms', 'Mushroom cluster', 0.52],
+  ].map(([id, name, renderScale]) => ({
+    id: `block:${id}`,
+    name: String(name),
+    width: 64,
+    height: 64,
+    renderScale: Number(renderScale),
+    pixels: [] as string[],
+  })),
   { id: 'terrain:mud', name: 'Deep mud', width: 16, height: 16, pixels: [] as string[], source: { sheet: 'tiles' as const, col: 4, row: 0, frames: 1 } },
   ...[
     ['grass', 'Grass', 0], ['water', 'Water', 2], ['sand', 'Sand', 3], ['road', 'Dirt road', 4],
@@ -103,6 +144,34 @@ const defaultSounds = {
 
 const defaultWorldBlocks = {
   steel_crate: { id: 'steel_crate', name: 'Steel crate', spriteId: 'block:steel_crate', scale: 1, offsetY: 0, maxHp: 120, destructible: true, collision: { move: true, enemy: true, bullets: true, sight: false }, hitSound: 'mine_heavy', breakSound: 'rock_break', drops: [{ itemId: 'scrap', min: 2, max: 5, chance: 1, when: 'depleted' }] },
+  wrecked_car: { id: 'wrecked_car', name: 'Wrecked car', spriteId: 'block:wrecked_car', scale: 1, offsetY: 0, maxHp: 260, destructible: true, collision: { move: true, enemy: true, bullets: true, sight: false }, hitSound: 'mine_heavy', breakSound: 'rock_break', drops: [{ itemId: 'scrap', min: 3, max: 7, chance: 1, when: 'depleted' }] },
+  road_barrier: { id: 'road_barrier', name: 'Road barrier', spriteId: 'block:road_barrier', scale: 1, offsetY: 0, maxHp: 80, destructible: true, collision: { move: true, enemy: true, bullets: false, sight: false }, hitSound: 'wood_heavy', breakSound: 'tree_crack', drops: [{ itemId: 'wood', min: 1, max: 2, chance: 1, when: 'depleted' }] },
+  sandbag_wall: { id: 'sandbag_wall', name: 'Sandbag wall', spriteId: 'block:sandbag_wall', scale: 1, offsetY: 0, maxHp: 220, destructible: true, collision: { move: true, enemy: true, bullets: true, sight: false }, hitSound: 'mine_heavy', breakSound: 'rock_break', drops: [] },
+  dead_tree: { id: 'dead_tree', name: 'Dead tree', spriteId: 'block:dead_tree', scale: 1, offsetY: 0, maxHp: 90, destructible: true, collision: { move: true, enemy: true, bullets: true, sight: false }, hitSound: 'chop', breakSound: 'tree_fall', drops: [{ itemId: 'wood', min: 2, max: 4, chance: 1, when: 'depleted' }] },
+  stone_wall: { id: 'stone_wall', name: 'Stone wall', spriteId: 'block:stone_wall', scale: 1, offsetY: 0, maxHp: 320, destructible: true, collision: { move: true, enemy: true, bullets: true, sight: true }, hitSound: 'mine_heavy', breakSound: 'rock_break', drops: [{ itemId: 'stone', min: 2, max: 5, chance: 1, when: 'depleted' }] },
+  ...Object.fromEntries([
+    ['young_pine', 'Young pine'],
+    ['dense_shrub', 'Dense shrub'],
+    ['berry_bush', 'Red berry bush'],
+    ['fern_patch', 'Fern patch'],
+    ['reeds', 'Reeds and cattails'],
+    ['wildflowers', 'Wildflower patch'],
+    ['tall_grass', 'Tall dry grass'],
+    ['fallen_log', 'Fallen mossy log'],
+    ['mossy_stump', 'Mossy stump'],
+    ['bramble', 'Bramble patch'],
+    ['mushrooms', 'Mushroom cluster'],
+  ].map(([id, name]) => [id, {
+    id,
+    name,
+    spriteId: `block:${id}`,
+    scale: 1,
+    offsetY: 0,
+    maxHp: 1,
+    destructible: false,
+    collision: { move: false, enemy: false, bullets: false, sight: false },
+    drops: [],
+  }])),
   ...Object.fromEntries(Object.entries(BUILDABLES).map(([buildType, buildable]) => {
     const kit = Object.values(ITEMS).find((item) => item.place === buildType)!;
     const tile = buildable.tile;
@@ -385,6 +454,7 @@ export function sanitizeGameContent(kind: EngineContentKind, input: unknown): un
       const sourceRef = record(asset.source);
       return {
         id: text(asset.id, `sprite_${index}`, 80), name: text(asset.name, `Sprite ${index + 1}`), width, height,
+        renderScale: finite(asset.renderScale, 2, 0.25, 4),
         pixels: legacy.length === size ? legacy : frames[0]?.length === size ? frames[0] : [],
         frames: (frames.length ? frames : legacy.length === size ? [legacy] : []).map((frame) => frame.length === size ? frame : new Array(size).fill('#00000000')),
         ...(sourceRef.sheet && ['tiles', 'chars', 'items'].includes(String(sourceRef.sheet)) ? { source: { sheet: sourceRef.sheet, col: finite(sourceRef.col, 0, 0, 4096) | 0, row: finite(sourceRef.row, 0, 0, 4096) | 0, frames: finite(sourceRef.frames, 1, 1, 64) | 0 } } : {}),

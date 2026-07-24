@@ -7,7 +7,21 @@ export const ITEM_INDEX: Record<string, number> = Object.fromEntries(
   ITEM_SHEET_ORDER.map((id, i) => [id, i]),
 );
 
-export const CHAR_ROWS = { survivorCount: 8, zombie: 8, military: 9, trader: 10, deer: 11, rabbit: 12, boar: 13, wolf: 14, fox: 15, bear: 16 };
+export const CHAR_ROWS = {
+  survivorCount: 8,
+  zombie: 8,
+  military: 9,
+  trader: 10,
+  deer: 11,
+  rabbit: 12,
+  boar: 13,
+  wolf: 14,
+  fox: 15,
+  bear: 16,
+  moose: 17,
+  raccoon: 18,
+  cougar: 19,
+};
 
 export interface Sheets {
   tiles: HTMLImageElement;

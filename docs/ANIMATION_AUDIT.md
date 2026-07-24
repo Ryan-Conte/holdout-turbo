@@ -33,20 +33,25 @@ Reviewed 22 July 2026 against the target of a responsive, polished browser `.io`
 - Tree falls use a weightier cubic acceleration. LOS fog uses a feathered union mask instead of exposed tile seams.
 - Game panels and the death overlay have short entry transitions, buttons get consistent press feedback, and the new motion respects `prefers-reduced-motion`.
 
-## What still depends on authored art
+## Production art follow-up — 24 July 2026
 
-The renderer now makes the compatibility sheet feel substantially better, but procedural polish cannot replace distinct authored actions. The next art pass should prioritize:
+The database-authored production library now closes the highest-impact art gaps:
 
-1. Player and humanoid clips with 6-8 locomotion frames plus weapon-specific attack/reload poses.
-2. Unique hit reactions from front/back and a grounded multi-frame death for each silhouette.
-3. Quadruped-specific idle, turn, run, attack and death clips; they currently share the generic state timing contract.
-4. Directional or rotational variants for characters that should read differently when moving north/south.
-5. Animation keyframe events for exact footstep, impact, shell and reload sound timing.
+- Player, trader, infected, military, brute and all nine wildlife silhouettes have 19 state frames: two idle, four active locomotion poses plus two alternates, three generic weapon attacks, two hit, three death and three authored punch/lunge poses.
+- Locomotion now comes from two generated, identity-preserving contact atlases with a scale-normalized neutral passing pose. Feet and paws remain planted at the world anchor instead of sliding a static sprite sideways.
+- Light, standard and heavy bodies use different contact/passing cadences. Wildlife emits quadruped stride events, heavy animals plant more slowly, and runtime bob is synchronized closely to the contact cycle.
+- Attack and hit frames articulate around a fixed ground anchor. Death uses one controlled accelerated rotation, a short settle, and a stable final corpse frame instead of combining sprite squash with a second rotation.
+- Bare-fist combat has its own `punch` state. The survivor now loads a planted stance, rotates shoulder and hip through a full-extension cross, retracts into guard and settles on the same 450 ms cadence used for authoritative fist attacks. The former detached skin-color rectangle has been removed.
+- Tree depletion preserves the exact oak, ironwood, pine or birch sprite. It now has root recoil, a 0.84 s accelerating fall, impact debris and bounce, delayed impact audio, a grounded hold, and a short final fade.
+- Moose, raccoon and cougar extend the fauna set with their own fallback rows, production frames, behavior, drops, sounds and map placements.
+- Published humanoids render from 80 by 64 px masters and wide-running wildlife from 96 by 64 px normalized masters; tree resources remain 64 px. The added width is transparent action room, while per-asset `renderScale` and shared height keep their gameplay footprint consistent.
+- Keyframe events now cover footsteps/strides, hit recovery, death contact and the brute roar/slam. Weapon-specific reload events remain blocked on additional authoritative snapshot state.
 
 ## Recommended follow-up engineering
 
 - Add a proper animation graph with cross-fades and per-clip playback rates derived from world speed.
 - Add reload and interaction timestamps to snapshots so those states can be authored like attack/hit/death.
+- Add directional north/south actor variants once the animation graph supports facing-specific clip selection.
 - Pool high-volume particles and atlas published DB frames before raising effect counts.
 - Profile low-end integrated GPUs with 100 visible actors; reduce ambient terrain effects dynamically if frame time exceeds budget.
 - Add optional camera look-ahead and a user-facing screen-shake strength setting after cursor-to-world transforms share the camera offset.

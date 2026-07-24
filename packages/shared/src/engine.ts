@@ -58,6 +58,8 @@ export interface PixelAsset {
   name: string;
   width: number;
   height: number;
+  /** World-space multiplier for authored high-resolution pixel frames. Legacy 16 px art defaults to 2. */
+  renderScale?: number;
   pixels: string[];
   frames?: string[][];
   source?: { sheet: 'tiles' | 'chars' | 'items'; col: number; row: number; frames?: number };
@@ -68,7 +70,7 @@ export interface SpriteDocument {
   assets: PixelAsset[];
 }
 
-export const ENTITY_ANIMATION_STATES = ['idle', 'walk', 'attack', 'hit', 'death'] as const;
+export const ENTITY_ANIMATION_STATES = ['idle', 'walk', 'attack', 'punch', 'hit', 'death'] as const;
 export type EntityAnimationState = (typeof ENTITY_ANIMATION_STATES)[number];
 
 export interface AnimationClipDef {
@@ -198,7 +200,7 @@ export interface SoundDocument {
 }
 
 export interface RuntimeVisualContent {
-  assets: Record<string, Pick<PixelAsset, 'width' | 'height' | 'pixels' | 'frames'>>;
+  assets: Record<string, Pick<PixelAsset, 'width' | 'height' | 'renderScale' | 'pixels' | 'frames'>>;
   animations: AnimationDocument;
   resources: Record<string, ResourceNodeDef>;
   sounds: SoundDocument;
@@ -312,4 +314,17 @@ export const DEFAULT_LOOT_TABLES: LootTableRegistry = {
   wolf: table('wolf', 'Wolf drops', 2, 3, [{ id: 'raw_meat', weight: 58, min: 1, max: 3 }, { id: 'animal_hide', weight: 42, min: 1, max: 3 }]),
   fox: table('fox', 'Fox drops', 1, 2, [{ id: 'raw_meat', weight: 38, min: 1, max: 1 }, { id: 'animal_hide', weight: 62, min: 1, max: 2 }]),
   bear: table('bear', 'Bear drops', 3, 4, [{ id: 'raw_meat', weight: 65, min: 3, max: 6 }, { id: 'animal_hide', weight: 35, min: 2, max: 4 }]),
+  moose: table('moose', 'Moose drops', 3, 4, [
+    { id: 'raw_meat', weight: 58, min: 4, max: 7 },
+    { id: 'animal_hide', weight: 30, min: 2, max: 4 },
+    { id: 'antler', weight: 12, min: 1, max: 2 },
+  ]),
+  raccoon: table('raccoon', 'Raccoon drops', 1, 2, [
+    { id: 'raw_meat', weight: 35, min: 1, max: 1 },
+    { id: 'animal_hide', weight: 65, min: 1, max: 2 },
+  ]),
+  cougar: table('cougar', 'Cougar drops', 2, 3, [
+    { id: 'raw_meat', weight: 45, min: 2, max: 4 },
+    { id: 'animal_hide', weight: 55, min: 2, max: 3 },
+  ]),
 };

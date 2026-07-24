@@ -370,8 +370,46 @@ export function generateShowcaseMap({ terrainDefs, blockDefs, resourceDefs, mobD
     ...militaryBases.flatMap((base) => base.buildings),
   ];
 
+  for (const [x, y, id, rotation] of [
+    [1640, 300, 'road_barrier', 1], [1720, 300, 'road_barrier', 1],
+    [1660, 325, 'wrecked_car', 0], [1530, 715, 'wrecked_car', 1],
+    [340, 300, 'sandbag_wall', 0], [380, 300, 'sandbag_wall', 0],
+    [1630, 1550, 'sandbag_wall', 0], [1670, 1550, 'sandbag_wall', 0],
+    [330, 318, 'stone_wall', 0], [390, 318, 'stone_wall', 0],
+    [720, 320, 'dead_tree', 0], [1180, 1710, 'dead_tree', 1],
+  ]) if (blockDefs[id]) placeBlock(x, y, id, rotation);
+
+  const scatterFloraBlock = (id, count, bounds, allowedTerrain = new Set(['grass', 'mud'])) => {
+    if (!blockDefs[id]) throw new Error(`Missing flora block definition: ${id}`);
+    let placed = 0;
+    for (let attempt = 0; attempt < count * 120 && placed < count; attempt++) {
+      const x = randomInt(bounds[0], bounds[2]); const y = randomInt(bounds[1], bounds[3]);
+      const index = indexOf(x, y);
+      const terrainId = terrain[String(index)] ?? DEFAULT_TERRAIN_ID_BY_TILE[tiles[index]] ?? 'grass';
+      if (x < 5 || y < 5 || x >= W - 5 || y >= H - 5) continue;
+      if (reserved.has(index) || blocks[String(index)] || resources[String(index)] || elevations[index] > 1) continue;
+      if (!allowedTerrain.has(terrainId)) continue;
+      placeBlock(x, y, id, randomInt(0, 3));
+      placed++;
+    }
+    if (placed < count) throw new Error(`Could only place ${placed}/${count} ${id} flora blocks`);
+  };
+  scatterFloraBlock('young_pine', 700, [10, 10, 1989, 1989]);
+  scatterFloraBlock('dense_shrub', 900, [10, 10, 1989, 1989]);
+  scatterFloraBlock('berry_bush', 420, [20, 20, 1980, 1980]);
+  scatterFloraBlock('fern_patch', 850, [20, 20, 1980, 1980]);
+  scatterFloraBlock('reeds', 500, [900, 40, 1320, 1910], new Set(['grass', 'mud', 'sand']));
+  scatterFloraBlock('wildflowers', 700, [10, 10, 1989, 1989], new Set(['grass']));
+  scatterFloraBlock('tall_grass', 1_000, [10, 10, 1989, 1989], new Set(['grass', 'mud']));
+  scatterFloraBlock('fallen_log', 300, [20, 20, 1980, 1980]);
+  scatterFloraBlock('mossy_stump', 300, [20, 20, 1980, 1980]);
+  scatterFloraBlock('bramble', 500, [20, 20, 1980, 1980]);
+  scatterFloraBlock('mushrooms', 450, [20, 20, 1980, 1980]);
+
   const scatterResource = (id, count, bounds) => {
-    const allowedTerrain = id === 'tree' || id === 'ironwood' ? new Set(['grass', 'mud']) : new Set(['grass', 'mud', 'rock']);
+    const allowedTerrain = resourceDefs[id]?.tile === Tile.Tree
+      ? new Set(['grass', 'mud'])
+      : new Set(['grass', 'mud', 'rock']);
     let placed = 0;
     for (let attempt = 0; attempt < count * 100 && placed < count; attempt++) {
       const x = randomInt(bounds[0], bounds[2]); const y = randomInt(bounds[1], bounds[3]);
@@ -383,8 +421,10 @@ export function generateShowcaseMap({ terrainDefs, blockDefs, resourceDefs, mobD
     }
     if (placed < count) throw new Error(`Could only place ${placed}/${count} ${id} resources`);
   };
-  scatterResource('tree', 24_000, [6, 6, 1993, 1993]);
-  scatterResource('ironwood', 2_500, [420, 40, 900, 620]);
+  scatterResource('tree', 15_000, [6, 6, 1993, 1993]);
+  scatterResource('pine_tree', 7_000, [20, 20, 1980, 1980]);
+  scatterResource('birch_tree', 3_000, [20, 20, 1980, 1980]);
+  scatterResource('ironwood', 1_500, [420, 40, 900, 620]);
   scatterResource('rock', 4_500, [40, 1200, 820, 1950]);
   scatterResource('copper_vein', 900, [175, 1340, 610, 1780]);
   scatterResource('iron_vein', 800, [190, 1340, 650, 1810]);
@@ -486,6 +526,11 @@ export function generateShowcaseMap({ terrainDefs, blockDefs, resourceDefs, mobD
   scatterObjects('boar', 35, [120, 1260, 820, 1900]);
   scatterObjects('wolf', 45, [1120, 500, 1940, 1360]);
   scatterObjects('wolf', 20, [80, 80, 520, 450]);
+  scatterObjects('fox', 30, [300, 80, 980, 760]);
+  scatterObjects('bear', 12, [80, 80, 540, 470]);
+  scatterObjects('moose', 18, [380, 60, 980, 700]);
+  scatterObjects('raccoon', 35, [850, 120, 1320, 760]);
+  scatterObjects('cougar', 12, [1250, 540, 1900, 1280]);
 
   const coveredMobs = new Set(objects.flatMap((object) => object.type === 'mob' ? [object.contentId] : Object.hasOwn(mobDefs, object.type) ? [object.type] : []));
   for (const id of Object.keys(mobDefs)) if (!coveredMobs.has(id)) scatterObjects('mob', 1, [1350, 1100, 1450, 1200], { contentId: id, respawnMs: 120_000 });

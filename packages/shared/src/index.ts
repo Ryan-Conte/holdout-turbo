@@ -115,11 +115,47 @@ export const DEFAULT_RESOURCE_NODES: Record<string, import('./engine').ResourceN
       { itemId: 'iron_ore', min: 1, max: 2, chance: 0.35, when: 'depleted' },
     ],
   },
+  pine_tree: {
+    id: 'pine_tree', name: 'Spruce pine', tile: Tile.Tree, depletedTile: Tile.Stump,
+    maxHits: 8, respawnMs: 300_000, skill: 'woodcutting', respawnFamily: 'tree', respawnWeight: 32,
+    spriteId: 'resource:pine_tree', hitSound: 'chop', breakSound: 'tree_fall',
+    drops: [
+      { itemId: 'wood', min: 2, max: 4, chance: 1, when: 'hit' },
+      { itemId: 'wood', min: 2, max: 3, chance: 0.5, when: 'depleted' },
+    ],
+  },
+  birch_tree: {
+    id: 'birch_tree', name: 'White birch', tile: Tile.Tree, depletedTile: Tile.Stump,
+    maxHits: 5, respawnMs: 210_000, skill: 'woodcutting', respawnFamily: 'tree', respawnWeight: 18,
+    spriteId: 'resource:birch_tree', hitSound: 'chop', breakSound: 'tree_fall',
+    drops: [
+      { itemId: 'wood', min: 2, max: 3, chance: 1, when: 'hit' },
+      { itemId: 'wood', min: 1, max: 2, chance: 0.7, when: 'depleted' },
+    ],
+  },
   rock: {
     id: 'rock', name: 'Stone outcrop', tile: Tile.Rock, depletedTile: Tile.Rubble,
     maxHits: 8, respawnMs: NODE_RESPAWN_MS, skill: 'mining', respawnFamily: 'rock', respawnWeight: 1,
     spriteId: 'resource:rock', hitSound: 'mine', breakSound: 'rock_break',
     drops: [{ itemId: 'stone', min: 2, max: 3, chance: 1, when: 'hit' }],
+  },
+  copper_vein: {
+    id: 'copper_vein', name: 'Copper vein', tile: Tile.CopperOre, depletedTile: Tile.Rubble,
+    maxHits: 5, respawnMs: 300_000, skill: 'mining', respawnFamily: 'rock', respawnWeight: 0,
+    spriteId: 'resource:copper_vein', hitSound: 'mine', breakSound: 'rock_break',
+    drops: [
+      { itemId: 'stone', min: 2, max: 3, chance: 1, when: 'hit' },
+      { itemId: 'copper_ore', min: 1, max: 1, chance: 1, when: 'hit' },
+    ],
+  },
+  iron_vein: {
+    id: 'iron_vein', name: 'Iron vein', tile: Tile.IronOre, depletedTile: Tile.Rubble,
+    maxHits: 5, respawnMs: 360_000, skill: 'mining', respawnFamily: 'rock', respawnWeight: 0,
+    spriteId: 'resource:iron_vein', hitSound: 'mine_heavy', breakSound: 'rock_break',
+    drops: [
+      { itemId: 'stone', min: 2, max: 3, chance: 1, when: 'hit' },
+      { itemId: 'iron_ore', min: 1, max: 1, chance: 1, when: 'hit' },
+    ],
   },
 };
 
@@ -415,7 +451,10 @@ export function armorMultiplier(eq: Equipment, items: import('./items').RuntimeI
 
 // ─── Enemies ────────────────────────────────────────────────────────────────
 
-export type KnownEnemyKind = 'zombie' | 'military' | 'deer' | 'rabbit' | 'boar' | 'wolf' | 'fox' | 'bear';
+export type KnownEnemyKind =
+  | 'zombie' | 'military'
+  | 'deer' | 'rabbit' | 'boar' | 'wolf' | 'fox' | 'bear'
+  | 'moose' | 'raccoon' | 'cougar';
 export type EnemyKind = KnownEnemyKind | (string & {});
 
 /** flee = runs from players (huntable) · melee = chases and bites · ranged = keeps distance and shoots */
@@ -443,6 +482,10 @@ export const ENEMY_DEFS: Record<KnownEnemyKind, EnemyDef> = {
   fox: { behavior: 'flee', maxHp: 20, speed: 190, aggroRange: 230, attackRange: 0, damage: 0, attackMs: 0, name: 'red fox' },
   // bears ignore distant survivors, but become a serious close-range threat.
   bear: { behavior: 'melee', maxHp: 180, speed: 135, aggroRange: 75, attackRange: 34, damage: 24, attackMs: 1050, name: 'black bear' },
+  // Moose are imposing neutral game: they hold their ground until crowded or wounded.
+  moose: { behavior: 'melee', maxHp: 150, speed: 145, aggroRange: 55, attackRange: 36, damage: 22, attackMs: 1100, name: 'bull moose' },
+  raccoon: { behavior: 'flee', maxHp: 16, speed: 185, aggroRange: 190, attackRange: 0, damage: 0, attackMs: 0, name: 'raccoon' },
+  cougar: { behavior: 'melee', maxHp: 65, speed: 205, aggroRange: 285, attackRange: 30, damage: 18, attackMs: 760, name: 'cougar' },
 };
 
 export interface EnemySnap {
@@ -841,7 +884,7 @@ export interface StationOpen {
 
 export type MapObjectType =
   | 'chest' | 'chest_military' | 'loot' | 'zombie' | 'military'
-  | 'deer' | 'rabbit' | 'boar' | 'wolf' | 'fox' | 'bear'
+  | 'deer' | 'rabbit' | 'boar' | 'wolf' | 'fox' | 'bear' | 'moose' | 'raccoon' | 'cougar'
   | 'chest_custom' | 'mob'
   | 'spawn' | 'trader' | 'trader_black' | 'extract'
   | 'poi_town' | 'poi_airport' | 'poi_outpost' | 'poi_hotzone' | 'poi_zone';

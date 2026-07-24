@@ -17,7 +17,8 @@ import { prisma } from '@/lib/db';
 
 const VALID_OBJECTS = new Set([
   'chest', 'chest_military', 'chest_custom', 'loot', 'zombie', 'military', 'mob',
-  'deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear', 'spawn', 'trader', 'trader_black',
+  'deer', 'rabbit', 'boar', 'wolf', 'fox', 'bear', 'moose', 'raccoon', 'cougar',
+  'spawn', 'trader', 'trader_black',
   'extract', 'poi_town', 'poi_airport', 'poi_outpost', 'poi_hotzone', 'poi_zone',
 ]);
 const ZONE_KINDS = new Set(['town', 'airport', 'outpost', 'wilds', 'hotzone']);

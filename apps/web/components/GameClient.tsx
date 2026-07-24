@@ -824,9 +824,9 @@ export default function GameClient() {
         }
         if (you && now - lastGruntAt.current > 4500) {
           for (const e of s.enemies) {
-            if (e.kind !== 'boar' && e.kind !== 'bear') continue;
+            if (e.kind !== 'boar' && e.kind !== 'bear' && e.kind !== 'moose' && e.kind !== 'cougar') continue;
             const d = Math.hypot(e.x - you.x, e.y - you.y);
-            const range = e.kind === 'bear' ? 340 : 220;
+            const range = e.kind === 'bear' || e.kind === 'cougar' ? 340 : e.kind === 'moose' ? 280 : 220;
             if (d < range && Math.random() < 0.4) {
               sfx.grunt(Math.max(0.2, 1 - d / (range + 40)));
               lastGruntAt.current = now;
@@ -931,8 +931,15 @@ export default function GameClient() {
         const you = snapRef.current?.players.find((p) => p.id === youRef.current);
         const d = you ? Math.hypot(h.x - you.x, h.y - you.y) : 9999;
         if (d < 350) {
-          if (h.kind === 'node') h.soundId ? sfx.play(h.soundId, Math.max(0.2, 1 - d / 380)) : sfx.chop(Math.max(0.2, 1 - d / 380));
-          else sfx.hit(Math.max(0.2, 1 - d / 380));
+          const volume = Math.max(0.2, 1 - d / 380);
+          if (h.kind === 'node' && h.material === 'wood' && h.soundId === 'tree_fall') {
+            sfx.chop(volume * 0.58);
+            window.setTimeout(() => sfx.play('tree_fall', volume), 1_030);
+          } else if (h.kind === 'node') {
+            h.soundId ? sfx.play(h.soundId, volume) : sfx.chop(volume);
+          } else {
+            sfx.hit(volume);
+          }
         }
       });
       socket.on(EV.tile, (u: TileUpdate) => rendererRef.current?.applyTile(u.i, u.tile, u.under, u.resourceId));
@@ -1975,11 +1982,15 @@ export default function GameClient() {
       {/* HUD */}
       {inv && (
         <div className="hud">
-          <div className="bar">
+          <div className="hud-head">
+            <span>SURVIVOR STATUS</span>
+            <b>{inHideout ? 'HOLDOUT' : inSafe ? 'SAFE SECTOR' : location?.toUpperCase() ?? 'GREYVALE'}</b>
+          </div>
+          <div className="bar health">
             <div className="fill" style={{ width: `${inv.hp}%`, background: inv.hp > 50 ? 'var(--green)' : inv.hp > 25 ? 'var(--gold)' : 'var(--red)' }} />
             <div className="label">HP {inv.hp}/100</div>
           </div>
-          <div className="bar">
+          <div className="bar carry">
             <div className="fill" style={{ width: `${Math.min(100, (weight / cap.maxKg) * 100)}%`, background: weight > cap.maxKg ? 'var(--red)' : 'var(--blue)' }} />
             <div className="label">
               {weight > cap.maxKg ? '⚠ OVERWEIGHT' : `${weight.toFixed(1)} / ${cap.maxKg} KG`}
@@ -1987,11 +1998,11 @@ export default function GameClient() {
             {/* <div className="label">{weight.toFixed(1)} / {cap.maxKg} KG{weight > cap.maxKg ? ' — ⚠ OVERWEIGHT' : ''}</div> */}
           </div>
           <div className="survival-row">
-            <div className="bar mini" title="Hunger — hunt deer, fish, cook at a firepit">
+            <div className="bar mini food" title="Hunger — hunt deer, fish, cook at a firepit">
               <div className="fill" style={{ width: `${inv.hunger}%`, background: '#c08a3a' }} />
               <div className="label">FOOD {inv.hunger}</div>
             </div>
-            <div className="bar mini" title="Thirst — drink at water (E) or carry a canteen">
+            <div className="bar mini water" title="Thirst — drink at water (E) or carry a canteen">
               <div className="fill" style={{ width: `${inv.thirst}%`, background: '#4a90c8' }} />
               <div className="label">H2O {inv.thirst}</div>
             </div>
