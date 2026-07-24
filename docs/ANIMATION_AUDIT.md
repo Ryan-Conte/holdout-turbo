@@ -47,6 +47,26 @@ The database-authored production library now closes the highest-impact art gaps:
 - Published humanoids render from 80 by 64 px masters and wide-running wildlife from 96 by 64 px normalized masters; tree resources remain 64 px. The added width is transparent action room, while per-asset `renderScale` and shared height keep their gameplay footprint consistent.
 - Keyframe events now cover footsteps/strides, hit recovery, death contact and the brute roar/slam. Weapon-specific reload events remain blocked on additional authoritative snapshot state.
 
+## Smoothness and pipeline pass — 24 July 2026 (second pass)
+
+- Clip evaluation moved into `apps/web/game/animation.ts`, shared verbatim by the renderer and the new `/dev/animations` QA harness (`npm run art:preview`), so playback iterated in the harness is what ships.
+- Walk playback is stride-driven: a per-entity accumulator advances with actual ground speed (bounded 0.55–1.9× of the authored cadence around 160 px/s), and the procedural bob/sway phase is derived from the same stride cycle, eliminating foot-cadence drift at any velocity.
+- State exits crossfade for ~100 ms (walk/idle/recovery transitions only); hit, death, attack and punch entries still snap. The fallback `chars.png` path crossfades the same way.
+- Clips can opt into `blendMs` keyframe blending (idle 90, attack 50, punch 45, hit 40, death 80); keyframes tagged `impact` never blend in, so strikes stay hard.
+- Fixed: `punch` state elapsed fell through to wall-clock time in both `drawPlayer` and `drawEnemy`, freezing bare-fist attacks on their final frame. Attacks and punches now share the timestamped elapsed path.
+- Attacks displace the body along the facing angle (pull back through windup, ~4 px committed lunge at impact, eased settle) for players and enemies.
+- Locomotion gained generated push-off in-betweens (frames 19/20) for an eight-step cycle, idle gained a half-inhale (frame 21) for a four-step breathing triangle, and quadrupeds now breathe (1 px chest lift).
+- `shiftUpper` backfills the rows it vacates, removing the horizontal slit wide bodies (bear, brute) showed in lifted poses; generated cells are also cleaned of chroma-key fringe and isolated speckles.
+- Performance: published frames rasterize through bulk `ImageData` writes instead of ~2M per-pixel `fillRect` calls (world init and `s:visuals` pushes no longer stall), and the per-viewer snapshot filter memoizes LOS per target tile with squared-distance early-outs in the 20 Hz broadcast loop.
+- Verified in a real guest raid: walk mirroring, punch windup/impact/retract against rocks and trees, spear craft-equip-thrust attachment, death overlay and redeploy.
+
+## Alignment, HUD-perf and panel-chrome pass — 24 July 2026 (third pass)
+
+- The metronomic in-game stutter was the NET/clock HUD readouts: each ~1 s state change re-rendered the whole GameClient tree (~66 ms dev-mode long task, confirmed via PerformanceObserver + mutation correlation). Both chips now own their state outside the tree and receive updates through registered setters; a 900-frame capture afterwards recorded zero long tasks.
+- Actor frames register by planted-feet centroid instead of silhouette bounding box, so slung gear or an extended fist no longer shifts the body off the entity anchor between poses (republished as sprite rev 67 / animation rev 11).
+- Player and enemy shadows sit at the sprite's actual feet (frame bottom minus baseline padding) rather than a fixed offset the taller production art overran; armor overlay placeholders scale with the rendered sprite.
+- Center panels (crafting, inventory, trade, social) moved from the old flat steel chrome to the same dithered olive field-gear material as the HUD: brass headers, raised/pressed/disabled button bevels, recessed tabs with a brass active strip, sunken recipe sockets, framed requirement rows with met/short status edges, and a recessed red-tinted blocked-craft state distinct from ordinary disabled buttons.
+
 ## Recommended follow-up engineering
 
 - Add a proper animation graph with cross-fades and per-clip playback rates derived from world speed.

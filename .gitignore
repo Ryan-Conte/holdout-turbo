@@ -6,3 +6,4 @@ dist/
 .env.local
 *.tsbuildinfo
 .codex-dev*.log
+apps/web/public/dev-art-preview.json

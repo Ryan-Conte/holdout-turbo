@@ -83,6 +83,10 @@ Published humanoid assets use an 80 by 64 px transparent canvas; wide-running fa
 | 11-12 | hit recoil and settle |
 | 13-15 | stagger, fall and grounded death |
 | 16-18 | punch/lunge wind-up, peak impact and retraction |
+| 19-20 | left/right push-off locomotion in-betweens |
+| 21 | half-inhale breathing in-between |
+
+Locomotion plays as an eight-step cycle (contact → push-off → passing → reach per side) and idle breathes through a four-step triangle. Clips may set `blendMs` for short client-side alpha blends across keyframe boundaries; entries whose keyframe event is `impact` always snap. The client runtime (`apps/web/game/animation.ts`) additionally scales walk playback with actual ground speed and crossfades state exits, so the same clips read smoothly at any velocity.
 
 `/admin/animations` owns the timing and keyframe events. `punch` is a dedicated state rather than a hand-shaped overlay on the generic weapon attack. Its authored wind-up, impact, retraction and neutral recovery total 450 ms for the survivor, matching the authoritative fist cooldown. The current profiles use distinct heavy/light cadences, contact events, attack windups, hit recovery and persistent final death poses. The infected brute retains synchronized roar/slam cues.
 
@@ -97,6 +101,14 @@ Adding an item requires an `ITEMS` definition, an `ITEM_SPRITE_ORDER` entry, a c
 The production block catalog includes pine saplings, dense shrubs, berry bushes, fern beds, reeds, wildflowers, tall grass, fallen logs, mossy stumps, brambles and mushroom clusters. These are decorative, non-colliding block definitions so they can be densely dressed without changing movement authority.
 
 Pine and birch are full resource definitions with health, wood drops, respawn timing and weighted regrowth. Greyvale and the showcase generator both place every new flora category and tree family.
+
+## Animation QA harness
+
+```bash
+npm run art:preview
+```
+
+Writes `apps/web/public/dev-art-preview.json` (gitignored) — the exact document `art:publish` would store — and `/dev/animations` plays it through the same runtime the game uses (`sampleClip`, `EntityAnimator`, `computeMotionPose`). The page has a live grid across all states, a raw frame strip, a deterministic per-clip timeline with a baseline ruler, and static catalogs for items, blocks, resources and terrain. Iterate art or clip timing there before publishing.
 
 ## Browser pixel studio
 

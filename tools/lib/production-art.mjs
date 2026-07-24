@@ -208,7 +208,7 @@ function fitTransparentCell(sheet, index, {
       target[(offsetY + y) * width + offsetX + x] = resized[y * drawWidth + x];
     }
   }
-  return target;
+  return cleanFrame(target, width, height);
 }
 
 function fitPoseCells(inputs, {
@@ -249,17 +249,65 @@ function fitPoseCells(inputs, {
     const drawHeight = Math.max(1, Math.floor(crop.height * scale));
     const resized = resizeNearest(crop.pixels, crop.width, crop.height, drawWidth, drawHeight);
     const target = new Array(width * height).fill(EMPTY);
-    const offsetX = Math.floor((width - drawWidth) / 2);
+    // Register poses by their planted feet, not the silhouette bounding box:
+    // an extended fist or slung rifle widens the bbox and would shift the
+    // whole body off the entity anchor, making frames jitter side to side.
+    const footRows = Math.max(2, Math.round(drawHeight * 0.18));
+    let footWeight = 0;
+    let footSumX = 0;
+    for (let y = drawHeight - footRows; y < drawHeight; y++) {
+      for (let x = 0; x < drawWidth; x++) {
+        if (!visible(resized[y * drawWidth + x])) continue;
+        footWeight++;
+        footSumX += x + 0.5;
+      }
+    }
+    const anchorX = footWeight ? footSumX / footWeight : drawWidth / 2;
+    const offsetX = Math.max(0, Math.min(width - drawWidth, Math.round(width / 2 - anchorX)));
     const offsetY = height - paddingBottom - drawHeight;
     for (let y = 0; y < drawHeight; y++) {
       for (let x = 0; x < drawWidth; x++) target[(offsetY + y) * width + offsetX + x] = resized[y * drawWidth + x];
     }
-    return target;
+    return cleanFrame(target, width, height);
   });
 }
 
 function fractionalCuts(length, fractions) {
   return fractions.map((fraction) => Math.round(length * fraction));
+}
+
+/**
+ * Chroma-key hygiene for generated cells: semi-transparent fringe pixels
+ * either solidify or drop (so hard-pixel rendering never halos), and fully
+ * isolated speckles left over from background keying are removed.
+ */
+function cleanFrame(frame, width, height) {
+  const out = frame.slice();
+  for (let index = 0; index < out.length; index++) {
+    const [red, green, blue, alpha] = parseRgba(out[index]);
+    if (alpha <= 8) { out[index] = EMPTY; continue; }
+    if (alpha < 120) { out[index] = EMPTY; continue; }
+    if (alpha < 255) out[index] = rgbaHex(red, green, blue, 255);
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!visible(out[y * width + x])) continue;
+      let neighbours = 0;
+      for (let dy = -1; dy <= 1 && !neighbours; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy) continue;
+          const px = x + dx;
+          const py = y + dy;
+          if (px >= 0 && py >= 0 && px < width && py < height && visible(out[py * width + px])) {
+            neighbours++;
+            break;
+          }
+        }
+      }
+      if (!neighbours) out[y * width + x] = EMPTY;
+    }
+  }
+  return out;
 }
 
 function gridTexture(sheet, index, width = 64, height = 64) {
@@ -360,6 +408,19 @@ function shiftUpper(frame, width, height, dx, dy, cutoff = 0.68) {
       if (nx >= 0 && ny >= 0 && nx < width && ny < height) next[ny * width + nx] = frame[y * width + x];
     }
   }
+  // A vertical shift vacates rows at the cutoff seam; keep the original
+  // pixels there so wide bodies compress instead of showing a slit.
+  if (dy) {
+    const gapStart = dy < 0 ? cutoffY + dy : cutoffY;
+    const gapEnd = dy < 0 ? cutoffY : cutoffY + dy;
+    for (let y = Math.max(0, gapStart); y < Math.min(height, gapEnd); y++) {
+      for (let x = 0; x < width; x++) {
+        if (!visible(next[y * width + x]) && visible(frame[y * width + x])) {
+          next[y * width + x] = frame[y * width + x];
+        }
+      }
+    }
+  }
   return next;
 }
 
@@ -400,7 +461,9 @@ function animatedFrames(baseFrames, width, height, kind) {
   const punchImpact = baseFrames[4] ?? contactLeft;
   const punchRecovery = baseFrames[5] ?? punchWindup;
   const motion = Math.max(1, Math.round(width / 24));
-  const idleLift = quadruped ? 0 : -Math.max(1, Math.round(motion / 2));
+  // Quadrupeds breathe too: a one-pixel chest lift keeps their idle alive
+  // without disturbing the planted paws.
+  const idleLift = quadruped ? -1 : -Math.max(1, Math.round(motion / 2));
   const idleShift = kind === "bear" || kind === "moose" ? Math.max(1, Math.round(motion / 2)) : 0;
   const hitTint = kind === "zombie" || kind === "brute" ? "#c9896bff" : "#a94f48ff";
 
@@ -422,6 +485,16 @@ function animatedFrames(baseFrames, width, height, kind) {
     ? contactLeft
     : shiftUpper(original, width, height, -motion, Math.max(1, motion), 0.8);
 
+  // Locomotion in-betweens: each planted contact gets a push-off pose with
+  // the torso one pixel into its lift, halving the visual jump between the
+  // contact and passing frames. Breathing gets a half-inhale the same way.
+  const pushCutoff = quadruped ? 0.62 : 0.72;
+  const pushLeft = shiftUpper(contactLeft, width, height, 0, -1, pushCutoff);
+  const pushRight = shiftUpper(contactRight, width, height, 0, -1, pushCutoff);
+  const breathHalf = idleLift <= -2
+    ? shiftUpper(original, width, height, Math.round(idleShift / 2), Math.ceil(idleLift / 2), quadruped ? 0.55 : 0.5)
+    : original;
+
   let frames = [
     original,
     shiftUpper(original, width, height, idleShift, idleLift),
@@ -442,6 +515,9 @@ function animatedFrames(baseFrames, width, height, kind) {
     punchWindup,
     punchImpact,
     punchRecovery,
+    pushLeft,
+    pushRight,
+    breathHalf,
   ];
   if (kind === "brute") frames = frames.map((frame) => bulkBrute(frame, width, height));
   return frames;
@@ -888,50 +964,68 @@ export function buildProductionSpriteDocument({
   return { palette: PRODUCTION_PIXEL_PALETTE, assets };
 }
 
-function clip(frames, frameMs, loop, keyframes) {
-  return { frames, frameMs, loop, ...(keyframes?.length ? { keyframes } : {}) };
+function clip(frames, frameMs, loop, keyframes, blendMs) {
+  return {
+    frames,
+    frameMs,
+    loop,
+    ...(keyframes?.length ? { keyframes } : {}),
+    ...(blendMs ? { blendMs } : {}),
+  };
 }
 
 export function buildProductionAnimations(mobDefs) {
   const profile = (id) => {
     const animal = ["deer", "rabbit", "boar", "wolf", "fox", "bear", "moose", "raccoon", "cougar"].includes(id);
     const heavy = id === "bear" || id === "moose" || id === "brute";
-    const contactMs = id === "rabbit" || id === "raccoon" ? 72 : heavy ? 138 : animal ? 102 : 112;
-    const passingMs = id === "rabbit" || id === "raccoon" ? 48 : heavy ? 92 : animal ? 68 : 78;
-    const walk = clip([2, 3, 4, 5], contactMs, true, [
+    const light = id === "rabbit" || id === "raccoon";
+    // Eight-step locomotion: contact → push-off → passing → reach on each
+    // side. Frames 19/20 are the generated push-off in-betweens; the runtime
+    // additionally scales playback with actual ground speed.
+    const contactMs = light ? 52 : heavy ? 96 : animal ? 76 : 86;
+    const pushMs = light ? 22 : heavy ? 40 : animal ? 30 : 34;
+    const passingMs = light ? 34 : heavy ? 60 : animal ? 48 : 56;
+    const walk = clip([2, 19, 3, 20, 4, 20, 5, 19], contactMs, true, [
       { frame: 2, durationMs: contactMs, event: animal ? "stride_a" : "foot_l" },
+      { frame: 19, durationMs: pushMs },
       { frame: 3, durationMs: passingMs },
+      { frame: 20, durationMs: pushMs },
       { frame: 4, durationMs: contactMs, event: animal ? "stride_b" : "foot_r" },
+      { frame: 20, durationMs: pushMs },
       { frame: 5, durationMs: passingMs },
+      { frame: 19, durationMs: pushMs },
     ]);
     return {
       spriteId: `character:${id}`,
       clips: {
-        idle: clip([0, 1], heavy ? 620 : 520, true, [
-          { frame: 0, durationMs: heavy ? 760 : 620 },
-          { frame: 1, durationMs: heavy ? 540 : 420 },
-        ]),
+        // Breathing triangle: neutral → half inhale → full → half exhale.
+        idle: clip([0, 21, 1, 21], heavy ? 420 : 340, true, [
+          { frame: 0, durationMs: heavy ? 700 : 560 },
+          { frame: 21, durationMs: heavy ? 260 : 210 },
+          { frame: 1, durationMs: heavy ? 500 : 400 },
+          { frame: 21, durationMs: heavy ? 260 : 210 },
+        ], 90),
         walk,
         attack: clip([8, 9, 10], heavy ? 150 : 105, false, [
           { frame: 8, durationMs: heavy ? 220 : 120, event: "windup" },
           { frame: 9, durationMs: heavy ? 190 : 90, event: "impact" },
           { frame: 10, durationMs: heavy ? 230 : 150, event: "recover" },
-        ]),
+        ], 50),
         punch: clip([16, 17, 18, 0], heavy ? 170 : animal ? 120 : 110, false, [
           { frame: 16, durationMs: heavy ? 200 : animal ? 140 : 110, event: "windup" },
           { frame: 17, durationMs: heavy ? 130 : animal ? 90 : 70, event: "impact" },
           { frame: 18, durationMs: heavy ? 180 : animal ? 120 : 105, event: "retract" },
           { frame: 0, durationMs: heavy ? 170 : animal ? 130 : 165, event: "recover" },
-        ]),
+        ], 45),
         hit: clip([11, 12], 90, false, [
           { frame: 11, durationMs: 95, event: "recoil" },
           { frame: 12, durationMs: 135, event: "settle" },
-        ]),
+        ], 40),
         death: clip([13, 14, 15], heavy ? 190 : 145, false, [
           { frame: 13, durationMs: 110, event: "stagger" },
           { frame: 14, durationMs: heavy ? 230 : 170, event: "fall" },
           { frame: 15, durationMs: 900, event: "down" },
-        ]),
+        ], 80),
       },
     };
   };

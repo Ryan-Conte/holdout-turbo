@@ -6577,7 +6577,8 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       const elevation = inst.elevations[ty * inst.w + tx] ?? 0;
       if (Math.abs(elevation - previousElevation) > 1) return false;
       const index = ty * inst.w + tx;
-      const block = this.content.block(inst.blockKinds[String(index)]);
+      const blockId = inst.blockKinds[index];
+      const block = blockId === undefined ? undefined : this.content.block(blockId);
       const openDoor = inst.openDoors.has(index);
       const tileBlocks =
         BLOCKS_BULLET[inst.tiles[index]] &&
@@ -6935,16 +6936,29 @@ export class GameService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     // per-viewer snapshots: walls (and forest) hide other players, NPCs and enemies
+    const senseRangeSq = GameService.SENSE_RANGE * GameService.SENSE_RANGE;
+    const viewRangeSq = SNAPSHOT_VIEW_RANGE * SNAPSHOT_VIEW_RANGE;
     for (const viewer of this.players.values()) {
       if (viewer.instanceId !== inst.id) continue;
+      // Entities cluster on tiles and LOS is tile-resolution anyway, so one
+      // raycast per target tile serves every entity standing on it. This is
+      // the tick's hottest loop (viewers × entities × ray steps at 20 Hz).
+      const losByTile = new Map<number, boolean>();
       const sees = (x: number, y: number) => {
         if (viewer.dead || (viewer.admin && viewer.adminMode)) return true;
-        const distance = Math.hypot(x - viewer.x, y - viewer.y);
-        return (
-          distance < GameService.SENSE_RANGE ||
-          (distance < SNAPSHOT_VIEW_RANGE &&
-            this.losClear(inst, viewer.x, viewer.y, x, y))
-        );
+        const dx = x - viewer.x;
+        const dy = y - viewer.y;
+        const distanceSq = dx * dx + dy * dy;
+        if (distanceSq < senseRangeSq) return true;
+        if (distanceSq >= viewRangeSq) return false;
+        const tileKey =
+          Math.floor(y / TILE) * inst.w + Math.floor(x / TILE);
+        let clear = losByTile.get(tileKey);
+        if (clear === undefined) {
+          clear = this.losClear(inst, viewer.x, viewer.y, x, y);
+          losByTile.set(tileKey, clear);
+        }
+        return clear;
       };
       const snap: StateSnap = {
         ...base,

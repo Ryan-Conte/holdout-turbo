@@ -24,6 +24,15 @@ import {
   Tile,
 } from "@holdout/shared";
 import { CHAR_ROWS, ITEM_INDEX, Sheets } from "./sprites";
+import {
+  ClipSample,
+  EntityAnimator,
+  attackLungePx,
+  clipTotalMs,
+  computeMotionPose,
+  pruneAnimators,
+  sampleClip,
+} from "./animation";
 import { runtimePixelVisible } from "@/lib/runtime-visuals";
 
 const SPR = 16; // art cell size; rendered at 2× (TILE = 32)
@@ -206,6 +215,9 @@ export class Renderer {
   private doorProgress = new Map<number, number>();
   private facingDirections = new Map<string, -1 | 1>();
   private motionTransitions = new Map<string, { moving: boolean; changedAt: number }>();
+  private animators = new Map<string, EntityAnimator>();
+  private frameDtMs = 16;
+  private lastAnimatorPruneAt = 0;
   private reducedMotion = false;
 
   private unders: Map<number, number>;
@@ -287,15 +299,27 @@ export class Renderer {
       // Source-only seed entries have no database pixels yet. Keep their
       // compatibility renderer available until real engine art is published.
       if (!validFrames.some((frame) => frame.some(runtimePixelVisible))) continue;
+      // Bulk ImageData writes: per-pixel fillRect on ~2M published pixels
+      // stalled world init and every s:visuals hot push for seconds.
       const canvases = validFrames.map((frame) => {
         const canvas = document.createElement('canvas');
         canvas.width = asset.width; canvas.height = asset.height;
         const ctx = canvas.getContext('2d')!;
-        frame.forEach((color, index) => {
-          if (!runtimePixelVisible(color)) return;
-          ctx.fillStyle = color;
-          ctx.fillRect(index % asset.width, Math.floor(index / asset.width), 1, 1);
-        });
+        const image = ctx.createImageData(asset.width, asset.height);
+        const data = image.data;
+        const hex = /^#([0-9a-f]{6})([0-9a-f]{2})?$/;
+        for (let index = 0; index < frame.length; index++) {
+          const color = frame[index];
+          if (!runtimePixelVisible(color)) continue;
+          const match = hex.exec(color.trim().toLowerCase());
+          if (!match) continue;
+          const rgb = Number.parseInt(match[1], 16);
+          data[index * 4] = rgb >> 16;
+          data[index * 4 + 1] = (rgb >> 8) & 0xff;
+          data[index * 4 + 2] = rgb & 0xff;
+          data[index * 4 + 3] = match[2] ? Number.parseInt(match[2], 16) : 255;
+        }
+        ctx.putImageData(image, 0, 0);
         return canvas;
       });
       if (canvases.length) this.visualFrames.set(id, canvases);
@@ -374,45 +398,51 @@ export class Renderer {
     }
   }
 
-  private animationFrame(target: string, state: EntityAnimationState, elapsedMs: number, seed: number, totalFrames: number): number {
+  /**
+   * Samples the published clip for an entity state and fires any keyframe
+   * sound cues exactly once per step. All timing math lives in animation.ts
+   * so the /dev/animations harness plays back identically.
+   */
+  private sampleEntityAnimation(target: string, state: EntityAnimationState, elapsedMs: number, seed: number, totalFrames: number): ClipSample {
     const profile = this.visuals.animations?.[target];
     const clip = profile?.clips?.[state] ?? profile?.clips?.idle;
+    const sample = sampleClip(clip, state, elapsedMs, seed, this.reducedMotion);
     if (clip?.keyframes?.length) {
-      const keyframes = clip.keyframes;
-      const totalMs = keyframes.reduce((sum, keyframe) => sum + Math.max(16, keyframe.durationMs), 0);
-      const shifted = Math.max(0, elapsedMs + (clip.loop === false || state === 'walk' ? 0 : seed * 17));
-      const phase = clip.loop === false ? Math.min(totalMs - 1, shifted) : shifted % totalMs;
-      let elapsed = 0;
-      let at = keyframes.length - 1;
-      for (let index = 0; index < keyframes.length; index++) {
-        elapsed += Math.max(16, keyframes[index].durationMs);
-        if (phase < elapsed) { at = index; break; }
-      }
-      const cycle = clip.loop === false ? 0 : Math.floor(shifted / totalMs);
       const soundKey = `${target}:${state}:${seed}`;
-      const soundStep = `${cycle}:${at}`;
+      const soundStep = `${sample.cycle}:${sample.step}`;
       const previous = this.animationSoundSteps.get(soundKey);
       if (previous !== soundStep) {
         this.animationSoundSteps.set(soundKey, soundStep);
-        const cue = keyframes[at].soundId;
-        if (cue && (previous !== undefined || elapsedMs < keyframes[at].durationMs)) this.onSound?.(cue, 0.65);
+        const keyframe = clip.keyframes[sample.step];
+        const cue = keyframe?.soundId;
+        if (cue && (previous !== undefined || elapsedMs < keyframe.durationMs)) this.onSound?.(cue, 0.65);
       }
-      return Math.max(0, Math.min(totalFrames - 1, keyframes[at].frame));
     }
-    const sequence = clip?.frames?.length ? clip.frames : state === 'walk' ? [0, 1] : [0];
-    const phaseMs = clip?.loop === false || state === 'walk' ? elapsedMs : elapsedMs + seed * 17;
-    const step = Math.max(0, Math.floor(phaseMs / Math.max(16, clip?.frameMs ?? 125)));
-    const at = clip?.loop === false ? Math.min(sequence.length - 1, step) : step % sequence.length;
-    return Math.max(0, Math.min(totalFrames - 1, sequence[at] ?? 0));
+    const clampFrame = (frame: number) => Math.max(0, Math.min(totalFrames - 1, frame));
+    return {
+      ...sample,
+      frame: clampFrame(sample.frame),
+      blendFrame: sample.blendFrame === undefined ? undefined : clampFrame(sample.blendFrame),
+    };
+  }
+
+  private animationFrame(target: string, state: EntityAnimationState, elapsedMs: number, seed: number, totalFrames: number): number {
+    return this.sampleEntityAnimation(target, state, elapsedMs, seed, totalFrames).frame;
   }
 
   private animationDuration(target: string, state: EntityAnimationState, fallbackMs: number): number {
     const clip = this.visuals.animations?.[target]?.clips?.[state];
-    if (clip?.keyframes?.length) {
-      return clip.keyframes.reduce((sum, keyframe) => sum + Math.max(16, keyframe.durationMs), 0);
+    if (!clip) return fallbackMs;
+    return clipTotalMs(clip, fallbackMs);
+  }
+
+  private animator(id: string): EntityAnimator {
+    let animator = this.animators.get(id);
+    if (!animator) {
+      animator = new EntityAnimator();
+      this.animators.set(id, animator);
     }
-    if (clip?.frames?.length) return clip.frames.length * Math.max(16, clip.frameMs ?? 125);
-    return fallbackMs;
+    return animator;
   }
 
   private sheetAnimationFrame(target: string, state: EntityAnimationState, elapsedMs: number, seed: number): number {
@@ -435,45 +465,32 @@ export class Renderer {
     return direction === -1;
   }
 
-  private motionPose(id: string, moving: boolean, time: number, seed: number, vx: number, vy: number, hitElapsed = Infinity) {
+  private motionPose(
+    id: string,
+    moving: boolean,
+    time: number,
+    seed: number,
+    vx: number,
+    vy: number,
+    hitElapsed = Infinity,
+    strideCycle?: number,
+  ) {
     const previous = this.motionTransitions.get(id);
     if (!previous || previous.moving !== moving) this.motionTransitions.set(id, { moving, changedAt: time });
     const transition = this.motionTransitions.get(id)!;
     const transitionAge = Math.max(0, time - transition.changedAt);
-    const speed = Math.hypot(vx, vy);
-
-    if (this.reducedMotion) {
-      const hitShake = hitElapsed < 150 ? Math.sin(hitElapsed * 0.13) * (1 - hitElapsed / 150) : 0;
-      return { x: hitShake, y: 0, shadowScale: 1, lean: 0, animationElapsedMs: moving ? transitionAge * 1000 : time * 1000 };
-    }
-
-    const cadence = Math.min(17, 12.5 + speed * 0.02);
-    const phase = moving
-      ? transitionAge * cadence
-      : time * cadence + (seed % 997) * 0.031;
-    const moveBlend = moving ? easeOutCubic(Math.min(1, transitionAge / 0.14)) : 0;
-    const stride = Math.sin(phase);
-    const bob = moving
-      ? (1 - Math.cos(phase * 2)) * 0.68 * moveBlend
-      : Math.sin(time * 2.1 + (seed % 211) * 0.07) * 0.2;
-    const sway = moving ? stride * 0.55 * moveBlend : 0;
-    const startLean = moving && transitionAge < 0.18
-      ? Math.sin((transitionAge / 0.18) * Math.PI) * 0.026
-      : 0;
-    const stopSettle = !moving && transitionAge < 0.22
-      ? Math.sin((transitionAge / 0.22) * Math.PI * 2) * (1 - transitionAge / 0.22) * 0.7
-      : 0;
-    const hitShake = hitElapsed < 180 ? Math.sin(hitElapsed * 0.12) * (1 - hitElapsed / 180) * 1.8 : 0;
-    const directionLean = moving && speed > 1
-      ? Math.max(-0.025, Math.min(0.025, vx / 5000)) * moveBlend
-      : 0;
-    return {
-      x: sway + hitShake,
-      y: -bob + stopSettle,
-      shadowScale: Math.max(0.86, 1 - bob * 0.045),
-      lean: startLean * Math.sign(vx || Math.cos(phase)) + directionLean,
-      animationElapsedMs: moving ? transitionAge * 1000 : time * 1000,
-    };
+    const pose = computeMotionPose({
+      moving,
+      time,
+      seed,
+      vx,
+      vy,
+      hitElapsedMs: hitElapsed,
+      strideCycle: moving ? strideCycle : undefined,
+      transitionAgeS: transitionAge,
+      reducedMotion: this.reducedMotion,
+    });
+    return { ...pose, animationElapsedMs: moving ? transitionAge * 1000 : time * 1000 };
   }
 
   private drawResourceSprite(ctx: CanvasRenderingContext2D, spriteId: string | undefined, x: number, y: number, shakeX: number): boolean {
@@ -512,16 +529,47 @@ export class Renderer {
     ctx.fillText(blockId.slice(0, 8).toUpperCase(), x, y - 11);
   }
 
-  private drawEngineSprite(ctx: CanvasRenderingContext2D, target: string, state: EntityAnimationState, elapsedMs: number, seed: number, x: number, y: number): boolean {
+  private drawEngineSprite(
+    ctx: CanvasRenderingContext2D,
+    target: string,
+    state: EntityAnimationState,
+    elapsedMs: number,
+    seed: number,
+    x: number,
+    y: number,
+    fade?: { state: EntityAnimationState; elapsedMs: number; alpha: number },
+  ): boolean {
     const profile = this.visuals.animations?.[target];
     const frames = profile ? this.visualFrames.get(profile.spriteId) : undefined;
     if (!frames?.length) return false;
-    const frame = frames[this.animationFrame(target, state, elapsedMs, seed, frames.length)];
     const renderScale = this.visuals.assets?.[profile!.spriteId]?.renderScale ?? 2;
-    const width = frame.width * renderScale;
-    const height = frame.height * renderScale;
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(frame, x - width / 2, y - height / 2, width, height);
+    const drawFrame = (index: number, alpha: number) => {
+      const frame = frames[Math.max(0, Math.min(frames.length - 1, index))];
+      const width = frame.width * renderScale;
+      const height = frame.height * renderScale;
+      if (alpha >= 1) {
+        ctx.drawImage(frame, x - width / 2, y - height / 2, width, height);
+        return;
+      }
+      if (alpha <= 0.02) return;
+      const previousAlpha = ctx.globalAlpha;
+      ctx.globalAlpha = previousAlpha * alpha;
+      ctx.drawImage(frame, x - width / 2, y - height / 2, width, height);
+      ctx.globalAlpha = previousAlpha;
+    };
+    // Short state crossfade: the outgoing pose dissolves under the new state.
+    if (fade && fade.alpha > 0.02 && !this.reducedMotion) {
+      const fadeSample = this.sampleEntityAnimation(target, fade.state, fade.elapsedMs, seed, frames.length);
+      drawFrame(fadeSample.frame, fade.alpha);
+    }
+    const sample = this.sampleEntityAnimation(target, state, elapsedMs, seed, frames.length);
+    if (sample.blendFrame !== undefined && sample.blendAlpha < 1) {
+      drawFrame(sample.blendFrame, 1 - sample.blendAlpha);
+      drawFrame(sample.frame, sample.blendAlpha);
+    } else {
+      drawFrame(sample.frame, fade && fade.alpha > 0.02 && !this.reducedMotion ? 1 - fade.alpha : 1);
+    }
     return true;
   }
 
@@ -1064,6 +1112,11 @@ export class Renderer {
   draw(ctx: CanvasRenderingContext2D, w: number, h: number, view: WorldView) {
     const dt = this.lastTime ? Math.min(0.1, view.time - this.lastTime) : 0.016;
     this.lastTime = view.time;
+    this.frameDtMs = dt * 1000;
+    if (view.time - this.lastAnimatorPruneAt > 5) {
+      this.lastAnimatorPruneAt = view.time;
+      pruneAnimators(this.animators, view.time * 1000);
+    }
 
     const you = view.players.find((p) => p.id === view.youId);
     const activeEntities = new Set([...view.players.map((player) => player.id), ...view.enemies.map((enemy) => enemy.id)]);
@@ -2127,17 +2180,28 @@ export class Renderer {
         : p.moving
           ? 'walk'
           : 'idle';
-    const pose = this.motionPose(p.id, p.moving, view.time, seed, p.vx, p.vy, playerHitElapsed);
-    const playerElapsed = playerState === 'hit'
+    const playerRawElapsed = playerState === 'hit'
       ? playerHitElapsed
-      : playerState === 'attack'
+      : playerState === 'attack' || playerState === 'punch'
         ? playerAttackElapsed
-        : playerState === 'walk'
-          ? pose.animationElapsedMs
-          : view.time * 1000;
+        : view.time * 1000;
+    const plan = this.animator(p.id).update(
+      view.time * 1000,
+      this.frameDtMs,
+      playerState,
+      playerRawElapsed,
+      Math.hypot(p.vx, p.vy),
+      this.animationDuration('player', 'walk', 4 * 105),
+      this.reducedMotion,
+    );
+    const pose = this.motionPose(p.id, p.moving, view.time, seed, p.vx, p.vy, playerHitElapsed, plan.strideCycle);
+    const playerElapsed = plan.elapsedMs;
     const fallbackFrame = this.sheetAnimationFrame('player', playerState, playerElapsed, seed);
-    const bodyX = p.dx + pose.x;
-    const bodyY = p.dy + pose.y;
+    const lunge = this.reducedMotion || playerState !== playerActionState
+      ? 0
+      : attackLungePx(Math.min(1, playerAttackElapsed / Math.max(1, playerActionDuration)));
+    const bodyX = p.dx + pose.x + Math.cos(p.angle) * lunge;
+    const bodyY = p.dy + pose.y + Math.sin(p.angle) * lunge;
     const playerSpriteSize = this.engineSpriteRenderSize('player') ?? { width: 32, height: 32 };
     const facingLeft = this.facesLeft(p.id, p.facing ?? p.angle);
     const drawFacing = (draw: () => void) => {
@@ -2153,8 +2217,20 @@ export class Renderer {
       ctx.save();
       if (playerHitElapsed < 120) ctx.filter = 'brightness(1.75) saturate(0.55)';
       drawFacing(() => {
-        const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, bodyX, bodyY);
-        if (!custom) this.blitChar(ctx, row, fallbackFrame, bodyX - 16, bodyY - 16);
+        const custom = this.drawEngineSprite(ctx, 'player', playerState, playerElapsed, seed, bodyX, bodyY, plan.fade);
+        if (!custom) {
+          if (plan.fade && !this.reducedMotion) {
+            const fadeFrame = this.sheetAnimationFrame('player', plan.fade.state, plan.fade.elapsedMs, seed);
+            const previousAlpha = ctx.globalAlpha;
+            ctx.globalAlpha = previousAlpha * plan.fade.alpha;
+            this.blitChar(ctx, row, fadeFrame, bodyX - 16, bodyY - 16);
+            ctx.globalAlpha = previousAlpha * (1 - plan.fade.alpha);
+            this.blitChar(ctx, row, fallbackFrame, bodyX - 16, bodyY - 16);
+            ctx.globalAlpha = previousAlpha;
+          } else {
+            this.blitChar(ctx, row, fallbackFrame, bodyX - 16, bodyY - 16);
+          }
+        }
       });
       ctx.restore();
     };
@@ -2197,12 +2273,14 @@ export class Renderer {
       // nameplate still renders below
     }
     if (!swimming) {
+      // Shadow sits at the sprite's feet (bottom of the frame minus baseline
+      // padding), not at a fixed offset the taller production art overruns.
       ctx.fillStyle = "rgba(0,0,0,0.3)";
       ctx.beginPath();
       ctx.ellipse(
         p.dx,
-        p.dy + Math.max(14, playerSpriteSize.height * .28),
-        Math.max(9, playerSpriteSize.width * .22) * pose.shadowScale,
+        p.dy + Math.max(14, playerSpriteSize.height / 2 - 2),
+        Math.max(9, playerSpriteSize.width * .18) * pose.shadowScale,
         3.5 * pose.shadowScale,
         0,
         0,
@@ -2216,12 +2294,21 @@ export class Renderer {
     ctx.save();
     if (playerHitElapsed < 120) ctx.filter = 'brightness(1.75) saturate(0.55)';
     if (!swimming && p.helmet) {
+      const helmetWidth = Math.max(12, Math.round(playerSpriteSize.width * 0.24));
+      const helmetHeight = Math.max(4, Math.round(playerSpriteSize.height * 0.1));
       ctx.fillStyle = p.helmet === "helmet_military" ? "#44513a" : "#8a8a92";
-      ctx.fillRect(bodyX - 7, bodyY - playerSpriteSize.height / 2 + 4, 14, 5);
+      ctx.fillRect(
+        bodyX - helmetWidth / 2,
+        bodyY - playerSpriteSize.height / 2 + Math.round(playerSpriteSize.height * 0.08),
+        helmetWidth,
+        helmetHeight,
+      );
     }
     if (!swimming && p.vest) {
+      const vestWidth = Math.max(14, Math.round(playerSpriteSize.width * 0.3));
+      const vestHeight = Math.max(6, Math.round(playerSpriteSize.height * 0.16));
       ctx.fillStyle = p.vest === "vest_military" ? "#3c4834" : "#867454";
-      ctx.fillRect(bodyX - 8, bodyY - 4, 16, 7);
+      ctx.fillRect(bodyX - vestWidth / 2, bodyY - Math.round(vestHeight * 0.55), vestWidth, vestHeight);
     }
     ctx.restore();
 
@@ -2273,14 +2360,22 @@ export class Renderer {
         : e.moving
           ? 'walk'
           : 'idle';
-    const pose = this.motionPose(e.id, e.moving, time, seed, e.vx, e.vy, hitElapsed);
-    const elapsed = state === 'hit'
+    const rawElapsed = state === 'hit'
       ? hitElapsed
-      : state === 'attack'
+      : state === 'attack' || state === 'punch'
         ? attackElapsed
-        : state === 'walk'
-          ? pose.animationElapsedMs
-          : time * 1000;
+        : time * 1000;
+    const plan = this.animator(e.id).update(
+      time * 1000,
+      this.frameDtMs,
+      state,
+      rawElapsed,
+      Math.hypot(e.vx, e.vy),
+      this.animationDuration(`mob:${e.kind}`, 'walk', 4 * 105),
+      this.reducedMotion,
+    );
+    const pose = this.motionPose(e.id, e.moving, time, seed, e.vx, e.vy, hitElapsed, plan.strideCycle);
+    const elapsed = plan.elapsedMs;
     const previousSoundState = this.entitySoundStates.get(e.id);
     if (previousSoundState !== state) {
       this.entitySoundStates.set(e.id, state);
@@ -2300,8 +2395,11 @@ export class Renderer {
       cougar: CHAR_ROWS.cougar,
     };
     const animalRow = ANIMAL_ROWS[e.kind];
-    const bodyX = e.dx + pose.x;
-    const bodyY = e.dy + pose.y;
+    const lunge = this.reducedMotion || state !== attackState
+      ? 0
+      : attackLungePx(Math.min(1, attackElapsed / Math.max(1, attackDuration)));
+    const bodyX = e.dx + pose.x + Math.cos(e.angle) * lunge;
+    const bodyY = e.dy + pose.y + Math.sin(e.angle) * lunge;
     const enemySpriteSize = this.engineSpriteRenderSize(`mob:${e.kind}`) ?? { width: 32, height: 32 };
     const shadowWidth =
       e.kind === 'rabbit' || e.kind === 'raccoon' ? 6
@@ -2320,7 +2418,15 @@ export class Renderer {
     }
     ctx.fillStyle = "rgba(0,0,0,0.27)";
     ctx.beginPath();
-    ctx.ellipse(e.dx, e.dy + 13, shadowWidth * pose.shadowScale, 3 * pose.shadowScale, 0, 0, Math.PI * 2);
+    ctx.ellipse(
+      e.dx,
+      e.dy + Math.max(13, enemySpriteSize.height / 2 - 2),
+      shadowWidth * pose.shadowScale,
+      3 * pose.shadowScale,
+      0,
+      0,
+      Math.PI * 2,
+    );
     ctx.fill();
 
     ctx.save();
@@ -2329,10 +2435,20 @@ export class Renderer {
     if (e.boss) ctx.scale(1.25, 1.25);
     if (this.facesLeft(e.id, e.angle)) ctx.scale(-1, 1);
     if (hitElapsed < 120) ctx.filter = 'brightness(1.8) saturate(0.45)';
-    const custom = this.drawEngineSprite(ctx, `mob:${e.kind}`, state, elapsed, seed, 0, 0);
+    const custom = this.drawEngineSprite(ctx, `mob:${e.kind}`, state, elapsed, seed, 0, 0, plan.fade);
     if (!custom) {
       const row = animalRow ?? (e.kind === "zombie" ? CHAR_ROWS.zombie : CHAR_ROWS.military);
-      this.blitChar(ctx, row, this.sheetAnimationFrame(`mob:${e.kind}`, state, elapsed, seed), -16, -16);
+      if (plan.fade && !this.reducedMotion) {
+        const fadeFrame = this.sheetAnimationFrame(`mob:${e.kind}`, plan.fade.state, plan.fade.elapsedMs, seed);
+        const previousAlpha = ctx.globalAlpha;
+        ctx.globalAlpha = previousAlpha * plan.fade.alpha;
+        this.blitChar(ctx, row, fadeFrame, -16, -16);
+        ctx.globalAlpha = previousAlpha * (1 - plan.fade.alpha);
+        this.blitChar(ctx, row, this.sheetAnimationFrame(`mob:${e.kind}`, state, elapsed, seed), -16, -16);
+        ctx.globalAlpha = previousAlpha;
+      } else {
+        this.blitChar(ctx, row, this.sheetAnimationFrame(`mob:${e.kind}`, state, elapsed, seed), -16, -16);
+      }
     }
     ctx.restore();
     if (e.kind === "military")

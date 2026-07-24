@@ -78,6 +78,8 @@ export interface AnimationClipDef {
   frameMs: number;
   loop: boolean;
   keyframes?: AnimationKeyframeDef[];
+  /** Client-side alpha blend across keyframe boundaries (0/absent = hard steps). */
+  blendMs?: number;
 }
 
 export interface AnimationKeyframeDef {

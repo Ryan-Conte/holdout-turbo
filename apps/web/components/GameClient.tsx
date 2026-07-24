@@ -139,6 +139,33 @@ function localMovementDirections(
   };
 }
 
+/**
+ * High-frequency HUD chips live outside the main component tree. The network
+ * and clock readouts change about once a second; as GameClient state they
+ * re-rendered the entire HUD (a ~66 ms dev-mode stall on a metronome). Each
+ * chip owns its state and receives updates through a registered setter.
+ */
+function NetChip({ register }: { register: (set: (ms: number | null) => void) => void }) {
+  const [ms, setMs] = useState<number | null>(null);
+  useEffect(() => register(setMs), [register]);
+  if (ms === null) return null;
+  return (
+    <div
+      className={`kd-chip net-chip ${ms < 90 ? 'good' : ms < 180 ? 'ok' : 'high'}`}
+      title="Measured input round trip. Local prediction is active."
+    >
+      NET {ms} ms
+    </div>
+  );
+}
+
+function ClockChip({ register }: { register: (set: (label: string) => void) => void }) {
+  const [label, setLabel] = useState('');
+  useEffect(() => register(setLabel), [register]);
+  if (!label) return null;
+  return <div className="kd-chip dim">{label}</div>;
+}
+
 export default function GameClient() {
   const router = useRouter();
   const guestRequested = useRef<boolean>((() => {
@@ -232,7 +259,14 @@ export default function GameClient() {
   const [dead, setDead] = useState<string | null>(null);
   const [online, setOnline] = useState(0);
   const [worldEvents, setWorldEvents] = useState<WorldEventSnap[]>([]);
-  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const netChipSetRef = useRef<(ms: number | null) => void>(() => {});
+  const clockChipSetRef = useRef<(label: string) => void>(() => {});
+  const registerNetChip = useCallback((set: (ms: number | null) => void) => {
+    netChipSetRef.current = set;
+  }, []);
+  const registerClockChip = useCallback((set: (label: string) => void) => {
+    clockChipSetRef.current = set;
+  }, []);
   const [location, setLocation] = useState<string | null>(null);
   const [prompt, setPrompt] = useState<string | null>(null);
   const [inSafe, setInSafe] = useState(false);
@@ -261,7 +295,6 @@ export default function GameClient() {
   const [cookQueue, setCookQueue] = useState<number[]>([]); // inventory slots queued for cooking
   const [craftQueue, setCraftQueue] = useState<string[]>([]); // recipe ids queued for crafting
   const [station, setStation] = useState<StationOpen | null>(null);
-  const [clock, setClock] = useState('');
   const [demolishMode, setDemolishMode] = useState(false); // camp demolish mode (X)
   const [buildRotation, setBuildRotation] = useState(0);
   const [escMenu, setEscMenu] = useState(false); // pause/system menu (ESC)
@@ -666,7 +699,7 @@ export default function GameClient() {
       pendingInputsRef.current = [];
       acknowledgedInputRef.current = lastInputRef.current;
       latencyRef.current = null;
-      setLatencyMs(null);
+      netChipSetRef.current(null);
 
       socket.on('connect_error', () => setFailed('Cannot reach the selected game server. Return to deployment to choose another relay, or retry.'));
       socket.on('disconnect', () => setConnected(false));
@@ -755,7 +788,7 @@ export default function GameClient() {
             latencyRef.current = latencyRef.current === null ? sample : latencyRef.current * 0.8 + sample * 0.2;
             if (receivedAt - lastLatencyUiAtRef.current > 500) {
               lastLatencyUiAtRef.current = receivedAt;
-              setLatencyMs(Math.round(latencyRef.current));
+              netChipSetRef.current(Math.round(latencyRef.current));
             }
           }
           pendingInputsRef.current = pendingInputsRef.current.filter((entry) => entry.seq > ack);
@@ -1438,7 +1471,7 @@ export default function GameClient() {
         if (clockRef.current && wasNight !== nowNight)
           pushToast(nowNight ? '☾ Night falls — the dead grow restless' : '☀ Dawn breaks over the zone');
         clockRef.current = clockLabel;
-        setClock(clockLabel);
+        clockChipSetRef.current(clockLabel);
       }
 
       const you = meNow;
@@ -2065,15 +2098,8 @@ export default function GameClient() {
         {isGuest && <div className="kd-chip guest-self-chip">GUEST · TEMPORARY RAID</div>}
         {isAdmin && <div className="kd-chip admin-self-chip">ADMIN · F10</div>}
         <div className="online-chip">● {online} IN ZONE</div>
-        {latencyMs !== null && (
-          <div
-            className={`kd-chip net-chip ${latencyMs < 90 ? 'good' : latencyMs < 180 ? 'ok' : 'high'}`}
-            title="Measured input round trip. Local prediction is active."
-          >
-            NET {latencyMs} ms
-          </div>
-        )}
-        {clock && <div className="kd-chip dim">{clock}</div>}
+        <NetChip register={registerNetChip} />
+        <ClockChip register={registerClockChip} />
         {inv && <div className="kd-chip gold">{inv.money} cr</div>}
         {inv && <div className="kd-chip">☠ {inv.kills} · {inv.deaths}</div>}
         <div className="kd-chip dim">{muted ? 'SOUND OFF' : 'SOUND ON'}</div>

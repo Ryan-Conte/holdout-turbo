@@ -4174,3 +4174,175 @@ body {
     outline-width: 2px;
   }
 }
+
+/* ── panel chrome v3 — match the field-gear HUD and production pixel art ──
+   The HUD (status, hotbar, chips) already uses the dithered olive "field
+   gear" material; the center panels still wore the flatter steel pass. This
+   brings panels, tabs, buttons and the crafting states up to the same
+   charcoal-outlined, top-left-lit language as the sprites. */
+
+.panel {
+  border: 1px solid rgba(96, 101, 78, .9);
+  outline: 2px solid rgba(7, 9, 7, .78);
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, .016) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #20251b 0%, #191e15 60%, #161a12 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(222, 215, 195, .07),
+    inset 0 0 0 1px rgba(193, 180, 127, .05),
+    0 16px 44px rgba(0, 0, 0, .72);
+}
+
+.panel h3 {
+  border: 1px solid #57543c;
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, .035) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #a89b72, #8f8564 62%, #7e7457);
+  color: #171810;
+  box-shadow: inset 0 1px 0 rgba(255, 250, 230, .3), inset 0 -2px 0 rgba(22, 20, 11, .32);
+  text-shadow: 0 1px 0 rgba(255, 250, 230, .18);
+}
+
+.panel h3 .sub { color: #3a3626; }
+
+/* raised field buttons with a pressed state; sockets and cells excluded */
+.panel button:not(.craft-cell):not(.slot):not(.equip-slot) {
+  border: 1px solid #0d100c;
+  background: linear-gradient(180deg, #3c4433  0%, #2f3629 58%, #293024 100%);
+  color: var(--steel-text);
+  box-shadow:
+    inset 0 1px 0 rgba(222, 215, 195, .14),
+    inset 1px 0 0 rgba(222, 215, 195, .05),
+    inset 0 -2px 0 rgba(4, 6, 4, .5);
+}
+
+.panel button:not(.craft-cell):not(.slot):not(.equip-slot):not(:disabled):hover {
+  border-color: #0d100c;
+  color: #efe9d4;
+  filter: brightness(1.12);
+}
+
+.panel button:not(.craft-cell):not(.slot):not(.equip-slot):not(:disabled):active {
+  transform: translateY(1px);
+  box-shadow:
+    inset 0 2px 0 rgba(4, 6, 4, .55),
+    inset 0 -1px 0 rgba(222, 215, 195, .06);
+  filter: brightness(.94);
+}
+
+.panel button:not(.craft-cell):not(.slot):not(.equip-slot):disabled {
+  background: #22271d;
+  color: #6f7361;
+  box-shadow: inset 0 2px 0 rgba(4, 6, 4, .4);
+}
+
+/* primary action: brass, unmistakably pressable */
+.panel .btn-primary:not(:disabled),
+.panel .craft-go:not(:disabled) {
+  border: 1px solid #191206;
+  background:
+    repeating-linear-gradient(135deg, rgba(255, 255, 255, .05) 0 1px, transparent 1px 5px),
+    linear-gradient(180deg, #d8b35f 0%, #bb913e 58%, #a67d31 100%);
+  color: #1a1305;
+  font-weight: 700;
+  letter-spacing: 2px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 240, 200, .5),
+    inset 0 -2px 0 rgba(70, 45, 10, .55);
+  text-shadow: 0 1px 0 rgba(255, 244, 214, .3);
+}
+
+.panel .btn-primary:not(:disabled):hover,
+.panel .craft-go:not(:disabled):hover { filter: brightness(1.08); }
+
+/* blocked craft reads as a recessed warning, not a greyed mystery */
+.panel .craft-go:disabled {
+  opacity: 1;
+  cursor: not-allowed;
+  border: 1px solid #0d100c;
+  background: #241f1b;
+  color: #b07a67;
+  letter-spacing: 1.6px;
+  box-shadow:
+    inset 0 2px 0 rgba(4, 6, 4, .5),
+    inset 0 0 0 1px rgba(169, 79, 67, .22);
+}
+
+/* tabs: recessed until chosen; the active tab carries a brass top strip */
+.panel .craft-tabs button {
+  border: 1px solid #0d100c;
+  background: #1d2218;
+  color: var(--steel-dim);
+  box-shadow: inset 0 2px 0 rgba(4, 6, 4, .42);
+}
+
+.panel .craft-tabs button.active {
+  background: linear-gradient(180deg, #3c4433, #2e3529);
+  color: var(--gold);
+  box-shadow:
+    inset 0 2px 0 var(--gold),
+    inset 0 -2px 0 rgba(4, 6, 4, .5);
+}
+
+/* recipe sockets: sunken cells so item pixels read as objects in trays */
+.craft-cell {
+  border: 1px solid #0d100c;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, .03), transparent 46%),
+    #14180f;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, .55), inset 0 -1px 0 rgba(222, 215, 195, .05);
+}
+
+.craft-cell:hover { border-color: #8d875f; background-color: #1d2317; }
+.craft-cell.craftable { border-bottom: 2px solid var(--green); }
+
+.craft-cell.locked {
+  background:
+    repeating-linear-gradient(135deg, rgba(0, 0, 0, .3) 0 3px, transparent 3px 6px),
+    #12150e;
+}
+
+.craft-cell.active {
+  border-color: #c0a55f;
+  box-shadow:
+    inset 0 0 0 1px rgba(199, 168, 87, .7),
+    inset 0 2px 4px rgba(0, 0, 0, .5);
+}
+
+/* requirement lines: framed rows with a met/short status edge */
+.cd-costs > div {
+  padding: 4px 7px;
+  border: 1px solid #0d100c;
+  background: rgba(10, 13, 8, .62);
+  box-shadow: inset 0 1px 0 rgba(222, 215, 195, .05);
+}
+
+.cd-costs .have { border-left: 3px solid var(--green); }
+.cd-costs .missing { border-left: 3px solid var(--red); }
+.cd-costs .cd-count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.cd-costs .missing .cd-count { color: #e08874; font-weight: 700; }
+
+.craft-active,
+.station-fuel {
+  border: 1px solid #0d100c;
+  box-shadow: inset 3px 0 0 var(--gold), inset 0 1px 0 rgba(222, 215, 195, .06);
+}
+
+.station-fuel { box-shadow: inset 3px 0 0 #e6a84c, inset 0 1px 0 rgba(222, 215, 195, .06); }
+.station-fuel.empty { box-shadow: inset 3px 0 0 #d06858, inset 0 1px 0 rgba(222, 215, 195, .06); }
+
+.craft-hidden {
+  border: 1px dashed #4a4f3c;
+  background: rgba(10, 13, 8, .4);
+  color: #8b8f7b;
+}
+
+.panel input,
+.panel .friend-add input {
+  border: 1px solid #0d100c;
+  background: #14180f;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, .45);
+}
+
+/* detail column divider matches the ink outline weight */
+.craft-detail { border-left: 1px solid #0d100c; box-shadow: -1px 0 0 rgba(222, 215, 195, .05); }
